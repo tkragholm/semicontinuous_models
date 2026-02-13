@@ -8,6 +8,7 @@ description = "Reusable models for semi-continuous outcomes (two-part, Tweedie, 
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 documentation = "https://docs.rs/semicontinuous_models"
+repository = "https://github.com/tkragholm/semicontinuous_models"
 keywords = ["glm", "two-part", "tweedie", "lognormal", "statistics"]
 categories = ["science", "mathematics", "algorithms"]
 exclude = ["target/", ".DS_Store"]
