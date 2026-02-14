@@ -17,9 +17,8 @@
 
 use crate::input::{InputError, ModelInput};
 use crate::models::matrix_ops::{map_mat, select_rows, select_values};
-use crate::utils::{max_abs_diff, mean_column, mean_vector, std_vector};
+use crate::utils::{max_abs_diff, mean_column, mean_vector, solve_linear_system, std_vector};
 use faer::Mat;
-use faer::prelude::Solve;
 use rand::prelude::*;
 use statrs::distribution::{ContinuousCDF, Normal};
 use statrs::function::gamma::ln_gamma;
@@ -961,10 +960,8 @@ fn covariance_logit_weighted(
     {
         xtwx += ridge_penalty(x.ncols(), lambda, exclude_intercept);
     }
-    let bread = invert_matrix(&xtwx)?;
-
     if !options.robust_se {
-        return Ok(bread);
+        return covariance_from_information(&xtwx);
     }
 
     let residuals = Mat::from_fn(y.nrows(), 1, |i, _| {
@@ -980,7 +977,7 @@ fn covariance_logit_weighted(
         }
     }
 
-    Ok(&bread * meat * &bread)
+    sandwich_covariance(&xtwx, &meat)
 }
 
 fn covariance_gamma_weighted(
@@ -1000,9 +997,8 @@ fn covariance_gamma_weighted(
     {
         xtx += ridge_penalty(x.ncols(), lambda, exclude_intercept);
     }
-    let bread = invert_matrix(&xtx)?;
     if !options.robust_se {
-        return Ok(bread);
+        return covariance_from_information(&xtx);
     }
 
     let residuals = Mat::from_fn(y.nrows(), 1, |i, _| {
@@ -1018,7 +1014,7 @@ fn covariance_gamma_weighted(
         }
     }
 
-    Ok(&bread * meat * &bread)
+    sandwich_covariance(&xtx, &meat)
 }
 
 fn covariance_logit_cluster_weighted(
@@ -1042,8 +1038,6 @@ fn covariance_logit_cluster_weighted(
     {
         xtwx += ridge_penalty(x.ncols(), lambda, exclude_intercept);
     }
-    let bread = invert_matrix(&xtwx)?;
-
     let residuals = Mat::from_fn(y.nrows(), 1, |i, _| {
         (y[(i, 0)] - p[(i, 0)]) * weights[(i, 0)]
     });
@@ -1066,7 +1060,7 @@ fn covariance_logit_cluster_weighted(
         }
     }
 
-    Ok(&bread * meat * &bread)
+    sandwich_covariance(&xtwx, &meat)
 }
 
 fn covariance_gamma_cluster_weighted(
@@ -1089,8 +1083,6 @@ fn covariance_gamma_cluster_weighted(
     {
         xtx += ridge_penalty(x.ncols(), lambda, exclude_intercept);
     }
-    let bread = invert_matrix(&xtx)?;
-
     let mut cluster_sums: HashMap<u64, Mat<f64>> = HashMap::new();
     for i in 0..x.nrows() {
         let entry = cluster_sums
@@ -1110,7 +1102,7 @@ fn covariance_gamma_cluster_weighted(
         }
     }
 
-    Ok(&bread * meat * &bread)
+    sandwich_covariance(&xtx, &meat)
 }
 
 fn diag_sqrt(covariance: &Mat<f64>) -> Mat<f64> {
@@ -1164,15 +1156,21 @@ fn component_mul(a: &Mat<f64>, b: &Mat<f64>) -> Mat<f64> {
     Mat::from_fn(a.nrows(), a.ncols(), |i, j| a[(i, j)] * b[(i, j)])
 }
 
-fn invert_matrix(matrix: &Mat<f64>) -> Result<Mat<f64>, TwoPartError> {
-    let n = matrix.nrows();
-    let rhs = Mat::<f64>::identity(n, n);
-    let lu = matrix.full_piv_lu();
-    let inv = lu.solve(rhs);
-    if !crate::utils::matrix_is_finite(&inv) {
-        return Err(TwoPartError::SolveFailed);
-    }
-    Ok(inv)
+fn covariance_from_information(information: &Mat<f64>) -> Result<Mat<f64>, TwoPartError> {
+    let identity = Mat::<f64>::identity(information.nrows(), information.ncols());
+    solve_linear_system(information, &identity)
+}
+
+fn sandwich_covariance(information: &Mat<f64>, meat: &Mat<f64>) -> Result<Mat<f64>, TwoPartError> {
+    let left = solve_linear_system(information, meat)?;
+    let information_t = transpose_owned(information);
+    let left_t = transpose_owned(&left);
+    let cov_t = solve_linear_system(&information_t, &left_t)?;
+    Ok(transpose_owned(&cov_t))
+}
+
+fn transpose_owned(matrix: &Mat<f64>) -> Mat<f64> {
+    Mat::from_fn(matrix.ncols(), matrix.nrows(), |i, j| matrix[(j, i)])
 }
 
 #[cfg(test)]

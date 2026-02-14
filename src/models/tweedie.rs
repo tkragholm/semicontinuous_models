@@ -122,6 +122,8 @@ pub struct TweediePrediction {
     pub mean: Mat<f64>,
 }
 
+type RobustCovarianceResult = (Option<Mat<f64>>, bool, Option<usize>);
+
 impl TweedieModel {
     /// Predict the mean outcome on the original scale.
     #[must_use]
@@ -211,9 +213,8 @@ pub(crate) fn fit_tweedie(
                 xtwx += ridge_penalty(x.ncols(), lambda, options.l2_penalty_exclude_intercept);
             }
             let (cov, se, clustered, cluster_count) = if options.robust_se {
-                let xtwx_inv = invert_matrix(&xtwx)?;
                 let (cov, clustered, cluster_count) =
-                    robust_covariance(x, y, &mu, &weights, clusters, &xtwx_inv);
+                    robust_covariance(x, y, &mu, &weights, clusters, &xtwx)?;
                 let se = cov.as_ref().map(diagonal_sqrt);
                 (cov, se, clustered, cluster_count)
             } else {
@@ -342,11 +343,6 @@ pub fn quasi_log_likelihood(y: &Mat<f64>, mu: &Mat<f64>, power: f64) -> f64 {
     if dev.is_finite() { -0.5 * dev } else { dev }
 }
 
-fn invert_matrix(a: &Mat<f64>) -> Result<Mat<f64>, TweedieError> {
-    let identity = Mat::from_fn(a.nrows(), a.ncols(), |i, j| if i == j { 1.0 } else { 0.0 });
-    solve_linear_system(a, &identity).map_err(|_| TweedieError::SolveFailed)
-}
-
 fn diagonal_sqrt(cov: &Mat<f64>) -> Mat<f64> {
     Mat::from_fn(cov.nrows(), 1, |i, _| cov[(i, i)].max(0.0).sqrt())
 }
@@ -357,8 +353,8 @@ fn robust_covariance(
     mu: &Mat<f64>,
     weights: &Mat<f64>,
     clusters: Option<&[u64]>,
-    xtwx_inv: &Mat<f64>,
-) -> (Option<Mat<f64>>, bool, Option<usize>) {
+    xtwx: &Mat<f64>,
+) -> Result<RobustCovarianceResult, TweedieError> {
     let p = x.ncols();
     let mut meat = Mat::<f64>::zeros(p, p);
     if let Some(clusters) = clusters {
@@ -379,8 +375,8 @@ fn robust_covariance(
                 }
             }
         }
-        let cov = xtwx_inv * &meat * xtwx_inv;
-        return (Some(cov), true, Some(cluster_sums.len()));
+        let cov = sandwich_covariance(xtwx, &meat)?;
+        return Ok((Some(cov), true, Some(cluster_sums.len())));
     }
 
     for i in 0..x.nrows() {
@@ -392,8 +388,8 @@ fn robust_covariance(
             }
         }
     }
-    let cov = xtwx_inv * &meat * xtwx_inv;
-    (Some(cov), false, None)
+    let cov = sandwich_covariance(xtwx, &meat)?;
+    Ok((Some(cov), false, None))
 }
 
 fn ridge_penalty(ncols: usize, lambda: f64, exclude_intercept: bool) -> Mat<f64> {
@@ -435,6 +431,18 @@ fn weighted_xtz(x: &Mat<f64>, weights: &Mat<f64>, z: &Mat<f64>) -> Mat<f64> {
         }
     }
     xtz
+}
+
+fn sandwich_covariance(xtwx: &Mat<f64>, meat: &Mat<f64>) -> Result<Mat<f64>, TweedieError> {
+    let left = solve_linear_system(xtwx, meat).map_err(|_| TweedieError::SolveFailed)?;
+    let xtwx_t = transpose_owned(xtwx);
+    let left_t = transpose_owned(&left);
+    let cov_t = solve_linear_system(&xtwx_t, &left_t).map_err(|_| TweedieError::SolveFailed)?;
+    Ok(transpose_owned(&cov_t))
+}
+
+fn transpose_owned(matrix: &Mat<f64>) -> Mat<f64> {
+    Mat::from_fn(matrix.ncols(), matrix.nrows(), |i, j| matrix[(j, i)])
 }
 
 #[cfg(test)]

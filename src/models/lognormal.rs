@@ -118,6 +118,8 @@ pub struct LogNormalPrediction {
     pub mean: Mat<f64>,
 }
 
+type RobustCovarianceResult = (Option<Mat<f64>>, bool, Option<usize>);
+
 impl LogNormalModel {
     /// Predict mean outcome on the original scale.
     #[must_use]
@@ -245,9 +247,8 @@ pub(crate) fn fit_lognormal_smearing(
     let (cov, se, clustered, cluster_count) = if options.robust_se {
         let xtx = x_pos.transpose() * &x_pos
             + ridge_penalty(x_pos.ncols(), lambda, options.l2_penalty_exclude_intercept);
-        let xtx_inv = invert_matrix(&xtx)?;
         let (cov, clustered, cluster_count) =
-            robust_covariance(&x_pos, &residuals, cluster_ids_pos.as_deref(), &xtx_inv);
+            robust_covariance(&x_pos, &residuals, cluster_ids_pos.as_deref(), &xtx)?;
         let se = cov.as_ref().map(diagonal_sqrt);
         (cov, se, clustered, cluster_count)
     } else {
@@ -321,11 +322,6 @@ fn ridge_penalty(ncols: usize, lambda: f64, exclude_intercept: bool) -> Mat<f64>
     })
 }
 
-fn invert_matrix(a: &Mat<f64>) -> Result<Mat<f64>, LogNormalError> {
-    let identity = Mat::from_fn(a.nrows(), a.ncols(), |i, j| if i == j { 1.0 } else { 0.0 });
-    solve_linear_system(a, &identity).map_err(|_| LogNormalError::SolveFailed)
-}
-
 fn diagonal_sqrt(cov: &Mat<f64>) -> Mat<f64> {
     Mat::from_fn(cov.nrows(), 1, |i, _| cov[(i, i)].max(0.0).sqrt())
 }
@@ -334,8 +330,8 @@ fn robust_covariance(
     x: &Mat<f64>,
     residuals: &Mat<f64>,
     clusters: Option<&[u64]>,
-    xtx_inv: &Mat<f64>,
-) -> (Option<Mat<f64>>, bool, Option<usize>) {
+    xtx: &Mat<f64>,
+) -> Result<RobustCovarianceResult, LogNormalError> {
     let p = x.ncols();
     let mut meat = Mat::<f64>::zeros(p, p);
     if let Some(clusters) = clusters {
@@ -356,8 +352,8 @@ fn robust_covariance(
                 }
             }
         }
-        let cov = xtx_inv * &meat * xtx_inv;
-        return (Some(cov), true, Some(cluster_sums.len()));
+        let cov = sandwich_covariance(xtx, &meat)?;
+        return Ok((Some(cov), true, Some(cluster_sums.len())));
     }
 
     for i in 0..x.nrows() {
@@ -369,8 +365,20 @@ fn robust_covariance(
             }
         }
     }
-    let cov = xtx_inv * &meat * xtx_inv;
-    (Some(cov), false, None)
+    let cov = sandwich_covariance(xtx, &meat)?;
+    Ok((Some(cov), false, None))
+}
+
+fn sandwich_covariance(xtx: &Mat<f64>, meat: &Mat<f64>) -> Result<Mat<f64>, LogNormalError> {
+    let left = solve_linear_system(xtx, meat).map_err(|_| LogNormalError::SolveFailed)?;
+    let xtx_t = transpose_owned(xtx);
+    let left_t = transpose_owned(&left);
+    let cov_t = solve_linear_system(&xtx_t, &left_t).map_err(|_| LogNormalError::SolveFailed)?;
+    Ok(transpose_owned(&cov_t))
+}
+
+fn transpose_owned(matrix: &Mat<f64>) -> Mat<f64> {
+    Mat::from_fn(matrix.ncols(), matrix.nrows(), |i, j| matrix[(j, i)])
 }
 
 #[cfg(test)]
