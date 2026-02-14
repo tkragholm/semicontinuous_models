@@ -18,7 +18,7 @@ use faer::Mat;
 
 use crate::input::{InputError, ModelInput};
 use crate::models::matrix_ops::map_mat;
-use crate::utils::{diag_from_vec, max_abs_diff, solve_linear_system};
+use crate::utils::{max_abs_diff, solve_linear_system};
 
 /// Tuning parameters for Tweedie fitting.
 #[derive(Debug, Clone, Copy)]
@@ -190,13 +190,11 @@ pub(crate) fn fit_tweedie(
             eta[(i, 0)] + (y[(i, 0)] - mu[(i, 0)]) / mu[(i, 0)]
         });
 
-        let w_diag = diag_from_vec(&weights);
-        let xtw = x.transpose() * &w_diag;
-        let mut xtwx = &xtw * x;
+        let mut xtwx = weighted_xtx(x, &weights);
         if lambda > 0.0 {
             xtwx += ridge_penalty(x.ncols(), lambda, options.l2_penalty_exclude_intercept);
         }
-        let xtw_rhs = &xtw * z;
+        let xtw_rhs = weighted_xtz(x, &weights, &z);
         let beta_next =
             solve_linear_system(&xtwx, &xtw_rhs).map_err(|_| TweedieError::SolveFailed)?;
 
@@ -208,9 +206,7 @@ pub(crate) fn fit_tweedie(
                 let w = mu[(i, 0)].powf(2.0 - power);
                 w.max(options.min_weight)
             });
-            let w_diag = diag_from_vec(&weights);
-            let xtw = x.transpose() * &w_diag;
-            let mut xtwx = &xtw * x;
+            let mut xtwx = weighted_xtx(x, &weights);
             if lambda > 0.0 {
                 xtwx += ridge_penalty(x.ncols(), lambda, options.l2_penalty_exclude_intercept);
             }
@@ -412,6 +408,33 @@ fn ridge_penalty(ncols: usize, lambda: f64, exclude_intercept: bool) -> Mat<f64>
             0.0
         }
     })
+}
+
+fn weighted_xtx(x: &Mat<f64>, weights: &Mat<f64>) -> Mat<f64> {
+    let p = x.ncols();
+    let mut xtx = Mat::<f64>::zeros(p, p);
+    for i in 0..x.nrows() {
+        let w = weights[(i, 0)];
+        for col_i in 0..p {
+            let wxi = w * x[(i, col_i)];
+            for col_j in 0..p {
+                xtx[(col_i, col_j)] += wxi * x[(i, col_j)];
+            }
+        }
+    }
+    xtx
+}
+
+fn weighted_xtz(x: &Mat<f64>, weights: &Mat<f64>, z: &Mat<f64>) -> Mat<f64> {
+    let p = x.ncols();
+    let mut xtz = Mat::<f64>::zeros(p, 1);
+    for i in 0..x.nrows() {
+        let wz = weights[(i, 0)] * z[(i, 0)];
+        for col in 0..p {
+            xtz[(col, 0)] += x[(i, col)] * wz;
+        }
+    }
+    xtz
 }
 
 #[cfg(test)]
