@@ -17,7 +17,7 @@
 
 use crate::input::{InputError, ModelInput};
 use crate::models::matrix_ops::{map_mat, select_rows, select_values};
-use crate::utils::{diag_from_vec, max_abs_diff, mean_column, mean_vector, std_vector};
+use crate::utils::{max_abs_diff, mean_column, mean_vector, std_vector};
 use faer::Mat;
 use faer::prelude::Solve;
 use rand::prelude::*;
@@ -804,15 +804,13 @@ fn weighted_least_squares(
         return elastic_net_wls(x, weights, z, regularization);
     }
 
-    let w_diag = diag_from_vec(weights);
-    let xtw = x.transpose() * &w_diag;
-    let mut xtwx = &xtw * x;
+    let mut xtwx = weighted_xtx(x, weights);
     if let Some((lambda, exclude_intercept)) = ridge_from_regularization(regularization)
         && lambda > 0.0
     {
         xtwx += ridge_penalty(x.ncols(), lambda, exclude_intercept);
     }
-    let xtw_rhs = &xtw * z;
+    let xtw_rhs = weighted_xtz(x, weights, z);
     crate::utils::solve_linear_system(&xtwx, &xtw_rhs)
 }
 
@@ -957,8 +955,7 @@ fn covariance_logit_weighted(
         (value.max(options.min_weight)) * weights[(i, 0)]
     });
 
-    let w_diag = diag_from_vec(&weights);
-    let mut xtwx = x.transpose() * &w_diag * x;
+    let mut xtwx = weighted_xtx(x, &weights);
     if let Some((lambda, exclude_intercept)) = ridge_from_regularization(options.regularization)
         && lambda > 0.0
     {
@@ -997,7 +994,7 @@ fn covariance_gamma_weighted(
     let mu = map_mat(&eta, f64::exp);
 
     let w = Mat::from_fn(mu.nrows(), 1, |i, _| weights[(i, 0)]);
-    let mut xtx = x.transpose() * (diag_from_vec(&w) * x);
+    let mut xtx = weighted_xtx(x, &w);
     if let Some((lambda, exclude_intercept)) = ridge_from_regularization(options.regularization)
         && lambda > 0.0
     {
@@ -1039,8 +1036,7 @@ fn covariance_logit_cluster_weighted(
         (value.max(options.min_weight)) * weights[(i, 0)]
     });
 
-    let w_diag = diag_from_vec(&weights);
-    let mut xtwx = x.transpose() * &w_diag * x;
+    let mut xtwx = weighted_xtx(x, &weights);
     if let Some((lambda, exclude_intercept)) = ridge_from_regularization(options.regularization)
         && lambda > 0.0
     {
@@ -1087,8 +1083,7 @@ fn covariance_gamma_cluster_weighted(
         ((y[(i, 0)] - mu[(i, 0)]) / mu[(i, 0)]) * weights[(i, 0)]
     });
 
-    let w_diag = diag_from_vec(weights);
-    let mut xtx = x.transpose() * &w_diag * x;
+    let mut xtx = weighted_xtx(x, weights);
     if let Some((lambda, exclude_intercept)) = ridge_from_regularization(options.regularization)
         && lambda > 0.0
     {
@@ -1122,6 +1117,35 @@ fn diag_sqrt(covariance: &Mat<f64>) -> Mat<f64> {
     Mat::from_fn(covariance.nrows(), 1, |i, _| {
         covariance[(i, i)].max(0.0).sqrt()
     })
+}
+
+fn weighted_xtx(x: &Mat<f64>, weights: &Mat<f64>) -> Mat<f64> {
+    let n = x.nrows();
+    let p = x.ncols();
+    let mut xtx = Mat::<f64>::zeros(p, p);
+    for i in 0..n {
+        let w = weights[(i, 0)];
+        for col_i in 0..p {
+            let wxi = w * x[(i, col_i)];
+            for col_j in 0..p {
+                xtx[(col_i, col_j)] += wxi * x[(i, col_j)];
+            }
+        }
+    }
+    xtx
+}
+
+fn weighted_xtz(x: &Mat<f64>, weights: &Mat<f64>, z: &Mat<f64>) -> Mat<f64> {
+    let n = x.nrows();
+    let p = x.ncols();
+    let mut xtz = Mat::<f64>::zeros(p, 1);
+    for i in 0..n {
+        let wz = weights[(i, 0)] * z[(i, 0)];
+        for col in 0..p {
+            xtz[(col, 0)] += x[(i, col)] * wz;
+        }
+    }
+    xtz
 }
 
 fn normal_quantile(p: f64) -> f64 {
