@@ -38,6 +38,15 @@ assert_eq!(prediction.expected_outcome.nrows(), n);
 assert!(report.iterations_logit > 0);
 ```
 
+For more numerically stable defaults on observational data:
+
+```rust
+use semicontinuous_models::{FitOptions, LogNormalOptions};
+
+let two_part_options = FitOptions::stable_defaults();
+let lognormal_options = LogNormalOptions::stable_defaults();
+```
+
 ## Public entry points
 
 - `fit_two_part_input`
@@ -48,6 +57,12 @@ assert!(report.iterations_logit > 0);
 - `select_models_input`
 - `cross_validate_models_input`
 - `compare_models_input`
+
+Preprocess helpers:
+
+- `drop_constant_columns`
+- `column_has_variation`
+- `outcome_diagnostics`
 
 ## Data contract
 

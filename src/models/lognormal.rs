@@ -48,6 +48,20 @@ impl Default for LogNormalOptions {
     }
 }
 
+impl LogNormalOptions {
+    /// Stable defaults for noisy observational data.
+    ///
+    /// Uses a mild L2 penalty to make linear solves more robust in near-singular designs.
+    #[must_use]
+    pub fn stable_defaults() -> Self {
+        Self {
+            l2_penalty: 1e-4,
+            l2_penalty_exclude_intercept: true,
+            ..Self::default()
+        }
+    }
+}
+
 /// Errors returned by log-normal fitting.
 #[derive(Debug, Error)]
 pub enum LogNormalError {

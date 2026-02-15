@@ -75,6 +75,23 @@ impl Default for FitOptions {
     }
 }
 
+impl FitOptions {
+    /// Stable defaults for noisy observational data.
+    ///
+    /// Uses mild ridge regularization to reduce solver failures while keeping
+    /// coefficients close to the unpenalized solution.
+    #[must_use]
+    pub fn stable_defaults() -> Self {
+        Self {
+            regularization: Regularization::Ridge {
+                lambda: 1e-4,
+                exclude_intercept: true,
+            },
+            ..Self::default()
+        }
+    }
+}
+
 /// Errors returned by two-part model fitting.
 #[derive(Debug, Error)]
 pub enum TwoPartError {

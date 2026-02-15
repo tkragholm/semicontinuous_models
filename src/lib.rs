@@ -10,9 +10,13 @@
 
 pub mod input;
 pub mod models;
+pub mod preprocess;
 pub mod utils;
 
 pub use input::{InputError, ModelInput};
+pub use preprocess::{
+    OutcomeDiagnostics, column_has_variation, drop_constant_columns, outcome_diagnostics,
+};
 pub mod comparison {
     pub use crate::models::comparison::*;
 }
