@@ -2,7 +2,7 @@
 name = "semicontinuous_models"
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 authors = ["Tobias Kragholm"]
 description = "Reusable models for semi-continuous outcomes (two-part, Tweedie, and log-normal)"
 readme = "README.md"
