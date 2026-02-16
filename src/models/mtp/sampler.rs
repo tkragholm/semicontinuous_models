@@ -87,6 +87,7 @@ struct ProposalScales {
 
 struct SamplerContext<'a> {
     input: &'a LongitudinalModelInput,
+    subjects: &'a [SubjectRows],
     row_to_subject: &'a [usize],
     row_to_family: Option<&'a [usize]>,
     structure: RandomEffectsStructure,
@@ -98,6 +99,18 @@ struct SamplerContext<'a> {
 struct SamplingResult {
     samples: MtpPosteriorSamples,
     acceptance_rates: MtpAcceptanceRates,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PosteriorSimulationRequest<'a> {
+    input: &'a LongitudinalModelInput,
+    subjects: &'a [SubjectRows],
+    row_to_subject: &'a [usize],
+    row_to_family: Option<&'a [usize]>,
+    family_count: usize,
+    baseline: &'a BaselineEstimate,
+    config: MtpSamplerConfig,
+    retained_draws: usize,
 }
 
 #[derive(Default)]
@@ -127,9 +140,9 @@ impl AcceptanceCounts {
         self.accepted_beta += usize::from(accepted);
     }
 
-    fn record_random_effects(&mut self, accepted: bool) {
-        self.proposed_random_effects += 1;
-        self.accepted_random_effects += usize::from(accepted);
+    const fn record_random_effects(&mut self, accepted: usize, proposed: usize) {
+        self.proposed_random_effects += proposed;
+        self.accepted_random_effects += accepted;
     }
 
     const fn record_family_effects(&mut self, accepted: usize, proposed: usize) {
@@ -262,15 +275,16 @@ pub fn fit_mtp_input_with_posterior_config(
     let baseline = estimate_correlated_random_effects(&prepared, &row_to_subject, options)?;
 
     let retained_draws = options.retained_draws();
-    let sampling = simulate_posterior_draws(
-        prepared.input,
-        &row_to_subject,
+    let sampling = simulate_posterior_draws(&PosteriorSimulationRequest {
+        input: prepared.input,
+        subjects: &prepared.subjects,
+        row_to_subject: &row_to_subject,
         row_to_family,
         family_count,
-        &baseline,
+        baseline: &baseline,
         config,
         retained_draws,
-    )?;
+    })?;
     let posterior = sampling.samples;
 
     let posterior_summary = if posterior.is_empty() {
@@ -400,18 +414,19 @@ pub fn fit_mtp_input_multi_chain_with_posterior_config(
             .seed
             .wrapping_add(index_u64.saturating_mul(multi_chain.seed_stride));
 
-        let sampling = simulate_posterior_draws(
-            prepared.input,
-            &row_to_subject,
+        let sampling = simulate_posterior_draws(&PosteriorSimulationRequest {
+            input: prepared.input,
+            subjects: &prepared.subjects,
+            row_to_subject: &row_to_subject,
             row_to_family,
             family_count,
-            &baseline,
-            MtpSamplerConfig {
+            baseline: &baseline,
+            config: MtpSamplerConfig {
                 fit_options: chain_options,
                 ..config
             },
             retained_draws,
-        )?;
+        })?;
 
         let posterior_summary = if sampling.samples.is_empty() {
             None
@@ -611,18 +626,24 @@ fn initialize_estimation_state(
 }
 
 fn simulate_posterior_draws(
-    input: &LongitudinalModelInput,
-    row_to_subject: &[usize],
-    row_to_family: Option<&[usize]>,
-    family_count: usize,
-    baseline: &BaselineEstimate,
-    config: MtpSamplerConfig,
-    retained_draws: usize,
+    request: &PosteriorSimulationRequest<'_>,
 ) -> Result<SamplingResult, MtpError> {
+    let PosteriorSimulationRequest {
+        input,
+        subjects,
+        row_to_subject,
+        row_to_family,
+        family_count,
+        baseline,
+        config,
+        retained_draws,
+    } = *request;
+
     let options = config.fit_options;
     let mut rng = StdRng::seed_from_u64(options.seed);
     let context = SamplerContext {
         input,
+        subjects,
         row_to_subject,
         row_to_family,
         structure: baseline.structure,
@@ -725,14 +746,15 @@ fn run_mcmc_chain(
             &proposal_scales.beta,
             tuning.min_draw_scale,
         ));
-        counts.record_random_effects(update_random_effects_block(
+        let (accepted_random, proposed_random) = update_random_effects_block(
             context,
             rng,
             state,
             &mut log_posterior,
             &proposal_scales.random_effects,
             tuning.min_draw_scale,
-        ));
+        );
+        counts.record_random_effects(accepted_random, proposed_random);
         let (accepted_family, proposed_family) = update_family_effects_block(
             context,
             rng,
@@ -902,6 +924,7 @@ impl SamplerContext<'_> {
             || state.beta.len() != self.input.x_mean.ncols()
             || state.subject_effects.len()
                 != self.row_to_subject.iter().max().copied().unwrap_or(0) + 1
+            || state.subject_effects.len() != self.subjects.len()
         {
             return false;
         }
@@ -1068,20 +1091,52 @@ impl SamplerContext<'_> {
     }
 
     fn log_subject_random_effect_prior(state: &ChainState) -> f64 {
-        state
-            .subject_effects
-            .iter()
-            .map(|effect| {
-                let mut quadratic = 0.0;
-                for row in 0..effect.len() {
-                    for col in 0..effect.len() {
-                        quadratic +=
-                            effect[row] * state.random_effects_precision[(row, col)] * effect[col];
-                    }
-                }
-                -0.5 * quadratic
-            })
-            .sum::<f64>()
+        (0..state.subject_effects.len())
+            .map(|subject_idx| Self::subject_random_effect_log_prior(state, subject_idx))
+            .sum()
+    }
+
+    fn subject_log_posterior_contribution(&self, state: &ChainState, subject_idx: usize) -> f64 {
+        let log_likelihood = self.subject_log_likelihood(state, subject_idx);
+        if !log_likelihood.is_finite() {
+            return f64::NEG_INFINITY;
+        }
+
+        log_likelihood + Self::subject_random_effect_log_prior(state, subject_idx)
+    }
+
+    fn subject_log_likelihood(&self, state: &ChainState, subject_idx: usize) -> f64 {
+        let omega = state.omega_sq.sqrt();
+        let kappa = self.effective_kappa(state);
+        let delta = kappa / kappa.mul_add(kappa, 1.0).sqrt();
+        let log_phi_omega_delta =
+            if self.positive_part_distribution == PositivePartDistribution::LogSkewNormal {
+                likelihood::log_standard_normal_cdf(omega * delta)
+            } else {
+                0.0
+            };
+
+        let mut sum = 0.0;
+        for row in &self.subjects[subject_idx].rows {
+            let contribution =
+                self.row_log_likelihood(state, *row, omega, kappa, log_phi_omega_delta);
+            if !contribution.is_finite() {
+                return f64::NEG_INFINITY;
+            }
+            sum += contribution;
+        }
+        sum
+    }
+
+    fn subject_random_effect_log_prior(state: &ChainState, subject_idx: usize) -> f64 {
+        let effect = &state.subject_effects[subject_idx];
+        let mut quadratic = 0.0;
+        for row in 0..effect.len() {
+            for col in 0..effect.len() {
+                quadratic += effect[row] * state.random_effects_precision[(row, col)] * effect[col];
+            }
+        }
+        -0.5 * quadratic
     }
 }
 
@@ -1120,11 +1175,40 @@ fn update_random_effects_block(
     log_posterior: &mut f64,
     scales: &[f64],
     min_draw_scale: f64,
-) -> bool {
-    let proposal = random_walk_subject_effects(&state.subject_effects, scales, rng, min_draw_scale);
-    let mut candidate = state.clone();
-    candidate.subject_effects = proposal;
-    metropolis_update(context, rng, state, log_posterior, candidate)
+) -> (usize, usize) {
+    if state.subject_effects.is_empty() {
+        return (0, 0);
+    }
+
+    let mut accepted = 0;
+    let proposed = state.subject_effects.len();
+
+    for subject_idx in 0..state.subject_effects.len() {
+        let current_contribution = context.subject_log_posterior_contribution(state, subject_idx);
+        if !current_contribution.is_finite() {
+            continue;
+        }
+
+        let proposal = random_walk_vector(
+            &state.subject_effects[subject_idx],
+            scales,
+            rng,
+            min_draw_scale,
+        );
+        let previous = std::mem::replace(&mut state.subject_effects[subject_idx], proposal);
+        let candidate_contribution = context.subject_log_posterior_contribution(state, subject_idx);
+
+        if candidate_contribution.is_finite()
+            && should_accept(candidate_contribution - current_contribution, rng)
+        {
+            *log_posterior += candidate_contribution - current_contribution;
+            accepted += 1;
+        } else {
+            state.subject_effects[subject_idx] = previous;
+        }
+    }
+
+    (accepted, proposed)
 }
 
 fn update_family_effects_block(
@@ -1271,26 +1355,6 @@ fn random_walk_vector(
         .iter()
         .zip(scales.iter())
         .map(|(value, scale)| value + scale.max(min_draw_scale) * sample_standard_normal(rng))
-        .collect()
-}
-
-fn random_walk_subject_effects(
-    subject_effects: &[Vec<f64>],
-    scales: &[f64],
-    rng: &mut StdRng,
-    min_draw_scale: f64,
-) -> Vec<Vec<f64>> {
-    subject_effects
-        .iter()
-        .map(|effect| {
-            effect
-                .iter()
-                .enumerate()
-                .map(|(idx, value)| {
-                    value + scales[idx].max(min_draw_scale) * sample_standard_normal(rng)
-                })
-                .collect()
-        })
         .collect()
 }
 

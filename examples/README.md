@@ -52,3 +52,29 @@ cargo run --example compare_models
 Fits two-part (default + elastic net), Tweedie, and log-normal models and
 prints RMSE/MAE/RMSLE/R2 tables for in-sample and cross-validated metrics,
 plus a Park test summary with candidate metrics.
+
+## Marginalized two-part (MTP) model
+
+```
+cargo run --example mtp
+```
+
+Builds a synthetic longitudinal person-period dataset, fits the correlated
+marginalized two-part model with posterior draws, and prints:
+- sampler diagnostics and acceptance rates,
+- selected posterior coefficient summaries,
+- posterior predictive diagnostics (zero-rate and Brier score),
+- counterfactual exposed-vs-unexposed effect summaries.
+
+## MTP recovery / validation workflow
+
+```
+cargo run --release --example mtp_recovery
+```
+
+Simulates a realistic policy-evaluation setting (preventive care program vs usual
+care), fits an MTP model, and reports:
+- posterior predictive calibration checks against known data-generating truth,
+- incremental per-person cost and cohort budget-impact estimates,
+- counterfactual effect recovery versus ground truth,
+- simple pass/fail sanity checks.
