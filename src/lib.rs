@@ -8,12 +8,14 @@
 //! The crate was initially developed for healthcare outcome analyses, but the API is
 //! intentionally domain-agnostic and can be reused in other settings.
 
+pub mod inference;
 pub mod input;
 pub mod models;
 pub mod preprocess;
 pub mod utils;
 
-pub use input::{InputError, ModelInput};
+pub use inference::{InferenceError, McmcConfig, ProposalStats};
+pub use input::{InputError, LongitudinalInputError, LongitudinalModelInput, ModelInput};
 pub use preprocess::{
     OutcomeDiagnostics, column_has_variation, drop_constant_columns, outcome_diagnostics,
 };
@@ -54,4 +56,19 @@ pub use models::comparison::{
     ComparisonTables, ModelComparison, ModelComparisonError, ModelComparisonOptions,
     ModelInformationCriteria, ModelScore, TweedieRankingRow, compare_models_input,
     render_comparison_tables,
+};
+
+pub use models::mtp::{
+    CalibrationBinSummary, CounterfactualEffects, CounterfactualEffectsSummary,
+    CounterfactualScenario, EffectIntervalSummary, FamilyRandomEffects, MtpAcceptanceRates,
+    MtpConvergenceSummary, MtpError, MtpFitOptions, MtpModel, MtpMultiChainOptions,
+    MtpMultiChainReport, MtpPosteriorDraw, MtpPosteriorSamples, MtpPosteriorSummary,
+    MtpPriorConfig, MtpProposalTuning, MtpReport, MtpSamplerConfig, MtpSamplerDiagnostics,
+    ParameterSummary, PeriodEffect, PeriodEffectSummary, PositivePartDistribution,
+    PosteriorPredictiveSummary, RandomEffectsStructure, autocorrelation,
+    compute_counterfactual_effects, compute_counterfactual_effects_summary, effective_sample_size,
+    fit_mtp_input, fit_mtp_input_multi_chain, fit_mtp_input_multi_chain_with_config,
+    fit_mtp_input_multi_chain_with_posterior, fit_mtp_input_multi_chain_with_posterior_config,
+    fit_mtp_input_with_config, fit_mtp_input_with_posterior, fit_mtp_input_with_posterior_config,
+    posterior_predictive_summary, summarize_multi_chain_convergence, summarize_posterior,
 };

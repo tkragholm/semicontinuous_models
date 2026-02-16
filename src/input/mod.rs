@@ -38,6 +38,10 @@
 use faer::Mat;
 use thiserror::Error;
 
+pub mod longitudinal;
+
+pub use longitudinal::{LongitudinalInputError, LongitudinalModelInput};
+
 /// Errors returned when validating model inputs.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum InputError {
