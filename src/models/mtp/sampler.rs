@@ -101,6 +101,56 @@ struct SamplingResult {
     acceptance_rates: MtpAcceptanceRates,
 }
 
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Clone, Copy)]
+struct PosteriorCache {
+    log_likelihood: f64,
+    log_prior_alpha: f64,
+    log_prior_beta: f64,
+    log_prior_random_effects: f64,
+    log_prior_family: f64,
+    log_prior_kappa: f64,
+    log_prior_omega: f64,
+}
+
+impl PosteriorCache {
+    fn initialize(context: &SamplerContext<'_>, state: &ChainState) -> Result<Self, MtpError> {
+        if !context.validate_state(state) {
+            return Err(MtpError::NonConvergence);
+        }
+        let log_likelihood = context.log_likelihood(state);
+        if !log_likelihood.is_finite() {
+            return Err(MtpError::NonConvergence);
+        }
+
+        let cache = Self {
+            log_likelihood,
+            log_prior_alpha: context.log_alpha_prior(&state.alpha),
+            log_prior_beta: context.log_beta_prior(&state.beta),
+            log_prior_random_effects: SamplerContext::log_subject_random_effect_prior(state),
+            log_prior_family: context.log_family_prior(&state.family_effects),
+            log_prior_kappa: context.log_kappa_prior(state.kappa),
+            log_prior_omega: context.log_omega_prior(state.omega_sq),
+        };
+
+        if !cache.total().is_finite() {
+            return Err(MtpError::NonConvergence);
+        }
+
+        Ok(cache)
+    }
+
+    const fn total(self) -> f64 {
+        self.log_likelihood
+            + self.log_prior_alpha
+            + self.log_prior_beta
+            + self.log_prior_random_effects
+            + self.log_prior_family
+            + self.log_prior_kappa
+            + self.log_prior_omega
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PosteriorSimulationRequest<'a> {
     input: &'a LongitudinalModelInput,
@@ -367,6 +417,7 @@ pub fn fit_mtp_input_multi_chain_with_posterior(
 /// # Errors
 ///
 /// Returns `MtpError` if input/options are invalid or chain fitting fails.
+#[allow(clippy::too_many_lines)]
 pub fn fit_mtp_input_multi_chain_with_posterior_config(
     input: &LongitudinalModelInput,
     config: MtpSamplerConfig,
@@ -406,27 +457,65 @@ pub fn fit_mtp_input_multi_chain_with_posterior_config(
     let retained_draws = options.retained_draws();
     let mut chain_reports = Vec::with_capacity(multi_chain.chains);
     let mut chain_posteriors = Vec::with_capacity(multi_chain.chains);
+    let prepared_input = prepared.input;
+    let prepared_subjects = prepared.subjects.as_slice();
+    let row_to_subject_ref = row_to_subject.as_slice();
+    let baseline_ref = &baseline;
+    let mut chain_results = (0..multi_chain.chains)
+        .map(|_| None)
+        .collect::<Vec<Option<Result<SamplingResult, MtpError>>>>();
 
-    for chain_index in 0..multi_chain.chains {
+    std::thread::scope(|scope| -> Result<(), MtpError> {
+        let mut handles = Vec::with_capacity(multi_chain.chains);
+        for chain_index in 0..multi_chain.chains {
+            let mut chain_options = options;
+            let index_u64 = u64::try_from(chain_index).unwrap_or(u64::MAX);
+            chain_options.seed = options
+                .seed
+                .wrapping_add(index_u64.saturating_mul(multi_chain.seed_stride));
+            let chain_config = MtpSamplerConfig {
+                fit_options: chain_options,
+                ..config
+            };
+
+            handles.push((
+                chain_index,
+                chain_options,
+                scope.spawn(move || {
+                    simulate_posterior_draws(&PosteriorSimulationRequest {
+                        input: prepared_input,
+                        subjects: prepared_subjects,
+                        row_to_subject: row_to_subject_ref,
+                        row_to_family,
+                        family_count,
+                        baseline: baseline_ref,
+                        config: chain_config,
+                        retained_draws,
+                    })
+                }),
+            ));
+        }
+
+        for (chain_index, _chain_options, handle) in handles {
+            let result = handle.join().map_err(|_| MtpError::NonConvergence)?;
+            chain_results[chain_index] = Some(result);
+        }
+
+        Ok(())
+    })?;
+
+    for (chain_index, chain_result) in chain_results
+        .iter_mut()
+        .enumerate()
+        .take(multi_chain.chains)
+    {
         let mut chain_options = options;
         let index_u64 = u64::try_from(chain_index).unwrap_or(u64::MAX);
         chain_options.seed = options
             .seed
             .wrapping_add(index_u64.saturating_mul(multi_chain.seed_stride));
 
-        let sampling = simulate_posterior_draws(&PosteriorSimulationRequest {
-            input: prepared.input,
-            subjects: &prepared.subjects,
-            row_to_subject: &row_to_subject,
-            row_to_family,
-            family_count,
-            baseline: &baseline,
-            config: MtpSamplerConfig {
-                fit_options: chain_options,
-                ..config
-            },
-            retained_draws,
-        })?;
+        let sampling = chain_result.take().ok_or(MtpError::NonConvergence)??;
 
         let posterior_summary = if sampling.samples.is_empty() {
             None
@@ -721,11 +810,8 @@ fn run_mcmc_chain(
     tuning: MtpProposalTuning,
     retained_draws: usize,
 ) -> Result<SamplingResult, MtpError> {
-    let mut log_posterior = context.log_posterior(state);
-    if !log_posterior.is_finite() {
-        return Err(MtpError::NonConvergence);
-    }
-
+    let mut posterior = PosteriorCache::initialize(context, state)?;
+    let family_rows = build_family_rows(context.row_to_family, state.family_effects.len());
     let mut counts = AcceptanceCounts::default();
     let mut draws = Vec::with_capacity(retained_draws);
 
@@ -734,7 +820,7 @@ fn run_mcmc_chain(
             context,
             rng,
             state,
-            &mut log_posterior,
+            &mut posterior,
             &proposal_scales.alpha,
             tuning.min_draw_scale,
         ));
@@ -742,7 +828,7 @@ fn run_mcmc_chain(
             context,
             rng,
             state,
-            &mut log_posterior,
+            &mut posterior,
             &proposal_scales.beta,
             tuning.min_draw_scale,
         ));
@@ -750,7 +836,7 @@ fn run_mcmc_chain(
             context,
             rng,
             state,
-            &mut log_posterior,
+            &mut posterior,
             &proposal_scales.random_effects,
             tuning.min_draw_scale,
         );
@@ -759,18 +845,19 @@ fn run_mcmc_chain(
             context,
             rng,
             state,
-            &mut log_posterior,
+            &mut posterior,
+            &family_rows,
             proposal_scales.family_effects,
             tuning.min_draw_scale,
         );
         counts.record_family_effects(accepted_family, proposed_family);
-        update_sigma_block(context, rng, state, &mut log_posterior);
+        update_sigma_block(context, rng, state, &mut posterior);
         if context.positive_part_distribution == PositivePartDistribution::LogSkewNormal {
             counts.record_kappa(update_kappa_block(
                 context,
                 rng,
                 state,
-                &mut log_posterior,
+                &mut posterior,
                 proposal_scales.kappa,
             ));
         }
@@ -778,7 +865,7 @@ fn run_mcmc_chain(
             context,
             rng,
             state,
-            &mut log_posterior,
+            &mut posterior,
             proposal_scales.log_omega_sq,
         ));
 
@@ -898,24 +985,6 @@ impl SubjectUpdateContext<'_> {
 }
 
 impl SamplerContext<'_> {
-    fn log_posterior(&self, state: &ChainState) -> f64 {
-        if !self.validate_state(state) {
-            return f64::NEG_INFINITY;
-        }
-
-        let log_likelihood = self.log_likelihood(state);
-        if !log_likelihood.is_finite() {
-            return f64::NEG_INFINITY;
-        }
-
-        let log_density = log_likelihood + self.log_priors(state);
-        if log_density.is_finite() {
-            log_density
-        } else {
-            f64::NEG_INFINITY
-        }
-    }
-
     fn validate_state(&self, state: &ChainState) -> bool {
         if !(state.omega_sq.is_finite() && state.omega_sq > 0.0 && state.kappa.is_finite()) {
             return false;
@@ -1043,66 +1112,69 @@ impl SamplerContext<'_> {
         }
     }
 
-    fn log_priors(&self, state: &ChainState) -> f64 {
-        let mut log_density = state
-            .alpha
+    fn log_alpha_prior(&self, alpha: &[f64]) -> f64 {
+        alpha
             .iter()
             .map(|value| {
                 priors::log_zero_mean_normal_density(*value, self.prior_config.alpha_variance)
             })
-            .sum::<f64>();
-        log_density += state
-            .beta
-            .iter()
+            .sum()
+    }
+
+    fn log_beta_prior(&self, beta: &[f64]) -> f64 {
+        beta.iter()
             .map(|value| {
                 priors::log_zero_mean_normal_density(*value, self.prior_config.beta_variance)
             })
-            .sum::<f64>();
+            .sum()
+    }
+
+    fn log_kappa_prior(&self, kappa: f64) -> f64 {
         if self.positive_part_distribution == PositivePartDistribution::LogSkewNormal {
-            log_density += priors::log_uniform_density(
-                state.kappa,
+            priors::log_uniform_density(
+                kappa,
                 self.prior_config.kappa_lower,
                 self.prior_config.kappa_upper,
-            );
+            )
+        } else {
+            0.0
         }
-        log_density += priors::log_inverse_gamma_density(
-            state.omega_sq,
+    }
+
+    fn log_omega_prior(&self, omega_sq: f64) -> f64 {
+        priors::log_inverse_gamma_density(
+            omega_sq,
             self.prior_config.omega_sq_shape,
             self.prior_config.omega_sq_scale,
-        );
-        log_density += Self::log_subject_random_effect_prior(state);
+        )
+    }
 
-        if self.family_random_effects != FamilyRandomEffects::Disabled {
-            log_density += state
-                .family_effects
-                .iter()
-                .map(|effect| {
-                    priors::log_zero_mean_normal_density(
-                        effect[0],
-                        self.prior_config.family_binary_variance,
-                    ) + priors::log_zero_mean_normal_density(
-                        effect[1],
-                        self.prior_config.family_mean_variance,
-                    )
-                })
-                .sum::<f64>();
+    fn family_effect_log_prior(&self, effect: [f64; 2]) -> f64 {
+        if self.family_random_effects == FamilyRandomEffects::Disabled {
+            0.0
+        } else {
+            priors::log_zero_mean_normal_density(
+                effect[0],
+                self.prior_config.family_binary_variance,
+            ) + priors::log_zero_mean_normal_density(
+                effect[1],
+                self.prior_config.family_mean_variance,
+            )
         }
-        log_density
+    }
+
+    fn log_family_prior(&self, family_effects: &[[f64; 2]]) -> f64 {
+        family_effects
+            .iter()
+            .copied()
+            .map(|effect| self.family_effect_log_prior(effect))
+            .sum()
     }
 
     fn log_subject_random_effect_prior(state: &ChainState) -> f64 {
         (0..state.subject_effects.len())
             .map(|subject_idx| Self::subject_random_effect_log_prior(state, subject_idx))
             .sum()
-    }
-
-    fn subject_log_posterior_contribution(&self, state: &ChainState, subject_idx: usize) -> f64 {
-        let log_likelihood = self.subject_log_likelihood(state, subject_idx);
-        if !log_likelihood.is_finite() {
-            return f64::NEG_INFINITY;
-        }
-
-        log_likelihood + Self::subject_random_effect_log_prior(state, subject_idx)
     }
 
     fn subject_log_likelihood(&self, state: &ChainState, subject_idx: usize) -> f64 {
@@ -1128,6 +1200,32 @@ impl SamplerContext<'_> {
         sum
     }
 
+    fn family_log_likelihood(&self, state: &ChainState, rows: &[usize]) -> f64 {
+        if rows.is_empty() {
+            return 0.0;
+        }
+
+        let omega = state.omega_sq.sqrt();
+        let kappa = self.effective_kappa(state);
+        let delta = kappa / kappa.mul_add(kappa, 1.0).sqrt();
+        let log_phi_omega_delta =
+            if self.positive_part_distribution == PositivePartDistribution::LogSkewNormal {
+                likelihood::log_standard_normal_cdf(omega * delta)
+            } else {
+                0.0
+            };
+
+        let mut sum = 0.0;
+        for row in rows {
+            let contribution = self.row_log_likelihood(state, *row, omega, kappa, log_phi_omega_delta);
+            if !contribution.is_finite() {
+                return f64::NEG_INFINITY;
+            }
+            sum += contribution;
+        }
+        sum
+    }
+
     fn subject_random_effect_log_prior(state: &ChainState, subject_idx: usize) -> f64 {
         let effect = &state.subject_effects[subject_idx];
         let mut quadratic = 0.0;
@@ -1144,35 +1242,69 @@ fn update_alpha_block(
     context: &SamplerContext<'_>,
     rng: &mut StdRng,
     state: &mut ChainState,
-    log_posterior: &mut f64,
+    posterior: &mut PosteriorCache,
     scales: &[f64],
     min_draw_scale: f64,
 ) -> bool {
+    let current_total = posterior.total();
     let proposal = random_walk_vector(&state.alpha, scales, rng, min_draw_scale);
-    let mut candidate = state.clone();
-    candidate.alpha = proposal;
-    metropolis_update(context, rng, state, log_posterior, candidate)
+    let previous = std::mem::replace(&mut state.alpha, proposal);
+
+    let candidate_log_likelihood = context.log_likelihood(state);
+    if !candidate_log_likelihood.is_finite() {
+        state.alpha = previous;
+        return false;
+    }
+    let candidate_alpha_prior = context.log_alpha_prior(&state.alpha);
+    let candidate_total = current_total - posterior.log_likelihood - posterior.log_prior_alpha
+        + candidate_log_likelihood
+        + candidate_alpha_prior;
+    let accepted = should_accept(candidate_total - current_total, rng);
+    if accepted {
+        posterior.log_likelihood = candidate_log_likelihood;
+        posterior.log_prior_alpha = candidate_alpha_prior;
+    } else {
+        state.alpha = previous;
+    }
+    accepted
 }
 
 fn update_beta_block(
     context: &SamplerContext<'_>,
     rng: &mut StdRng,
     state: &mut ChainState,
-    log_posterior: &mut f64,
+    posterior: &mut PosteriorCache,
     scales: &[f64],
     min_draw_scale: f64,
 ) -> bool {
+    let current_total = posterior.total();
     let proposal = random_walk_vector(&state.beta, scales, rng, min_draw_scale);
-    let mut candidate = state.clone();
-    candidate.beta = proposal;
-    metropolis_update(context, rng, state, log_posterior, candidate)
+    let previous = std::mem::replace(&mut state.beta, proposal);
+
+    let candidate_log_likelihood = context.log_likelihood(state);
+    if !candidate_log_likelihood.is_finite() {
+        state.beta = previous;
+        return false;
+    }
+    let candidate_beta_prior = context.log_beta_prior(&state.beta);
+    let candidate_total = current_total - posterior.log_likelihood - posterior.log_prior_beta
+        + candidate_log_likelihood
+        + candidate_beta_prior;
+    let accepted = should_accept(candidate_total - current_total, rng);
+    if accepted {
+        posterior.log_likelihood = candidate_log_likelihood;
+        posterior.log_prior_beta = candidate_beta_prior;
+    } else {
+        state.beta = previous;
+    }
+    accepted
 }
 
 fn update_random_effects_block(
     context: &SamplerContext<'_>,
     rng: &mut StdRng,
     state: &mut ChainState,
-    log_posterior: &mut f64,
+    posterior: &mut PosteriorCache,
     scales: &[f64],
     min_draw_scale: f64,
 ) -> (usize, usize) {
@@ -1184,10 +1316,11 @@ fn update_random_effects_block(
     let proposed = state.subject_effects.len();
 
     for subject_idx in 0..state.subject_effects.len() {
-        let current_contribution = context.subject_log_posterior_contribution(state, subject_idx);
-        if !current_contribution.is_finite() {
+        let current_log_likelihood = context.subject_log_likelihood(state, subject_idx);
+        if !current_log_likelihood.is_finite() {
             continue;
         }
+        let current_log_prior = SamplerContext::subject_random_effect_log_prior(state, subject_idx);
 
         let proposal = random_walk_vector(
             &state.subject_effects[subject_idx],
@@ -1196,12 +1329,18 @@ fn update_random_effects_block(
             min_draw_scale,
         );
         let previous = std::mem::replace(&mut state.subject_effects[subject_idx], proposal);
-        let candidate_contribution = context.subject_log_posterior_contribution(state, subject_idx);
+        let candidate_log_likelihood = context.subject_log_likelihood(state, subject_idx);
+        let candidate_log_prior = SamplerContext::subject_random_effect_log_prior(state, subject_idx);
 
-        if candidate_contribution.is_finite()
-            && should_accept(candidate_contribution - current_contribution, rng)
+        if candidate_log_likelihood.is_finite()
+            && should_accept(
+                (candidate_log_likelihood - current_log_likelihood)
+                    + (candidate_log_prior - current_log_prior),
+                rng,
+            )
         {
-            *log_posterior += candidate_contribution - current_contribution;
+            posterior.log_likelihood += candidate_log_likelihood - current_log_likelihood;
+            posterior.log_prior_random_effects += candidate_log_prior - current_log_prior;
             accepted += 1;
         } else {
             state.subject_effects[subject_idx] = previous;
@@ -1215,7 +1354,8 @@ fn update_family_effects_block(
     context: &SamplerContext<'_>,
     rng: &mut StdRng,
     state: &mut ChainState,
-    log_posterior: &mut f64,
+    posterior: &mut PosteriorCache,
+    family_rows: &[Vec<usize>],
     scales: [f64; 2],
     min_draw_scale: f64,
 ) -> (usize, usize) {
@@ -1228,10 +1368,19 @@ fn update_family_effects_block(
     let mut accepted = 0;
     let proposed = state.family_effects.len();
 
-    for family_idx in 0..state.family_effects.len() {
-        let mut candidate = state.clone();
+    for (family_idx, rows) in family_rows
+        .iter()
+        .enumerate()
+        .take(state.family_effects.len())
+    {
         let current = state.family_effects[family_idx];
-        candidate.family_effects[family_idx] = [
+        let current_log_likelihood = context.family_log_likelihood(state, rows);
+        if !current_log_likelihood.is_finite() {
+            continue;
+        }
+        let current_log_prior = context.family_effect_log_prior(current);
+
+        state.family_effects[family_idx] = [
             scales[0]
                 .max(min_draw_scale)
                 .mul_add(sample_standard_normal(rng), current[0]),
@@ -1239,8 +1388,21 @@ fn update_family_effects_block(
                 .max(min_draw_scale)
                 .mul_add(sample_standard_normal(rng), current[1]),
         ];
-        if metropolis_update(context, rng, state, log_posterior, candidate) {
+        let candidate_log_likelihood = context.family_log_likelihood(state, rows);
+        let candidate_log_prior = context.family_effect_log_prior(state.family_effects[family_idx]);
+
+        if candidate_log_likelihood.is_finite()
+            && should_accept(
+                (candidate_log_likelihood - current_log_likelihood)
+                    + (candidate_log_prior - current_log_prior),
+                rng,
+            )
+        {
+            posterior.log_likelihood += candidate_log_likelihood - current_log_likelihood;
+            posterior.log_prior_family += candidate_log_prior - current_log_prior;
             accepted += 1;
+        } else {
+            state.family_effects[family_idx] = current;
         }
     }
 
@@ -1251,7 +1413,7 @@ fn update_sigma_block(
     context: &SamplerContext<'_>,
     rng: &mut StdRng,
     state: &mut ChainState,
-    log_posterior: &mut f64,
+    posterior: &mut PosteriorCache,
 ) {
     let dim = state.random_effects_cov.ncols();
     let n_subjects = state.subject_effects.len();
@@ -1278,71 +1440,90 @@ fn update_sigma_block(
 
     state.random_effects_cov = sampled_covariance;
     state.random_effects_precision = sampled_precision;
-    *log_posterior = context.log_posterior(state);
+    posterior.log_prior_random_effects = SamplerContext::log_subject_random_effect_prior(state);
 }
 
 fn update_kappa_block(
     context: &SamplerContext<'_>,
     rng: &mut StdRng,
     state: &mut ChainState,
-    log_posterior: &mut f64,
+    posterior: &mut PosteriorCache,
     scale: f64,
 ) -> bool {
-    let mut candidate = state.clone();
+    let current_total = posterior.total();
+    let previous = state.kappa;
     let kappa_lower = context.prior_config.kappa_lower;
     let kappa_upper = context.prior_config.kappa_upper;
-    candidate.kappa = scale
+    state.kappa = scale
         .mul_add(sample_standard_normal(rng), state.kappa)
         .clamp(kappa_lower, kappa_upper);
-    metropolis_update(context, rng, state, log_posterior, candidate)
+
+    let candidate_log_likelihood = context.log_likelihood(state);
+    if !candidate_log_likelihood.is_finite() {
+        state.kappa = previous;
+        return false;
+    }
+    let candidate_kappa_prior = context.log_kappa_prior(state.kappa);
+    let candidate_total = current_total - posterior.log_likelihood - posterior.log_prior_kappa
+        + candidate_log_likelihood
+        + candidate_kappa_prior;
+    let accepted = should_accept(candidate_total - current_total, rng);
+    if accepted {
+        posterior.log_likelihood = candidate_log_likelihood;
+        posterior.log_prior_kappa = candidate_kappa_prior;
+    } else {
+        state.kappa = previous;
+    }
+    accepted
 }
 
 fn update_omega_block(
     context: &SamplerContext<'_>,
     rng: &mut StdRng,
     state: &mut ChainState,
-    log_posterior: &mut f64,
+    posterior: &mut PosteriorCache,
     scale: f64,
 ) -> bool {
-    let mut candidate = state.clone();
-    let proposed_log_omega = scale.mul_add(sample_standard_normal(rng), state.omega_sq.ln());
-    candidate.omega_sq = proposed_log_omega.exp().max(1.0e-8);
-    let candidate_log_posterior = context.log_posterior(&candidate);
-    if !candidate_log_posterior.is_finite() {
+    let current_total = posterior.total();
+    let previous = state.omega_sq;
+    let proposed_log_omega = scale.mul_add(sample_standard_normal(rng), previous.ln());
+    state.omega_sq = proposed_log_omega.exp().max(1.0e-8);
+
+    let candidate_log_likelihood = context.log_likelihood(state);
+    if !candidate_log_likelihood.is_finite() {
+        state.omega_sq = previous;
         return false;
     }
-
-    let log_acceptance =
-        candidate_log_posterior + candidate.omega_sq.ln() - (*log_posterior + state.omega_sq.ln());
-    if should_accept(log_acceptance, rng) {
-        *state = candidate;
-        *log_posterior = candidate_log_posterior;
-        true
+    let candidate_omega_prior = context.log_omega_prior(state.omega_sq);
+    let candidate_total = current_total - posterior.log_likelihood - posterior.log_prior_omega
+        + candidate_log_likelihood
+        + candidate_omega_prior;
+    let log_acceptance = candidate_total + state.omega_sq.ln() - (current_total + previous.ln());
+    let accepted = should_accept(log_acceptance, rng);
+    if accepted {
+        posterior.log_likelihood = candidate_log_likelihood;
+        posterior.log_prior_omega = candidate_omega_prior;
     } else {
-        false
+        state.omega_sq = previous;
     }
+    accepted
 }
 
-fn metropolis_update(
-    context: &SamplerContext<'_>,
-    rng: &mut StdRng,
-    state: &mut ChainState,
-    log_posterior: &mut f64,
-    candidate: ChainState,
-) -> bool {
-    let candidate_log_posterior = context.log_posterior(&candidate);
-    if !candidate_log_posterior.is_finite() {
-        return false;
+fn build_family_rows(row_to_family: Option<&[usize]>, family_count: usize) -> Vec<Vec<usize>> {
+    let Some(row_to_family) = row_to_family else {
+        return Vec::new();
+    };
+    if family_count == 0 {
+        return Vec::new();
     }
 
-    let log_acceptance = candidate_log_posterior - *log_posterior;
-    if should_accept(log_acceptance, rng) {
-        *state = candidate;
-        *log_posterior = candidate_log_posterior;
-        true
-    } else {
-        false
+    let mut family_rows = vec![Vec::new(); family_count];
+    for (row, family_idx) in row_to_family.iter().copied().enumerate() {
+        if family_idx < family_count {
+            family_rows[family_idx].push(row);
+        }
     }
+    family_rows
 }
 
 fn random_walk_vector(
