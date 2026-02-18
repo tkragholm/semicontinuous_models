@@ -889,7 +889,8 @@ fn run_mcmc_chain(
     retained_draws: usize,
 ) -> Result<SamplingResult, MtpError> {
     let mut row_cache = RowLikelihoodCache::initialize(context, state)?;
-    let mut posterior = PosteriorCache::initialize_with_likelihood(context, state, row_cache.total)?;
+    let mut posterior =
+        PosteriorCache::initialize_with_likelihood(context, state, row_cache.total)?;
     let family_rows = build_family_rows(context.row_to_family, state.family_effects.len());
     let mut counts = AcceptanceCounts::default();
     let mut draws = Vec::with_capacity(retained_draws);
@@ -1310,7 +1311,11 @@ impl SamplerContext<'_> {
             let contribution = self.row_log_likelihood_with_terms(
                 self.input.outcome[(*row, 0)],
                 row_cache.binary_fixed[*row]
-                    + random_binary_component(subject_effect, self.input.time[*row], self.structure)
+                    + random_binary_component(
+                        subject_effect,
+                        self.input.time[*row],
+                        self.structure,
+                    )
                     + family_effect[0],
                 row_cache.mean_fixed[*row]
                     + random_mean_component(subject_effect, self.input.time[*row], self.structure)
@@ -1355,7 +1360,11 @@ impl SamplerContext<'_> {
             let contribution = self.row_log_likelihood_with_terms(
                 self.input.outcome[(*row, 0)],
                 row_cache.binary_fixed[*row]
-                    + random_binary_component(subject_effect, self.input.time[*row], self.structure)
+                    + random_binary_component(
+                        subject_effect,
+                        self.input.time[*row],
+                        self.structure,
+                    )
                     + family_effect[0],
                 row_cache.mean_fixed[*row]
                     + random_mean_component(subject_effect, self.input.time[*row], self.structure)
@@ -1466,9 +1475,11 @@ fn update_alpha_block(
     let previous = std::mem::replace(&mut state.alpha, proposal_buffer.clone());
 
     let candidate_binary_fixed = linear_predictor(&context.input.x_binary, &state.alpha);
-    let Some(candidate_rows) =
-        context.recompute_all_rows_with_terms(state, &candidate_binary_fixed, &row_cache.mean_fixed)
-    else {
+    let Some(candidate_rows) = context.recompute_all_rows_with_terms(
+        state,
+        &candidate_binary_fixed,
+        &row_cache.mean_fixed,
+    ) else {
         state.alpha = previous;
         return false;
     };
@@ -1481,7 +1492,11 @@ fn update_alpha_block(
     if accepted {
         posterior.log_likelihood = candidate_log_likelihood;
         posterior.log_prior_alpha = candidate_alpha_prior;
-        row_cache.replace_all_rows(candidate_rows, candidate_binary_fixed, row_cache.mean_fixed.clone());
+        row_cache.replace_all_rows(
+            candidate_rows,
+            candidate_binary_fixed,
+            row_cache.mean_fixed.clone(),
+        );
     } else {
         state.alpha = previous;
     }
@@ -1521,7 +1536,11 @@ fn update_beta_block(
     if accepted {
         posterior.log_likelihood = candidate_log_likelihood;
         posterior.log_prior_beta = candidate_beta_prior;
-        row_cache.replace_all_rows(candidate_rows, row_cache.binary_fixed.clone(), candidate_mean_fixed);
+        row_cache.replace_all_rows(
+            candidate_rows,
+            row_cache.binary_fixed.clone(),
+            candidate_mean_fixed,
+        );
     } else {
         state.beta = previous;
     }
@@ -1561,8 +1580,10 @@ fn evaluate_subject_proposals(
                     &proposals[subject_idx],
                 )?;
                 let candidate_sum = candidate_rows.iter().sum::<f64>();
-                let candidate_prior =
-                    subject_effect_log_prior(&proposals[subject_idx], &state.random_effects_precision);
+                let candidate_prior = subject_effect_log_prior(
+                    &proposals[subject_idx],
+                    &state.random_effects_precision,
+                );
                 Some(SubjectProposalEvaluation {
                     candidate_row_values: candidate_rows,
                     current_sum,
@@ -1604,10 +1625,8 @@ fn evaluate_subject_proposals(
                         continue;
                     };
                     let candidate_sum = candidate_rows.iter().sum::<f64>();
-                    let candidate_prior = subject_effect_log_prior(
-                        proposal,
-                        &state.random_effects_precision,
-                    );
+                    let candidate_prior =
+                        subject_effect_log_prior(proposal, &state.random_effects_precision);
 
                     local.push((
                         subject_idx,
@@ -1726,8 +1745,10 @@ fn update_family_effects_block(
         let candidate_sum = candidate_rows.iter().sum::<f64>();
         let candidate_log_prior = context.family_effect_log_prior(candidate_effect);
 
-        if should_accept((candidate_sum - current_sum) + (candidate_log_prior - current_log_prior), rng)
-        {
+        if should_accept(
+            (candidate_sum - current_sum) + (candidate_log_prior - current_log_prior),
+            rng,
+        ) {
             state.family_effects[family_idx] = candidate_effect;
             let likelihood_delta = row_cache.replace_rows(rows, &candidate_rows);
             posterior.log_likelihood += likelihood_delta;
@@ -1789,9 +1810,11 @@ fn update_kappa_block(
         .mul_add(sample_standard_normal(rng), state.kappa)
         .clamp(kappa_lower, kappa_upper);
 
-    let Some(candidate_rows) =
-        context.recompute_all_rows_with_terms(state, &row_cache.binary_fixed, &row_cache.mean_fixed)
-    else {
+    let Some(candidate_rows) = context.recompute_all_rows_with_terms(
+        state,
+        &row_cache.binary_fixed,
+        &row_cache.mean_fixed,
+    ) else {
         state.kappa = previous;
         return false;
     };
@@ -1825,9 +1848,11 @@ fn update_omega_block(
     let proposed_log_omega = scale.mul_add(sample_standard_normal(rng), previous.ln());
     state.omega_sq = proposed_log_omega.exp().max(1.0e-8);
 
-    let Some(candidate_rows) =
-        context.recompute_all_rows_with_terms(state, &row_cache.binary_fixed, &row_cache.mean_fixed)
-    else {
+    let Some(candidate_rows) = context.recompute_all_rows_with_terms(
+        state,
+        &row_cache.binary_fixed,
+        &row_cache.mean_fixed,
+    ) else {
         state.omega_sq = previous;
         return false;
     };
@@ -1874,9 +1899,12 @@ fn random_walk_vector_into(
     min_draw_scale: f64,
 ) {
     output.clear();
-    output.extend(values.iter().zip(scales.iter()).map(|(value, scale)| {
-        value + scale.max(min_draw_scale) * sample_standard_normal(rng)
-    }));
+    output.extend(
+        values
+            .iter()
+            .zip(scales.iter())
+            .map(|(value, scale)| value + scale.max(min_draw_scale) * sample_standard_normal(rng)),
+    );
 }
 
 fn should_accept(log_acceptance: f64, rng: &mut StdRng) -> bool {
@@ -2616,8 +2644,8 @@ mod tests {
             ..MtpSamplerConfig::default()
         };
 
-        let (_, _, single_posterior) =
-            fit_mtp_input_with_posterior_config(&input, config).expect("single-chain fit should run");
+        let (_, _, single_posterior) = fit_mtp_input_with_posterior_config(&input, config)
+            .expect("single-chain fit should run");
         let (_, _, chains) = fit_mtp_input_multi_chain_with_posterior_config(
             &input,
             config,
