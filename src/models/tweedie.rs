@@ -24,6 +24,7 @@ use crate::models::{
 };
 use crate::utils::{
     add_ridge_to_diagonal, max_abs_diff, solve_linear_system, solve_linear_system_ref,
+    weighted_xtx, weighted_xtz,
 };
 
 const LINEAR_PREDICTOR_CLIP: f64 = 30.0;
@@ -572,33 +573,6 @@ fn robust_covariance(
     }
     let cov = sandwich_covariance(xtwx, &meat)?;
     Ok((Some(cov), false, None))
-}
-
-fn weighted_xtx(x: &Mat<f64>, weights: &Mat<f64>) -> Mat<f64> {
-    let p = x.ncols();
-    let mut xtx = Mat::<f64>::zeros(p, p);
-    for i in 0..x.nrows() {
-        let w = weights[(i, 0)];
-        for col_i in 0..p {
-            let wxi = w * x[(i, col_i)];
-            for col_j in 0..p {
-                xtx[(col_i, col_j)] = wxi.mul_add(x[(i, col_j)], xtx[(col_i, col_j)]);
-            }
-        }
-    }
-    xtx
-}
-
-fn weighted_xtz(x: &Mat<f64>, weights: &Mat<f64>, z: &Mat<f64>) -> Mat<f64> {
-    let p = x.ncols();
-    let mut xtz = Mat::<f64>::zeros(p, 1);
-    for i in 0..x.nrows() {
-        let wz = weights[(i, 0)] * z[(i, 0)];
-        for col in 0..p {
-            xtz[(col, 0)] = x[(i, col)].mul_add(wz, xtz[(col, 0)]);
-        }
-    }
-    xtz
 }
 
 fn sandwich_covariance(xtwx: &Mat<f64>, meat: &Mat<f64>) -> Result<Mat<f64>, TweedieError> {

@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use crate::utils::acceptance_rate;
+use crate::utils::{acceptance_rate, retained_draws};
 
 /// Errors for generic MCMC configuration.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +60,7 @@ impl McmcConfig {
     /// Number of retained draws implied by this configuration.
     #[must_use]
     pub const fn retained_draws(self) -> usize {
-        (self.iterations - self.burn_in) / self.thin
+        retained_draws(self.iterations, self.burn_in, self.thin)
     }
 }
 

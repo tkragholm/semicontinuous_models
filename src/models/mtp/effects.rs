@@ -6,7 +6,7 @@ use crate::utils::{EffectIntervalSummary, dot_row, summarize_draws, usize_to_f64
 
 use super::likelihood::logistic_stable;
 use super::posterior::MtpPosteriorSamples;
-use super::types::MtpError;
+use super::types::{MtpError, validate_draw_dimensions};
 
 /// Exposed/unexposed design scenarios for posterior contrast calculations.
 #[derive(Debug, Clone)]
@@ -140,18 +140,7 @@ pub fn compute_counterfactual_effects_summary(
     let mut cumulative_additive_draws = Vec::with_capacity(draw_count);
 
     for draw in &samples.draws {
-        if draw.alpha.len() != alpha_len {
-            return Err(MtpError::DesignCoefficientMismatch {
-                design_cols: alpha_len,
-                coef_len: draw.alpha.len(),
-            });
-        }
-        if draw.beta.len() != beta_len {
-            return Err(MtpError::DesignCoefficientMismatch {
-                design_cols: beta_len,
-                coef_len: draw.beta.len(),
-            });
-        }
+        validate_draw_dimensions(alpha_len, beta_len, draw.alpha.len(), draw.beta.len())?;
 
         let mut cumulative_additive = 0.0;
         for row in 0..periods {

@@ -184,6 +184,11 @@ pub fn acceptance_rate(accepted: usize, proposed: usize) -> f64 {
 }
 
 #[must_use]
+pub const fn retained_draws(iterations: usize, burn_in: usize, thin: usize) -> usize {
+    (iterations - burn_in) / thin
+}
+
+#[must_use]
 pub fn dot_row(matrix: &Mat<f64>, row: usize, coefficients: &[f64]) -> f64 {
     (0..matrix.ncols())
         .map(|col| matrix[(row, col)] * coefficients[col])

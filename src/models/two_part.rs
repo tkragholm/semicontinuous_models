@@ -46,7 +46,7 @@ use crate::models::{
 use crate::utils::weighted_xtz;
 use crate::utils::{
     add_ridge_to_diagonal, max_abs_diff, mean_column, mean_vector, solve_linear_system,
-    solve_linear_system_ref, std_vector, weighted_xtz_with_buffer,
+    solve_linear_system_ref, std_vector, weighted_xtx, weighted_xtz_with_buffer,
 };
 use faer::Mat;
 use rand::prelude::*;
@@ -1316,22 +1316,6 @@ fn diag_sqrt(covariance: &Mat<f64>) -> Mat<f64> {
     Mat::from_fn(covariance.nrows(), 1, |i, _| {
         covariance[(i, i)].max(0.0).sqrt()
     })
-}
-
-fn weighted_xtx(x: &Mat<f64>, weights: &Mat<f64>) -> Mat<f64> {
-    let n = x.nrows();
-    let p = x.ncols();
-    let mut xtx = Mat::<f64>::zeros(p, p);
-    for i in 0..n {
-        let w = weights[(i, 0)];
-        for col_i in 0..p {
-            let wxi = w * x[(i, col_i)];
-            for col_j in 0..p {
-                xtx[(col_i, col_j)] = wxi.mul_add(x[(i, col_j)], xtx[(col_i, col_j)]);
-            }
-        }
-    }
-    xtx
 }
 
 #[cfg(feature = "bench-internals")]

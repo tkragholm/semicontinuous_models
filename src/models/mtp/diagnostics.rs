@@ -9,7 +9,9 @@ use crate::utils::{
 use super::likelihood::logistic_stable;
 
 use super::posterior::MtpPosteriorSamples;
-use super::types::{MtpConvergenceSummary, MtpError, validate_chain_count};
+use super::types::{
+    MtpConvergenceSummary, MtpError, validate_chain_count, validate_draw_dimensions,
+};
 
 /// Lag-`k` autocorrelation for a scalar chain.
 #[must_use]
@@ -105,9 +107,8 @@ pub fn summarize_multi_chain_convergence(
             });
         }
         for draw in chain.draws.iter().take(draws_per_chain_used) {
-            if draw.alpha.len() != alpha_len || draw.beta.len() != beta_len {
-                return Err(MtpError::InconsistentPosteriorDimensions);
-            }
+            validate_draw_dimensions(alpha_len, beta_len, draw.alpha.len(), draw.beta.len())
+                .map_err(|_| MtpError::InconsistentPosteriorDimensions)?;
         }
     }
 
@@ -199,18 +200,7 @@ pub fn posterior_predictive_summary(
     let mut brier_draws = Vec::with_capacity(samples.len());
 
     for draw in &samples.draws {
-        if draw.alpha.len() != alpha_len {
-            return Err(MtpError::DesignCoefficientMismatch {
-                design_cols: alpha_len,
-                coef_len: draw.alpha.len(),
-            });
-        }
-        if draw.beta.len() != beta_len {
-            return Err(MtpError::DesignCoefficientMismatch {
-                design_cols: beta_len,
-                coef_len: draw.beta.len(),
-            });
-        }
+        validate_draw_dimensions(alpha_len, beta_len, draw.alpha.len(), draw.beta.len())?;
 
         let mut zero_sum = 0.0;
         let mut mean_sum = 0.0;

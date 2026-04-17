@@ -1,7 +1,9 @@
 //! Sampler entrypoints for correlated longitudinal MTP.
 
 use crate::input::LongitudinalModelInput;
-use crate::utils::{acceptance_rate, weighted_xtx, weighted_xtz};
+use crate::utils::acceptance_rate;
+#[cfg(feature = "bench-internals")]
+use crate::utils::{weighted_xtx, weighted_xtz};
 use faer::Mat;
 use std::time::Instant;
 

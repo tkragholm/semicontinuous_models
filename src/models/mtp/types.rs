@@ -161,8 +161,30 @@ impl MtpFitOptions {
     /// Number of retained draws implied by `(iterations, burn_in, thin)`.
     #[must_use]
     pub const fn retained_draws(self) -> usize {
-        (self.iterations - self.burn_in) / self.thin
+        crate::utils::retained_draws(self.iterations, self.burn_in, self.thin)
     }
+}
+
+/// Validate the posterior draw dimensions used by MTP summary calculations.
+pub(super) const fn validate_draw_dimensions(
+    alpha_len: usize,
+    beta_len: usize,
+    draw_alpha_len: usize,
+    draw_beta_len: usize,
+) -> Result<(), MtpError> {
+    if draw_alpha_len != alpha_len {
+        return Err(MtpError::DesignCoefficientMismatch {
+            design_cols: alpha_len,
+            coef_len: draw_alpha_len,
+        });
+    }
+    if draw_beta_len != beta_len {
+        return Err(MtpError::DesignCoefficientMismatch {
+            design_cols: beta_len,
+            coef_len: draw_beta_len,
+        });
+    }
+    Ok(())
 }
 
 /// Proposal-scale and adaptation controls for MTP MCMC.
