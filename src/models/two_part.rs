@@ -1503,13 +1503,13 @@ mod tests {
     #[case::elastic_net(Regularization::ElasticNet { lambda: 0.1, alpha: 0.5, exclude_intercept: true }, false)]
     fn test_two_part_regularization_options(#[case] reg: Regularization, #[case] robust_se: bool) {
         let n = 50;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) / 10.0 });
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 });
         let mut y = Mat::<f64>::zeros(n, 1);
         for i in 0..n {
             y[(i, 0)] = if i % 3 == 0 {
                 0.0
             } else {
-                0.1f64.mul_add(idx_to_f64(i), 1.0)
+                0.1f64.mul_add(usize_to_f64(i), 1.0)
             };
         }
 
@@ -1530,8 +1530,8 @@ mod tests {
     #[test]
     fn two_part_model_handles_all_positive_outcomes() {
         let n = 40;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) / 10.0 });
-        let y = Mat::from_fn(n, 1, |i, _| 1.0 + idx_to_f64(i) / 100.0);
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 });
+        let y = Mat::from_fn(n, 1, |i, _| 1.0 + usize_to_f64(i) / 100.0);
 
         let (_model, report) = fit_two_part(&x, &y, FitOptions::default())
             .expect("all-positive outcomes should still fit");
@@ -1557,13 +1557,13 @@ mod tests {
     #[test]
     fn bootstrap_produces_parameter_samples() {
         let n = 40;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) / 10.0 });
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 });
         let mut y = Mat::<f64>::zeros(n, 1);
         for i in 0..n {
             y[(i, 0)] = if i % 4 == 0 {
                 0.0
             } else {
-                0.1f64.mul_add(idx_to_f64(i), 1.0)
+                0.1f64.mul_add(usize_to_f64(i), 1.0)
             };
         }
 
@@ -1624,8 +1624,8 @@ mod tests {
             let betas = (0..reps)
                 .map(|draw| {
                     Mat::from_fn(4, 1, |coef, _| {
-                        let d = idx_to_f64(draw);
-                        let c = idx_to_f64(coef);
+                        let d = usize_to_f64(draw);
+                        let c = usize_to_f64(coef);
                         0.001f64
                             .mul_add(-d, 0.05f64.mul_add(c, (0.17f64.mul_add(d, 0.31 * c)).sin()))
                     })
@@ -1682,14 +1682,14 @@ mod tests {
     #[test]
     fn fit_with_cluster_robust_se() {
         let n = 30;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) / 5.0 });
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 5.0 });
         let mut y = Mat::<f64>::zeros(n, 1);
         let clusters: Vec<u64> = (0..n).map(|i| (i / 5) as u64).collect();
         for i in 0..n {
             y[(i, 0)] = if i % 4 == 0 {
                 0.0
             } else {
-                0.1f64.mul_add(idx_to_f64(i), 1.0)
+                0.1f64.mul_add(usize_to_f64(i), 1.0)
             };
         }
 
@@ -1728,7 +1728,7 @@ mod tests {
         // Create a problem that is hard to converge without regularization
         // by having very few observations or high collinearity.
         let n = 10;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) });
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) });
         let y = Mat::from_fn(n, 1, |i, _| if i == 0 { 0.0 } else { 1.0 });
 
         let options = FitOptions {

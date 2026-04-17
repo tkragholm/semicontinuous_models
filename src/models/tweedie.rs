@@ -824,7 +824,7 @@ mod tests {
     #[test]
     fn fit_strategy_relaxed_handles_tweedie_non_convergence() {
         let n = 10;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) });
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) });
         let y = Mat::from_fn(n, 1, |i, _| if i == 0 { 0.0 } else { 1.0 });
 
         let options = TweedieOptions {

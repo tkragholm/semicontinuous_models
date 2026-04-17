@@ -690,7 +690,7 @@ mod tests {
     fn cross_validate_rejects_invalid_fold_counts() {
         let n = 8;
         let design_matrix =
-            Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) / 10.0 });
+            Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 });
         let outcome = Mat::from_fn(n, 1, |i, _| if i % 3 == 0 { 0.0 } else { 1.0 });
         let input = ModelInput::new(design_matrix, outcome);
 
@@ -715,7 +715,7 @@ mod tests {
     fn cross_validate_allows_empty_power_grid() {
         let n = 30;
         let design_matrix =
-            Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) / 10.0 });
+            Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 });
         let outcome = Mat::from_fn(n, 1, |i, _| if i % 5 == 0 { 0.0 } else { 1.0 });
         let input = ModelInput::new(design_matrix, outcome);
         let result = cross_validate_models_input(&input, &[], CrossValidationOptions::default())
@@ -727,7 +727,7 @@ mod tests {
     fn cross_validate_can_skip_two_part_and_lognormal() {
         let n = 30;
         let design_matrix =
-            Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) / 10.0 });
+            Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 });
         let outcome = Mat::from_fn(n, 1, |i, _| if i % 5 == 0 { 0.0 } else { 1.0 });
         let input = ModelInput::new(design_matrix, outcome);
         let result = cross_validate_models_input(
@@ -749,7 +749,7 @@ mod tests {
     fn cross_validate_is_deterministic_for_fixed_seed() {
         let n = 40;
         let design_matrix =
-            Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) / 8.0 });
+            Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 8.0 });
         let outcome = Mat::from_fn(n, 1, |i, _| if i % 6 == 0 { 0.0 } else { 1.0 });
         let input = ModelInput::new(design_matrix, outcome);
         let options = CrossValidationOptions::builder()
@@ -777,7 +777,7 @@ mod tests {
     fn cross_validate_propagates_two_part_model_errors() {
         let n = 20;
         let design_matrix =
-            Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) / 5.0 });
+            Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 5.0 });
         let outcome = Mat::from_fn(n, 1, |_i, _| 0.0);
         let input = ModelInput::new(design_matrix, outcome);
         let err = cross_validate_models_input(&input, &[], CrossValidationOptions::default())
