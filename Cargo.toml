@@ -1,0 +1,57 @@
+[package]
+name = "semicontinuous_models"
+version = "0.1.1"
+edition = "2024"
+authors = ["Tobias Kragholm"]
+license = "MIT OR Apache-2.0"
+description = "Reusable models for semi-continuous outcomes (two-part, Tweedie, and log-normal)"
+readme = "README.md"
+documentation = "https://docs.rs/semicontinuous_models"
+repository = "https://github.com/tkragholm/semicontinuous_models"
+keywords = ["glm", "two-part", "tweedie", "lognormal", "statistics"]
+categories = ["science", "mathematics", "algorithms"]
+exclude = ["target/", ".DS_Store"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+crate-type = ["lib"]
+
+[features]
+bench-internals = []
+
+[dependencies]
+bon = "3"
+thiserror = "2.0.18"
+faer = { version = "0.24.0", features = ["nightly", "perf-warn"] }
+rand = "0.10.0"
+rand_distr = "0.6.0"
+statrs = "0.18.0"
+num-traits = "0.2.19"
+cgp = "0.7.0"
+comfy-table = "7.2.2"
+dyn-stack = "0.13.2"
+tracing = "0.1.41"
+rayon = "1.11.0"
+
+[dev-dependencies]
+approx = "0.5.1"
+criterion = { version = "0.8.2", default-features = false }
+rstest = "0.26"
+proptest = "1.6.0"
+
+[[bench]]
+name = "mtp_linear_algebra"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "two_part_bootstrap"
+harness = false
+
+[[bench]]
+name = "mtp_rng_kernels"
+harness = false
+required-features = ["bench-internals"]
