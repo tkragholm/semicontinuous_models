@@ -318,13 +318,6 @@ pub struct TwoPartReport {
     pub attempts: Vec<AttemptDiagnostics>,
 }
 
-impl TwoPartReport {
-    #[must_use]
-    pub fn attempts(&self) -> &[AttemptDiagnostics] {
-        &self.attempts
-    }
-}
-
 impl Model for TwoPartModel {
     type Prediction = TwoPartPrediction;
     type Report = TwoPartReport;
@@ -1472,15 +1465,12 @@ impl TwoPartTrainer {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
-
-    fn idx_to_f64(idx: usize) -> f64 {
-        f64::from(u32::try_from(idx).unwrap_or(u32::MAX))
-    }
+    use crate::utils::usize_to_f64;
 
     #[test]
     fn two_part_model_runs_on_synthetic_data() {
         let n = 200;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) / 50.0 });
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 50.0 });
 
         let mut y = Mat::<f64>::zeros(n, 1);
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);

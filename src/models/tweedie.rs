@@ -23,7 +23,8 @@ use crate::models::{
     AttemptDiagnostics, AttemptOutcome, FitMetadata, FitStrategy, Model, SolverKind,
 };
 use crate::utils::{
-    add_ridge_to_diagonal, max_abs_diff, solve_linear_system, solve_linear_system_ref,
+    add_ridge_to_diagonal, add_row_outer_product_scaled, max_abs_diff, solve_linear_system,
+    solve_linear_system_ref,
     weighted_xtx, weighted_xtz,
 };
 
@@ -93,26 +94,22 @@ pub enum TweedieError {
     SolveFailed,
 }
 
-impl From<InputError> for TweedieError {
-    fn from(value: InputError) -> Self {
-        match value {
-            InputError::EmptyDesign => Self::EmptyDesign,
-            InputError::InvalidOutcomeShape => Self::InvalidOutcomeShape,
-            InputError::DimensionMismatch { rows, len } => Self::DimensionMismatch { rows, len },
-            InputError::InvalidClusterLength { labels, rows } => {
-                Self::InvalidClusterLength { labels, rows }
-            }
-            InputError::NonFiniteDesign
-            | InputError::NonFiniteOutcome
-            | InputError::InvalidWeightShape
-            | InputError::NonFiniteWeights
-            | InputError::NonPositiveWeights
-            | InputError::InvalidLabelLength { .. }
-            | InputError::DuplicateLabels(_) => Self::NonFiniteInput,
-            InputError::NegativeOutcome => Self::NegativeOutcome,
-        }
-    }
-}
+crate::impl_input_error_from!(TweedieError, {
+    InputError::EmptyDesign => Self::EmptyDesign,
+    InputError::InvalidOutcomeShape => Self::InvalidOutcomeShape,
+    InputError::DimensionMismatch { rows, len } => Self::DimensionMismatch { rows, len },
+    InputError::InvalidClusterLength { labels, rows } => {
+        Self::InvalidClusterLength { labels, rows }
+    },
+    InputError::NonFiniteDesign
+    | InputError::NonFiniteOutcome
+    | InputError::InvalidWeightShape
+    | InputError::NonFiniteWeights
+    | InputError::NonPositiveWeights
+    | InputError::InvalidLabelLength { .. }
+    | InputError::DuplicateLabels(_) => Self::NonFiniteInput,
+    InputError::NegativeOutcome => Self::NegativeOutcome,
+});
 
 /// Tweedie model coefficients.
 #[derive(Debug, Clone)]
@@ -142,13 +139,6 @@ pub struct TweedieReport {
     pub cluster_count: Option<usize>,
     /// History of retry attempts (if Relaxed strategy used).
     pub attempts: Vec<AttemptDiagnostics>,
-}
-
-impl TweedieReport {
-    #[must_use]
-    pub fn attempts(&self) -> &[AttemptDiagnostics] {
-        &self.attempts
-    }
 }
 
 /// Tweedie predictions (mean on original scale).
@@ -285,12 +275,7 @@ pub(crate) fn fit_tweedie(
 
         match result {
             Ok((mut model, mut report)) => {
-                let execution_time = start_time.elapsed();
-                report.meta.execution_time = execution_time;
-                report.meta.fallback_attempts = attempt_idx;
-                report.attempts = attempts;
-                model.report = report.clone();
-                return Ok((model, report));
+                crate::finalize_retry_fit!(model, report, attempts, start_time, attempt_idx);
             }
             Err(e @ (TweedieError::NonConvergence | TweedieError::SolveFailed)) => {
                 attempts.push(AttemptDiagnostics {
@@ -564,12 +549,7 @@ fn robust_covariance(
 
     for i in 0..x.nrows() {
         let resid = (y[(i, 0)] - mu[(i, 0)]) * weights[(i, 0)];
-        for j in 0..p {
-            let xj = x[(i, j)];
-            for k in 0..p {
-                meat[(j, k)] = (resid * resid * xj).mul_add(x[(i, k)], meat[(j, k)]);
-            }
-        }
+        add_row_outer_product_scaled(&mut meat, x, i, resid * resid);
     }
     let cov = sandwich_covariance(xtwx, &meat)?;
     Ok((Some(cov), false, None))
@@ -799,20 +779,17 @@ impl TweedieTrainer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn idx_to_f64(idx: usize) -> f64 {
-        f64::from(u32::try_from(idx).unwrap_or(u32::MAX))
-    }
+    use crate::utils::usize_to_f64;
 
     #[test]
     fn fit_tweedie_runs() {
         let n = 100;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) / 20.0 });
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 20.0 });
         let y = Mat::from_fn(n, 1, |i, _| {
             if i % 5 == 0 {
                 0.0
             } else {
-                0.2f64.mul_add(idx_to_f64(i), 2.0)
+                0.2f64.mul_add(usize_to_f64(i), 2.0)
             }
         });
         let (model, _report) =
@@ -826,12 +803,12 @@ mod tests {
     #[test]
     fn tweedie_reports_robust_se_with_clusters() {
         let n = 40;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) / 20.0 });
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 20.0 });
         let y = Mat::from_fn(n, 1, |i, _| {
             if i % 5 == 0 {
                 0.0
             } else {
-                0.2f64.mul_add(idx_to_f64(i), 2.0)
+                0.2f64.mul_add(usize_to_f64(i), 2.0)
             }
         });
         let clusters: Vec<u64> = (0..n).map(|i| (i / 4) as u64).collect();

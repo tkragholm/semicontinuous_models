@@ -247,6 +247,17 @@ pub fn weighted_xtz_with_buffer(
     x.transpose() * weighted_response
 }
 
+/// Add a scaled outer-product row contribution to a sandwich "meat" matrix.
+pub fn add_row_outer_product_scaled(meat: &mut Mat<f64>, x: &Mat<f64>, row: usize, scale: f64) {
+    let p = x.ncols();
+    for j in 0..p {
+        let scaled_xj = scale * x[(row, j)];
+        for k in 0..p {
+            meat[(j, k)] = scaled_xj.mul_add(x[(row, k)], meat[(j, k)]);
+        }
+    }
+}
+
 #[must_use]
 pub fn calculate_quantile(sorted_values: &[f64], quantile: f64) -> f64 {
     if sorted_values.is_empty() {

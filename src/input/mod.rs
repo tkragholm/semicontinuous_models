@@ -51,6 +51,22 @@ pub use counterfactual::{
 };
 pub use longitudinal::{LongitudinalInputError, LongitudinalModelInput};
 
+/// Generate a `From<InputError>` implementation for a model-specific error type.
+#[macro_export]
+macro_rules! impl_input_error_from {
+    ($target:ty, {
+        $($pattern:pat => $expr:expr,)+
+    }) => {
+        impl From<$crate::input::InputError> for $target {
+            fn from(value: $crate::input::InputError) -> Self {
+                match value {
+                    $($pattern => $expr,)+
+                }
+            }
+        }
+    };
+}
+
 /// Errors returned when validating model inputs.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum InputError {

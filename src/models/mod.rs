@@ -9,6 +9,19 @@ pub mod selection;
 pub mod tweedie;
 pub mod two_part;
 
+/// Finalize a successful retryable fit by updating metadata and returning the model/report pair.
+#[macro_export]
+macro_rules! finalize_retry_fit {
+    ($model:ident, $report:ident, $attempts:ident, $start_time:ident, $attempt_idx:ident) => {{
+        let execution_time = $start_time.elapsed();
+        $report.meta.execution_time = execution_time;
+        $report.meta.fallback_attempts = $attempt_idx;
+        $report.attempts = $attempts;
+        $model.report = $report.clone();
+        return Ok(($model, $report));
+    }};
+}
+
 /// Unified interface for all semicontinuous models.
 pub trait Model {
     /// Prediction output type (e.g., `TwoPartPrediction`).

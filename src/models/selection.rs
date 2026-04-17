@@ -634,20 +634,17 @@ fn pick_best(current: Option<(f64, String)>, value: f64, name: &str) -> Option<(
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
-
-    fn idx_to_f64(idx: usize) -> f64 {
-        f64::from(u32::try_from(idx).unwrap_or(u32::MAX))
-    }
+    use crate::utils::usize_to_f64;
 
     #[test]
     fn selection_runs() {
         let n = 60;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) / 10.0 });
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 });
         let y = Mat::from_fn(n, 1, |i, _| {
             if i % 6 == 0 {
                 0.0
             } else {
-                0.2f64.mul_add(idx_to_f64(i), 1.0)
+                0.2f64.mul_add(usize_to_f64(i), 1.0)
             }
         });
         let result = select_models(&x, &y, &[1.2, 1.5, 1.8]);
@@ -658,12 +655,12 @@ mod tests {
     #[test]
     fn cross_validate_runs() {
         let n = 50;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) / 10.0 });
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 });
         let y = Mat::from_fn(n, 1, |i, _| {
             if i % 7 == 0 {
                 0.0
             } else {
-                0.2f64.mul_add(idx_to_f64(i), 1.0)
+                0.2f64.mul_add(usize_to_f64(i), 1.0)
             }
         });
         let input = ModelInput::new(x, y);

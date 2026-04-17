@@ -24,7 +24,8 @@ use thiserror::Error;
 
 use crate::input::{InputError, ModelInput};
 use crate::utils::{
-    add_ridge_to_diagonal, max_abs_diff, mean_column, solve_linear_system, solve_linear_system_ref,
+    add_ridge_to_diagonal, add_row_outer_product_scaled, max_abs_diff, mean_column,
+    solve_linear_system, solve_linear_system_ref,
 };
 
 /// Tuning parameters for log-normal fitting.
@@ -104,26 +105,22 @@ pub enum LogNormalError {
     NonConvergence,
 }
 
-impl From<InputError> for LogNormalError {
-    fn from(value: InputError) -> Self {
-        match value {
-            InputError::EmptyDesign => Self::EmptyDesign,
-            InputError::InvalidOutcomeShape => Self::InvalidOutcomeShape,
-            InputError::DimensionMismatch { rows, len } => Self::DimensionMismatch { rows, len },
-            InputError::InvalidClusterLength { labels, rows } => {
-                Self::InvalidClusterLength { labels, rows }
-            }
-            InputError::NonFiniteDesign
-            | InputError::NonFiniteOutcome
-            | InputError::InvalidWeightShape
-            | InputError::NonFiniteWeights
-            | InputError::NonPositiveWeights
-            | InputError::InvalidLabelLength { .. }
-            | InputError::DuplicateLabels(_) => Self::NonFiniteInput,
-            InputError::NegativeOutcome => Self::NegativeOutcome,
-        }
-    }
-}
+crate::impl_input_error_from!(LogNormalError, {
+    InputError::EmptyDesign => Self::EmptyDesign,
+    InputError::InvalidOutcomeShape => Self::InvalidOutcomeShape,
+    InputError::DimensionMismatch { rows, len } => Self::DimensionMismatch { rows, len },
+    InputError::InvalidClusterLength { labels, rows } => {
+        Self::InvalidClusterLength { labels, rows }
+    },
+    InputError::NonFiniteDesign
+    | InputError::NonFiniteOutcome
+    | InputError::InvalidWeightShape
+    | InputError::NonFiniteWeights
+    | InputError::NonPositiveWeights
+    | InputError::InvalidLabelLength { .. }
+    | InputError::DuplicateLabels(_) => Self::NonFiniteInput,
+    InputError::NegativeOutcome => Self::NegativeOutcome,
+});
 
 /// Log-normal model coefficients and smearing factor.
 #[derive(Debug, Clone)]
@@ -153,13 +150,6 @@ pub struct LogNormalReport {
     pub cluster_count: Option<usize>,
     /// History of retry attempts (if Relaxed strategy used).
     pub attempts: Vec<AttemptDiagnostics>,
-}
-
-impl LogNormalReport {
-    #[must_use]
-    pub fn attempts(&self) -> &[AttemptDiagnostics] {
-        &self.attempts
-    }
 }
 
 /// Log-normal predictions on the original scale.
@@ -319,12 +309,7 @@ pub(crate) fn fit_lognormal_smearing(
 
         match result {
             Ok((mut model, mut report)) => {
-                let execution_time = start_time.elapsed();
-                report.meta.execution_time = execution_time;
-                report.meta.fallback_attempts = attempt_idx;
-                report.attempts = attempts;
-                model.report = report.clone();
-                return Ok((model, report));
+                crate::finalize_retry_fit!(model, report, attempts, start_time, attempt_idx);
             }
             Err(e @ (LogNormalError::SolveFailed | LogNormalError::NonConvergence)) => {
                 attempts.push(AttemptDiagnostics {
@@ -479,12 +464,7 @@ fn robust_covariance(
 
     for i in 0..x.nrows() {
         let resid = residuals[(i, 0)];
-        for j in 0..p {
-            let xj = x[(i, j)];
-            for k in 0..p {
-                meat[(j, k)] = (resid * resid * xj).mul_add(x[(i, k)], meat[(j, k)]);
-            }
-        }
+        add_row_outer_product_scaled(&mut meat, x, i, resid * resid);
     }
     let cov = sandwich_covariance(xtx, &meat)?;
     Ok((Some(cov), false, None))
@@ -604,20 +584,17 @@ impl LogNormalTrainer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn idx_to_f64(idx: usize) -> f64 {
-        f64::from(u32::try_from(idx).unwrap_or(u32::MAX))
-    }
+    use crate::utils::usize_to_f64;
 
     #[test]
     fn fit_lognormal_smearing_runs() {
         let n = 80;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) / 10.0 });
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 });
         let y = Mat::from_fn(n, 1, |i, _| {
             if i % 7 == 0 {
                 0.0
             } else {
-                0.3f64.mul_add(idx_to_f64(i), 2.0)
+                0.3f64.mul_add(usize_to_f64(i), 2.0)
             }
         });
         let (model, _report) =
@@ -630,12 +607,12 @@ mod tests {
     #[test]
     fn lognormal_reports_robust_se_with_clusters() {
         let n = 30;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { idx_to_f64(i) / 10.0 });
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 });
         let y = Mat::from_fn(n, 1, |i, _| {
             if i % 3 == 0 {
                 0.0
             } else {
-                0.2f64.mul_add(idx_to_f64(i), 1.5)
+                0.2f64.mul_add(usize_to_f64(i), 1.5)
             }
         });
         let clusters: Vec<u64> = (0..n).map(|i| (i / 5) as u64).collect();
