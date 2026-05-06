@@ -281,16 +281,16 @@ fn fit_tweedie_weighted(
                 fallback_lambda.mul_add(scale, options.l2_penalty).max(1e-8);
         }
 
-        let result = fit_tweedie_with_lambda(
+        let result = fit_tweedie_with_lambda(TweedieFitRequest {
             x,
             y,
             sample_weights,
             clusters,
             power,
-            current_options,
-            current_options.l2_penalty,
-            warm_start_beta.as_ref(),
-        );
+            options: current_options,
+            lambda: current_options.l2_penalty,
+            initial_beta_override: warm_start_beta.as_ref(),
+        });
 
         match result {
             Ok((mut model, mut report)) => {
@@ -322,16 +322,31 @@ fn fit_tweedie_weighted(
     Err(last_err)
 }
 
-fn fit_tweedie_with_lambda(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
-    sample_weights: Option<&Mat<f64>>,
-    clusters: Option<&[u64]>,
+struct TweedieFitRequest<'a> {
+    x: &'a Mat<f64>,
+    y: &'a Mat<f64>,
+    sample_weights: Option<&'a Mat<f64>>,
+    clusters: Option<&'a [u64]>,
     power: f64,
     options: TweedieOptions,
     lambda: f64,
-    initial_beta_override: Option<&Mat<f64>>,
+    initial_beta_override: Option<&'a Mat<f64>>,
+}
+
+fn fit_tweedie_with_lambda(
+    request: TweedieFitRequest<'_>,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
+    let TweedieFitRequest {
+        x,
+        y,
+        sample_weights,
+        clusters,
+        power,
+        options,
+        lambda,
+        initial_beta_override,
+    } = request;
+
     let mut beta = initial_beta_override
         .cloned()
         .unwrap_or_else(|| initial_beta(x, y, sample_weights, options.min_weight));
@@ -404,7 +419,7 @@ fn initial_beta(
     let mut weight_sum = 0.0;
     for i in 0..y.nrows() {
         let weight = sample_weight_at(sample_weights, i);
-        mean_y += weight * y[(i, 0)];
+        mean_y = weight.mul_add(y[(i, 0)], mean_y);
         weight_sum += weight;
     }
     mean_y /= weight_sum.max(1.0);
@@ -537,9 +552,9 @@ fn weighted_deviance(
             let mui = mu[(i, 0)].max(1e-12);
             let weight = sample_weight_at(sample_weights, i);
             if yi == 0.0 {
-                result += weight * 2.0 * mui;
+                result = (weight * 2.0).mul_add(mui, result);
             } else {
-                result += weight * 2.0 * (yi * (yi / mui).ln() - (yi - mui));
+                result = (weight * 2.0).mul_add(yi * (yi / mui).ln() - (yi - mui), result);
             }
         }
         return result;
@@ -555,7 +570,7 @@ fn weighted_deviance(
             if yi <= 0.0 {
                 return f64::INFINITY;
             }
-            result += weight * 2.0 * (((yi - mui) / mui) - (yi / mui).ln());
+            result = (weight * 2.0).mul_add(((yi - mui) / mui) - (yi / mui).ln(), result);
         }
         return result;
     }
@@ -571,7 +586,8 @@ fn weighted_deviance(
             let term1 = yi.powf(2.0 - power) / ((1.0 - power) * (2.0 - power));
             let term2 = yi * mui.powf(1.0 - power) / (1.0 - power);
             let term3 = mui.powf(2.0 - power) / (2.0 - power);
-            deviance += sample_weight_at(sample_weights, i) * 2.0 * (term1 - term2 + term3);
+            deviance = (sample_weight_at(sample_weights, i) * 2.0)
+                .mul_add(term1 - term2 + term3, deviance);
         }
     }
     deviance

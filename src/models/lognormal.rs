@@ -589,7 +589,11 @@ mod tests {
     #[test]
     fn fit_lognormal_smearing_runs() {
         let n = 80;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 });
+        let x = Mat::from_fn(
+            n,
+            2,
+            |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 },
+        );
         let y = Mat::from_fn(n, 1, |i, _| {
             if i % 7 == 0 {
                 0.0
@@ -607,7 +611,11 @@ mod tests {
     #[test]
     fn lognormal_reports_robust_se_with_clusters() {
         let n = 30;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 });
+        let x = Mat::from_fn(
+            n,
+            2,
+            |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 },
+        );
         let y = Mat::from_fn(n, 1, |i, _| {
             if i % 3 == 0 {
                 0.0

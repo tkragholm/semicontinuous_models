@@ -1464,13 +1464,17 @@ impl TwoPartTrainer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use approx::assert_relative_eq;
     use crate::utils::usize_to_f64;
+    use approx::assert_relative_eq;
 
     #[test]
     fn two_part_model_runs_on_synthetic_data() {
         let n = 200;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 50.0 });
+        let x = Mat::from_fn(
+            n,
+            2,
+            |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 50.0 },
+        );
 
         let mut y = Mat::<f64>::zeros(n, 1);
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
@@ -1503,7 +1507,11 @@ mod tests {
     #[case::elastic_net(Regularization::ElasticNet { lambda: 0.1, alpha: 0.5, exclude_intercept: true }, false)]
     fn test_two_part_regularization_options(#[case] reg: Regularization, #[case] robust_se: bool) {
         let n = 50;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 });
+        let x = Mat::from_fn(
+            n,
+            2,
+            |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 },
+        );
         let mut y = Mat::<f64>::zeros(n, 1);
         for i in 0..n {
             y[(i, 0)] = if i % 3 == 0 {
@@ -1530,7 +1538,11 @@ mod tests {
     #[test]
     fn two_part_model_handles_all_positive_outcomes() {
         let n = 40;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 });
+        let x = Mat::from_fn(
+            n,
+            2,
+            |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 },
+        );
         let y = Mat::from_fn(n, 1, |i, _| 1.0 + usize_to_f64(i) / 100.0);
 
         let (_model, report) = fit_two_part(&x, &y, FitOptions::default())
@@ -1557,7 +1569,11 @@ mod tests {
     #[test]
     fn bootstrap_produces_parameter_samples() {
         let n = 40;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 });
+        let x = Mat::from_fn(
+            n,
+            2,
+            |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 },
+        );
         let mut y = Mat::<f64>::zeros(n, 1);
         for i in 0..n {
             y[(i, 0)] = if i % 4 == 0 {
@@ -1682,7 +1698,11 @@ mod tests {
     #[test]
     fn fit_with_cluster_robust_se() {
         let n = 30;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 5.0 });
+        let x = Mat::from_fn(
+            n,
+            2,
+            |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 5.0 },
+        );
         let mut y = Mat::<f64>::zeros(n, 1);
         let clusters: Vec<u64> = (0..n).map(|i| (i / 5) as u64).collect();
         for i in 0..n {

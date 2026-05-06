@@ -13,11 +13,14 @@ fn build_inputs(n: usize, p: usize) -> (Mat<f64>, Mat<f64>, Mat<f64>) {
     let x = Mat::from_fn(n, p, |row, col| {
         let row_f = usize_to_f64(row);
         let col_f = usize_to_f64(col);
-        0.2f64.mul_add((0.0001 * row_f * (col_f + 1.0)).cos(), 0.17f64.mul_add(col_f, 0.0003 * row_f).sin())
+        0.2f64.mul_add(
+            (0.0001 * row_f * (col_f + 1.0)).cos(),
+            0.17f64.mul_add(col_f, 0.0003 * row_f).sin(),
+        )
     });
     let weights = Mat::from_fn(n, 1, |row, _| {
         let row_f = usize_to_f64(row);
-        0.95f64.mul_add((0.001 * row_f).sin().abs() , 0.05)
+        0.95f64.mul_add((0.001 * row_f).sin().abs(), 0.05)
     });
     let response = Mat::from_fn(n, 1, |row, _| {
         let row_f = usize_to_f64(row);

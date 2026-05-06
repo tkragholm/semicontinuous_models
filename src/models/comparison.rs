@@ -752,12 +752,15 @@ fn highlight_metric_cell(value: f64, best: f64, precision: usize) -> Cell {
 mod tests {
     use super::*;
     use crate::models::two_part::Regularization;
-    use faer::Mat;
     use crate::utils::usize_to_f64;
+    use faer::Mat;
 
     fn sample_input(n: usize) -> ModelInput {
-        let design_matrix =
-            Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 25.0 });
+        let design_matrix = Mat::from_fn(
+            n,
+            2,
+            |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 25.0 },
+        );
         let outcome = Mat::from_fn(n, 1, |i, _| {
             if i % 5 == 0 {
                 0.0
