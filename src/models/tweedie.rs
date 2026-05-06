@@ -24,8 +24,7 @@ use crate::models::{
 };
 use crate::utils::{
     add_ridge_to_diagonal, add_row_outer_product_scaled, max_abs_diff, solve_linear_system,
-    solve_linear_system_ref,
-    weighted_xtx, weighted_xtz,
+    solve_linear_system_ref, weighted_xtx, weighted_xtz,
 };
 
 const LINEAR_PREDICTOR_CLIP: f64 = 30.0;
@@ -82,12 +81,18 @@ pub enum TweedieError {
     InvalidPower,
     #[error("outcome must be a single column matrix")]
     InvalidOutcomeShape,
+    #[error("weights must be a single column matrix with the same number of rows as outcome")]
+    InvalidWeightShape,
     #[error("cluster labels length ({labels}) must match outcome rows ({rows})")]
     InvalidClusterLength { labels: usize, rows: usize },
     #[error("inputs contain non-finite values")]
     NonFiniteInput,
     #[error("outcome contains negative values")]
     NegativeOutcome,
+    #[error("weights contain non-finite values")]
+    NonFiniteWeights,
+    #[error("weights must be strictly positive")]
+    NonPositiveWeights,
     #[error("model failed to converge")]
     NonConvergence,
     #[error("linear solve failed")]
@@ -98,16 +103,16 @@ crate::impl_input_error_from!(TweedieError, {
     InputError::EmptyDesign => Self::EmptyDesign,
     InputError::InvalidOutcomeShape => Self::InvalidOutcomeShape,
     InputError::DimensionMismatch { rows, len } => Self::DimensionMismatch { rows, len },
+    InputError::InvalidWeightShape => Self::InvalidWeightShape,
     InputError::InvalidClusterLength { labels, rows } => {
         Self::InvalidClusterLength { labels, rows }
     },
     InputError::NonFiniteDesign
     | InputError::NonFiniteOutcome
-    | InputError::InvalidWeightShape
-    | InputError::NonFiniteWeights
-    | InputError::NonPositiveWeights
     | InputError::InvalidLabelLength { .. }
     | InputError::DuplicateLabels(_) => Self::NonFiniteInput,
+    InputError::NonFiniteWeights => Self::NonFiniteWeights,
+    InputError::NonPositiveWeights => Self::NonPositiveWeights,
     InputError::NegativeOutcome => Self::NegativeOutcome,
 });
 
@@ -194,6 +199,18 @@ pub(crate) fn fit_tweedie(
     power: f64,
     options: TweedieOptions,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
+    fit_tweedie_weighted(x, y, None, clusters, power, options)
+}
+
+#[allow(clippy::too_many_lines)]
+fn fit_tweedie_weighted(
+    x: &Mat<f64>,
+    y: &Mat<f64>,
+    sample_weights: Option<&Mat<f64>>,
+    clusters: Option<&[u64]>,
+    power: f64,
+    options: TweedieOptions,
+) -> Result<(TweedieModel, TweedieReport), TweedieError> {
     let start_time = Instant::now();
     if !(1.0..=2.0).contains(&power) {
         return Err(TweedieError::InvalidPower);
@@ -221,6 +238,7 @@ pub(crate) fn fit_tweedie(
     if !crate::utils::matrix_is_finite(x) || !crate::utils::matrix_is_finite(y) {
         return Err(TweedieError::NonFiniteInput);
     }
+    validate_sample_weights(y, sample_weights)?;
     if (0..y.nrows()).any(|i| y[(i, 0)] < 0.0) {
         return Err(TweedieError::NegativeOutcome);
     }
@@ -266,6 +284,7 @@ pub(crate) fn fit_tweedie(
         let result = fit_tweedie_with_lambda(
             x,
             y,
+            sample_weights,
             clusters,
             power,
             current_options,
@@ -306,6 +325,7 @@ pub(crate) fn fit_tweedie(
 fn fit_tweedie_with_lambda(
     x: &Mat<f64>,
     y: &Mat<f64>,
+    sample_weights: Option<&Mat<f64>>,
     clusters: Option<&[u64]>,
     power: f64,
     options: TweedieOptions,
@@ -314,16 +334,17 @@ fn fit_tweedie_with_lambda(
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
     let mut beta = initial_beta_override
         .cloned()
-        .unwrap_or_else(|| initial_beta(x, y, options.min_weight));
+        .unwrap_or_else(|| initial_beta(x, y, sample_weights, options.min_weight));
 
     for iteration in 0..options.max_iter {
         let eta = x * &beta;
         let mu = map_mat(&eta, exp_clamped);
-        let current_deviance = deviance(y, &mu, power);
+        let current_deviance = weighted_deviance(y, &mu, power, sample_weights);
 
         let weights = Mat::from_fn(mu.nrows(), 1, |i, _| {
-            let w = mu[(i, 0)].powf(2.0 - power);
-            w.max(options.min_weight)
+            let base_weight = sample_weight_at(sample_weights, i);
+            let w = mu[(i, 0)].powf(2.0 - power).max(options.min_weight);
+            base_weight * w
         });
         let z = Mat::from_fn(mu.nrows(), 1, |i, _| {
             eta[(i, 0)] + (y[(i, 0)] - mu[(i, 0)]) / mu[(i, 0)]
@@ -334,11 +355,19 @@ fn fit_tweedie_with_lambda(
         }
         let xtw_rhs = weighted_xtz(x, &weights, &z);
         let beta_candidate = solve_with_stabilization(&xtwx, &xtw_rhs)?;
-        let beta_next = backtracking_update(x, y, &beta, &beta_candidate, current_deviance, power);
+        let beta_next = backtracking_update(
+            x,
+            y,
+            sample_weights,
+            &beta,
+            &beta_candidate,
+            current_deviance,
+            power,
+        );
 
         let eta_next = x * &beta_next;
         let mu_next = map_mat(&eta_next, exp_clamped);
-        let dev_next = deviance(y, &mu_next, power);
+        let dev_next = weighted_deviance(y, &mu_next, power, sample_weights);
 
         let beta_converged = max_abs_diff(&beta_next, &beta) < options.tolerance;
         let dev_converged = relative_change(current_deviance, dev_next) < options.tolerance;
@@ -346,6 +375,7 @@ fn fit_tweedie_with_lambda(
             return finalize_fit(
                 x,
                 y,
+                sample_weights,
                 clusters,
                 power,
                 options,
@@ -360,24 +390,56 @@ fn fit_tweedie_with_lambda(
     Err(TweedieError::NonConvergence)
 }
 
-fn initial_beta(x: &Mat<f64>, y: &Mat<f64>, min_weight: f64) -> Mat<f64> {
+fn initial_beta(
+    x: &Mat<f64>,
+    y: &Mat<f64>,
+    sample_weights: Option<&Mat<f64>>,
+    min_weight: f64,
+) -> Mat<f64> {
     let mut beta = Mat::<f64>::zeros(x.ncols(), 1);
     if x.ncols() == 0 || y.nrows() == 0 {
         return beta;
     }
     let mut mean_y = 0.0;
+    let mut weight_sum = 0.0;
     for i in 0..y.nrows() {
-        mean_y += y[(i, 0)];
+        let weight = sample_weight_at(sample_weights, i);
+        mean_y += weight * y[(i, 0)];
+        weight_sum += weight;
     }
-    mean_y /= f64::from(u32::try_from(y.nrows()).unwrap_or(u32::MAX)).max(1.0);
+    mean_y /= weight_sum.max(1.0);
     beta[(0, 0)] = mean_y.max(min_weight).ln();
     beta
+}
+
+fn validate_sample_weights(
+    y: &Mat<f64>,
+    sample_weights: Option<&Mat<f64>>,
+) -> Result<(), TweedieError> {
+    let Some(weights) = sample_weights else {
+        return Ok(());
+    };
+    if weights.ncols() != 1 || weights.nrows() != y.nrows() {
+        return Err(TweedieError::InvalidWeightShape);
+    }
+    if !crate::utils::matrix_is_finite(weights) {
+        return Err(TweedieError::NonFiniteWeights);
+    }
+    if (0..weights.nrows()).any(|i| weights[(i, 0)] <= 0.0) {
+        return Err(TweedieError::NonPositiveWeights);
+    }
+    Ok(())
+}
+
+fn sample_weight_at(sample_weights: Option<&Mat<f64>>, row: usize) -> f64 {
+    sample_weights.map_or(1.0, |weights| weights[(row, 0)])
 }
 
 #[allow(clippy::too_many_arguments)]
 fn finalize_fit(
     x: &Mat<f64>,
     y: &Mat<f64>,
+    sample_weights: Option<&Mat<f64>>,
     clusters: Option<&[u64]>,
     power: f64,
     options: TweedieOptions,
@@ -388,8 +450,9 @@ fn finalize_fit(
     let eta = x * &beta_final;
     let mu = map_mat(&eta, exp_clamped);
     let weights = Mat::from_fn(mu.nrows(), 1, |i, _| {
-        let w = mu[(i, 0)].powf(2.0 - power);
-        w.max(options.min_weight)
+        let base_weight = sample_weight_at(sample_weights, i);
+        let w = mu[(i, 0)].powf(2.0 - power).max(options.min_weight);
+        base_weight * w
     });
     let mut xtwx = weighted_xtx(x, &weights);
     if lambda > 0.0 {
@@ -436,10 +499,11 @@ pub fn fit_tweedie_input(
     power: f64,
     options: TweedieOptions,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
-    input.validate_core().map_err(TweedieError::from)?;
-    fit_tweedie(
+    input.validate().map_err(TweedieError::from)?;
+    fit_tweedie_weighted(
         &input.design_matrix,
         &input.outcome,
+        input.sample_weights.as_ref(),
         input.cluster_ids.as_deref(),
         power,
         options,
@@ -456,16 +520,26 @@ pub fn deviance(y: &Mat<f64>, mu: &Mat<f64>, power: f64) -> f64 {
         return f64::NAN;
     }
 
+    weighted_deviance(y, mu, power, None)
+}
+
+fn weighted_deviance(
+    y: &Mat<f64>,
+    mu: &Mat<f64>,
+    power: f64,
+    sample_weights: Option<&Mat<f64>>,
+) -> f64 {
     // Closed-form endpoint for p = 1 (Poisson deviance limit).
     if (power - 1.0).abs() < 1e-12 {
         let mut result = 0.0;
         for i in 0..y.nrows() {
             let yi = y[(i, 0)].max(0.0);
             let mui = mu[(i, 0)].max(1e-12);
+            let weight = sample_weight_at(sample_weights, i);
             if yi == 0.0 {
-                result = 2.0f64.mul_add(mui, result);
+                result += weight * 2.0 * mui;
             } else {
-                result = 2.0f64.mul_add(yi * (yi / mui).ln() - (yi - mui), result);
+                result += weight * 2.0 * (yi * (yi / mui).ln() - (yi - mui));
             }
         }
         return result;
@@ -477,10 +551,11 @@ pub fn deviance(y: &Mat<f64>, mu: &Mat<f64>, power: f64) -> f64 {
         for i in 0..y.nrows() {
             let yi = y[(i, 0)];
             let mui = mu[(i, 0)].max(1e-12);
+            let weight = sample_weight_at(sample_weights, i);
             if yi <= 0.0 {
                 return f64::INFINITY;
             }
-            result = 2.0f64.mul_add(((yi - mui) / mui) - (yi / mui).ln(), result);
+            result += weight * 2.0 * (((yi - mui) / mui) - (yi / mui).ln());
         }
         return result;
     }
@@ -490,12 +565,13 @@ pub fn deviance(y: &Mat<f64>, mu: &Mat<f64>, power: f64) -> f64 {
         let yi = y[(i, 0)];
         let mui = mu[(i, 0)].max(1e-12);
         if yi == 0.0 {
-            deviance += 2.0 * mui.powf(2.0 - power) / (2.0 - power);
+            deviance +=
+                sample_weight_at(sample_weights, i) * 2.0 * mui.powf(2.0 - power) / (2.0 - power);
         } else {
             let term1 = yi.powf(2.0 - power) / ((1.0 - power) * (2.0 - power));
             let term2 = yi * mui.powf(1.0 - power) / (1.0 - power);
             let term3 = mui.powf(2.0 - power) / (2.0 - power);
-            deviance = 2.0f64.mul_add(term1 - term2 + term3, deviance);
+            deviance += sample_weight_at(sample_weights, i) * 2.0 * (term1 - term2 + term3);
         }
     }
     deviance
@@ -566,6 +642,7 @@ fn sandwich_covariance(xtwx: &Mat<f64>, meat: &Mat<f64>) -> Result<Mat<f64>, Twe
 fn backtracking_update(
     x: &Mat<f64>,
     y: &Mat<f64>,
+    sample_weights: Option<&Mat<f64>>,
     beta_current: &Mat<f64>,
     beta_candidate: &Mat<f64>,
     current_deviance: f64,
@@ -584,7 +661,7 @@ fn backtracking_update(
             blend_betas_into(&mut proposal, beta_current, beta_candidate, step);
         }
         let mu = map_mat(&(x * &proposal), exp_clamped);
-        let dev = deviance(y, &mu, power);
+        let dev = weighted_deviance(y, &mu, power, sample_weights);
         if dev.is_finite() && dev <= current_deviance {
             return proposal;
         }
@@ -784,7 +861,11 @@ mod tests {
     #[test]
     fn fit_tweedie_runs() {
         let n = 100;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 20.0 });
+        let x = Mat::from_fn(
+            n,
+            2,
+            |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 20.0 },
+        );
         let y = Mat::from_fn(n, 1, |i, _| {
             if i % 5 == 0 {
                 0.0
@@ -803,7 +884,11 @@ mod tests {
     #[test]
     fn tweedie_reports_robust_se_with_clusters() {
         let n = 40;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 20.0 });
+        let x = Mat::from_fn(
+            n,
+            2,
+            |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 20.0 },
+        );
         let y = Mat::from_fn(n, 1, |i, _| {
             if i % 5 == 0 {
                 0.0
