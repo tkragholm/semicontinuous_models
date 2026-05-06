@@ -322,6 +322,7 @@ fn fit_tweedie_weighted(
     Err(last_err)
 }
 
+#[derive(Clone, Copy)]
 struct TweedieFitRequest<'a> {
     x: &'a Mat<f64>,
     y: &'a Mat<f64>,
