@@ -32,7 +32,7 @@ use crate::input::{InputError, ModelInput};
 use crate::utils::solve_linear_system;
 
 /// Goodness-of-fit metrics for model comparison.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ModelFitMetrics {
     /// Root mean squared error.
     pub rmse: f64,
@@ -599,21 +599,26 @@ fn recommend_by_ic(
     let mut best_bic_candidate: Option<(f64, String)> = None;
 
     for candidate in tweedie_candidates {
-        let name = format!("tweedie p={:.1}", candidate.power);
-        best_aic = pick_best(best_aic, candidate.information_criteria.aic, &name);
+        // The name is only formatted (allocated) when the candidate actually
+        // becomes a new best, via the lazy closure passed to `pick_best`.
+        best_aic = pick_best(best_aic, candidate.information_criteria.aic, || {
+            format!("tweedie p={:.1}", candidate.power)
+        });
         best_bic_candidate = pick_best(
             best_bic_candidate,
             candidate.information_criteria.bic,
-            &name,
+            || format!("tweedie p={:.1}", candidate.power),
         );
     }
 
     if let Some(lognormal) = lognormal {
-        best_aic = pick_best(best_aic, lognormal.information_criteria.aic, "lognormal");
+        best_aic = pick_best(best_aic, lognormal.information_criteria.aic, || {
+            "lognormal".to_string()
+        });
         best_bic_candidate = pick_best(
             best_bic_candidate,
             lognormal.information_criteria.bic,
-            "lognormal",
+            || "lognormal".to_string(),
         );
     }
 
@@ -623,10 +628,14 @@ fn recommend_by_ic(
     )
 }
 
-fn pick_best(current: Option<(f64, String)>, value: f64, name: &str) -> Option<(f64, String)> {
+fn pick_best<F: FnOnce() -> String>(
+    current: Option<(f64, String)>,
+    value: f64,
+    name: F,
+) -> Option<(f64, String)> {
     match current {
         Some((best, _)) if value >= best => current,
-        _ => Some((value, name.to_string())),
+        _ => Some((value, name())),
     }
 }
 

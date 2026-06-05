@@ -2,7 +2,7 @@
 
 use faer::Mat;
 
-use crate::utils::{EffectIntervalSummary, dot_row, summarize_draws, usize_to_f64};
+use crate::utils::{EffectIntervalSummary, dot_row, summarize_draws_in_place, usize_to_f64};
 
 use super::likelihood::logistic_stable;
 use super::posterior::MtpPosteriorSamples;
@@ -167,20 +167,22 @@ pub fn compute_counterfactual_effects_summary(
         cumulative_additive_draws.push(cumulative_additive);
     }
 
+    // The per-period draw vectors are owned here and not needed afterwards, so
+    // they are sorted in place for the quantiles rather than copied again.
     let per_period = (0..periods)
         .map(|row| PeriodEffectSummary {
             period_index: row,
-            mean_exposed: summarize_draws(&mean_exposed_draws[row]),
-            mean_unexposed: summarize_draws(&mean_unexposed_draws[row]),
-            additive_effect: summarize_draws(&additive_draws[row]),
-            multiplicative_effect: summarize_draws(&multiplicative_draws[row]),
-            odds_ratio_positive: summarize_draws(&odds_ratio_draws[row]),
+            mean_exposed: summarize_draws_in_place(&mut mean_exposed_draws[row]),
+            mean_unexposed: summarize_draws_in_place(&mut mean_unexposed_draws[row]),
+            additive_effect: summarize_draws_in_place(&mut additive_draws[row]),
+            multiplicative_effect: summarize_draws_in_place(&mut multiplicative_draws[row]),
+            odds_ratio_positive: summarize_draws_in_place(&mut odds_ratio_draws[row]),
         })
         .collect();
 
     Ok(CounterfactualEffectsSummary {
         per_period,
-        cumulative_additive_effect: summarize_draws(&cumulative_additive_draws),
+        cumulative_additive_effect: summarize_draws_in_place(&mut cumulative_additive_draws),
     })
 }
 

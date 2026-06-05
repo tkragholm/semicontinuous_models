@@ -3,7 +3,7 @@
 use crate::input::LongitudinalModelInput;
 use crate::utils::{
     CalibrationBinSummary, EffectIntervalSummary, calibration_bins_summary, dot_row,
-    summarize_draws, usize_to_f64,
+    summarize_draws_in_place, usize_to_f64,
 };
 
 use super::likelihood::logistic_stable;
@@ -20,25 +20,34 @@ pub fn autocorrelation(series: &[f64], lag: usize) -> f64 {
         return 0.0;
     }
 
-    let n = series.len() - lag;
     let mean = series.iter().sum::<f64>() / usize_to_f64(series.len());
-
-    let mut numerator = 0.0;
-    let mut denominator = 0.0;
-
-    for value in series {
-        let centered = value - mean;
-        denominator = centered.mul_add(centered, denominator);
-    }
-
+    let denominator = sum_squared_deviations(series, mean);
     if denominator <= 0.0 {
         return 0.0;
     }
 
+    autocorrelation_with_stats(series, lag, mean, denominator)
+}
+
+/// Sum of squared deviations from `mean`, i.e. the lag-0 autocovariance numerator.
+fn sum_squared_deviations(series: &[f64], mean: f64) -> f64 {
+    series.iter().fold(0.0, |acc, value| {
+        let centered = value - mean;
+        centered.mul_add(centered, acc)
+    })
+}
+
+/// Lag-`k` autocorrelation given a precomputed `mean` and lag-0 `denominator`.
+///
+/// The denominator (sum of squared deviations) is identical for every lag of a
+/// given series, so callers that sweep many lags should compute it once and
+/// reuse it here instead of paying an O(n) pass per lag.
+fn autocorrelation_with_stats(series: &[f64], lag: usize, mean: f64, denominator: f64) -> f64 {
+    let n = series.len() - lag;
+    let mut numerator = 0.0;
     for idx in 0..n {
         numerator = (series[idx] - mean).mul_add(series[idx + lag] - mean, numerator);
     }
-
     numerator / denominator
 }
 
@@ -50,9 +59,15 @@ pub fn effective_sample_size(series: &[f64]) -> f64 {
         return usize_to_f64(n);
     }
 
+    let mean = series.iter().sum::<f64>() / usize_to_f64(n);
+    let denominator = sum_squared_deviations(series, mean);
+    if denominator <= 0.0 {
+        return usize_to_f64(n);
+    }
+
     let mut rho_sum = 0.0;
     for lag in 1..n {
-        let rho = autocorrelation(series, lag);
+        let rho = autocorrelation_with_stats(series, lag, mean, denominator);
         if rho <= 0.0 {
             break;
         }
@@ -195,9 +210,9 @@ pub fn posterior_predictive_summary(
 
     let nrows = input.outcome.nrows();
     let mut predicted_probability_sum = vec![0.0; nrows];
-    let mut predicted_zero_rate_draws = Vec::with_capacity(samples.len());
-    let mut predicted_mean_draws = Vec::with_capacity(samples.len());
-    let mut brier_draws = Vec::with_capacity(samples.len());
+    let mut predicted_zero_rate_draws: Vec<f64> = Vec::with_capacity(samples.len());
+    let mut predicted_mean_draws: Vec<f64> = Vec::with_capacity(samples.len());
+    let mut brier_draws: Vec<f64> = Vec::with_capacity(samples.len());
 
     for draw in &samples.draws {
         validate_draw_dimensions(alpha_len, beta_len, draw.alpha.len(), draw.beta.len())?;
@@ -243,9 +258,9 @@ pub fn posterior_predictive_summary(
     Ok(PosteriorPredictiveSummary {
         observed_zero_rate,
         observed_mean,
-        predicted_zero_rate: summarize_draws(&predicted_zero_rate_draws),
-        predicted_mean: summarize_draws(&predicted_mean_draws),
-        brier_score: summarize_draws(&brier_draws),
+        predicted_zero_rate: summarize_draws_in_place(&mut predicted_zero_rate_draws),
+        predicted_mean: summarize_draws_in_place(&mut predicted_mean_draws),
+        brier_score: summarize_draws_in_place(&mut brier_draws),
         calibration_bins: calibration_bins_summary(
             &predicted_probability_mean,
             input,
@@ -270,62 +285,67 @@ where
     }
 
     let half = draws_per_chain_used / 2;
-    let mut split_chains = Vec::with_capacity(chains.len() * 2);
-
+    // Accumulate only the per-split-chain (mean, variance) moments in a single
+    // pass, rather than materializing 2·`chains.len()` value vectors of length
+    // `half` for every parameter.
+    let mut means = Vec::with_capacity(chains.len() * 2);
+    let mut variances = Vec::with_capacity(chains.len() * 2);
     for chain in chains {
-        let first_half = chain
-            .draws
-            .iter()
-            .take(half)
-            .map(&extractor)
-            .collect::<Vec<_>>();
-        let second_half = chain
-            .draws
-            .iter()
-            .skip(half)
-            .take(half)
-            .map(&extractor)
-            .collect::<Vec<_>>();
-        split_chains.push(first_half);
-        split_chains.push(second_half);
+        let (first_mean, first_var, _) =
+            mean_and_sample_variance(chain.draws.iter().take(half).map(&extractor));
+        let (second_mean, second_var, _) =
+            mean_and_sample_variance(chain.draws.iter().skip(half).take(half).map(&extractor));
+        means.push(first_mean);
+        variances.push(first_var);
+        means.push(second_mean);
+        variances.push(second_var);
     }
 
-    split_rhat_scalar(&split_chains)
+    split_rhat_from_moments(&means, &variances, half)
 }
 
-fn split_rhat_scalar(chains: &[Vec<f64>]) -> Result<f64, MtpError> {
-    if chains.len() < 2 {
-        return Err(MtpError::InvalidChainCount {
-            min: 2,
-            found: chains.len(),
-        });
+/// Streaming mean and sample variance (Welford, `n - 1` denominator) returning
+/// `(mean, variance, count)`. Single pass, no allocation.
+fn mean_and_sample_variance<I>(values: I) -> (f64, f64, usize)
+where
+    I: Iterator<Item = f64>,
+{
+    let mut count = 0usize;
+    let mut mean = 0.0;
+    let mut m2 = 0.0;
+    for value in values {
+        count += 1;
+        let delta = value - mean;
+        mean += delta / usize_to_f64(count);
+        let delta2 = value - mean;
+        m2 = delta.mul_add(delta2, m2);
     }
+    let variance = if count < 2 {
+        0.0
+    } else {
+        m2 / usize_to_f64(count - 1)
+    };
+    (mean, variance, count)
+}
 
-    let n = chains.first().map_or(0, Vec::len);
+/// Split-R-hat from per-split-chain means and variances (each split chain has
+/// `n` draws). Equivalent to the prior `split_rhat_scalar`, but fed precomputed
+/// moments instead of value vectors.
+fn split_rhat_from_moments(means: &[f64], variances: &[f64], n: usize) -> Result<f64, MtpError> {
+    let m = means.len();
+    if m < 2 {
+        return Err(MtpError::InvalidChainCount { min: 2, found: m });
+    }
     if n < 2 {
         return Err(MtpError::InsufficientChainDraws {
             minimum: 2,
             found: n,
         });
     }
-    if chains.iter().any(|chain| chain.len() != n) {
-        return Err(MtpError::InconsistentPosteriorDimensions);
-    }
 
-    let chain_means = chains
-        .iter()
-        .map(|chain| chain.iter().sum::<f64>() / usize_to_f64(n))
-        .collect::<Vec<_>>();
-    let chain_vars = chains
-        .iter()
-        .zip(chain_means.iter())
-        .map(|(chain, mean)| sample_variance(chain, *mean))
-        .collect::<Vec<_>>();
-
-    let m = chains.len();
-    let mean_of_means = chain_means.iter().sum::<f64>() / usize_to_f64(m);
+    let mean_of_means = means.iter().sum::<f64>() / usize_to_f64(m);
     let between = usize_to_f64(n)
-        * chain_means
+        * means
             .iter()
             .map(|mean| {
                 let centered = *mean - mean_of_means;
@@ -333,7 +353,7 @@ fn split_rhat_scalar(chains: &[Vec<f64>]) -> Result<f64, MtpError> {
             })
             .sum::<f64>()
         / usize_to_f64(m - 1);
-    let within = chain_vars.iter().sum::<f64>() / usize_to_f64(m);
+    let within = variances.iter().sum::<f64>() / usize_to_f64(m);
 
     if !(within.is_finite() && within > 0.0 && between.is_finite()) {
         return Ok(1.0);
@@ -346,20 +366,6 @@ fn split_rhat_scalar(chains: &[Vec<f64>]) -> Result<f64, MtpError> {
     }
 
     Ok((var_plus / within).sqrt().max(1.0))
-}
-
-fn sample_variance(values: &[f64], mean: f64) -> f64 {
-    if values.len() < 2 {
-        return 0.0;
-    }
-    values
-        .iter()
-        .map(|value| {
-            let centered = *value - mean;
-            centered * centered
-        })
-        .sum::<f64>()
-        / usize_to_f64(values.len() - 1)
 }
 
 #[cfg(test)]
@@ -380,6 +386,43 @@ mod tests {
         let ess = effective_sample_size(&values);
         assert!(ess <= 5.0);
         assert!(ess > 0.0);
+    }
+
+    fn chain_from_alphas(alphas: &[f64]) -> MtpPosteriorSamples {
+        MtpPosteriorSamples {
+            draws: alphas
+                .iter()
+                .map(|&a| MtpPosteriorDraw {
+                    alpha: vec![a],
+                    beta: vec![0.0],
+                    kappa: 0.1,
+                    omega_sq: 1.0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn split_rhat_is_one_for_identical_chains() {
+        let chain = chain_from_alphas(&[0.0, 1.0, 0.0, 1.0]);
+        let summary = summarize_multi_chain_convergence(&[chain.clone(), chain])
+            .expect("two valid chains should summarize");
+        assert_eq!(summary.alpha_split_rhat.len(), 1);
+        assert!((summary.alpha_split_rhat[0] - 1.0).abs() < 1.0e-9);
+        assert!((summary.max_split_rhat.unwrap() - 1.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn split_rhat_is_finite_and_at_least_one_with_between_chain_variation() {
+        let chain_a = chain_from_alphas(&[0.0, 1.0, 0.0, 1.0]);
+        let chain_b = chain_from_alphas(&[5.0, 6.0, 5.0, 6.0]);
+        let summary = summarize_multi_chain_convergence(&[chain_a, chain_b])
+            .expect("two valid chains should summarize");
+        let rhat = summary.alpha_split_rhat[0];
+        assert!(rhat.is_finite());
+        assert!(rhat >= 1.0);
+        // Means differ sharply between chains, so R-hat must exceed 1.
+        assert!(rhat > 1.0);
     }
 
     #[test]

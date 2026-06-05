@@ -63,34 +63,46 @@ pub fn summarize_posterior(samples: &MtpPosteriorSamples) -> MtpPosteriorSummary
     let alpha_len = samples.draws.first().map_or(0, |draw| draw.alpha.len());
     let beta_len = samples.draws.first().map_or(0, |draw| draw.beta.len());
 
-    let alpha = (0..alpha_len)
-        .map(|index| {
-            let values: Vec<f64> = samples.draws.iter().map(|draw| draw.alpha[index]).collect();
-            summarize_scalar(&values)
-        })
-        .collect();
+    // One scratch buffer reused across every coefficient and block, instead of
+    // allocating a fresh `Vec` (twice) per coefficient.
+    let mut buffer: Vec<f64> = Vec::with_capacity(draw_count);
 
-    let beta = (0..beta_len)
-        .map(|index| {
-            let values: Vec<f64> = samples.draws.iter().map(|draw| draw.beta[index]).collect();
-            summarize_scalar(&values)
-        })
-        .collect();
+    let mut alpha = Vec::with_capacity(alpha_len);
+    for index in 0..alpha_len {
+        buffer.clear();
+        buffer.extend(samples.draws.iter().map(|draw| draw.alpha[index]));
+        alpha.push(summarize_scalar_in_place(&mut buffer));
+    }
 
-    let kappa_values: Vec<f64> = samples.draws.iter().map(|draw| draw.kappa).collect();
-    let omega_sq_values: Vec<f64> = samples.draws.iter().map(|draw| draw.omega_sq).collect();
+    let mut beta = Vec::with_capacity(beta_len);
+    for index in 0..beta_len {
+        buffer.clear();
+        buffer.extend(samples.draws.iter().map(|draw| draw.beta[index]));
+        beta.push(summarize_scalar_in_place(&mut buffer));
+    }
+
+    buffer.clear();
+    buffer.extend(samples.draws.iter().map(|draw| draw.kappa));
+    let kappa = Some(summarize_scalar_in_place(&mut buffer));
+
+    buffer.clear();
+    buffer.extend(samples.draws.iter().map(|draw| draw.omega_sq));
+    let omega_sq = Some(summarize_scalar_in_place(&mut buffer));
 
     MtpPosteriorSummary {
         alpha,
         beta,
-        kappa: Some(summarize_scalar(&kappa_values)),
-        omega_sq: Some(summarize_scalar(&omega_sq_values)),
+        kappa,
+        omega_sq,
         draw_count,
     }
 }
 
+/// Summarize a scalar parameter from a caller-owned buffer: mean and variance
+/// in one pass, then sort `values` in place for the quantiles (no internal
+/// `to_vec`).
 #[must_use]
-fn summarize_scalar(values: &[f64]) -> ParameterSummary {
+fn summarize_scalar_in_place(values: &mut [f64]) -> ParameterSummary {
     if values.is_empty() {
         return ParameterSummary::default();
     }
@@ -106,15 +118,14 @@ fn summarize_scalar(values: &[f64]) -> ParameterSummary {
         .sum::<f64>()
         / n.max(1.0);
 
-    let mut sorted = values.to_vec();
-    sorted.sort_by(f64::total_cmp);
+    values.sort_by(f64::total_cmp);
 
     ParameterSummary {
         mean,
         std_dev: variance.sqrt(),
-        q025: calculate_quantile(&sorted, 0.025),
-        q50: calculate_quantile(&sorted, 0.5),
-        q975: calculate_quantile(&sorted, 0.975),
+        q025: calculate_quantile(values, 0.025),
+        q50: calculate_quantile(values, 0.5),
+        q975: calculate_quantile(values, 0.975),
     }
 }
 

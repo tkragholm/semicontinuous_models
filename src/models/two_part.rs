@@ -45,8 +45,9 @@ use crate::models::{
 #[cfg(feature = "bench-internals")]
 use crate::utils::weighted_xtz;
 use crate::utils::{
-    add_ridge_to_diagonal, max_abs_diff, mean_column, mean_vector, solve_linear_system,
-    solve_linear_system_ref, std_vector, weighted_xtx, weighted_xtz_with_buffer,
+    add_ridge_to_diagonal, add_row_outer_product_scaled, max_abs_diff, mean_column, mean_vector,
+    solve_linear_system, solve_linear_system_ref, std_vector, weighted_xtx,
+    weighted_xtz_with_buffer,
 };
 use faer::Mat;
 use rand::prelude::*;
@@ -869,8 +870,10 @@ pub fn bootstrap_percentile_ci(betas: &[Mat<f64>], alpha: f64) -> Vec<Confidence
     upper_idx = upper_idx.min(last).max(lower_idx);
 
     let mut intervals = Vec::with_capacity(n);
+    let mut values: Vec<f64> = Vec::with_capacity(betas.len());
     for col in 0..n {
-        let mut values = betas.iter().map(|b| b[(col, 0)]).collect::<Vec<_>>();
+        values.clear();
+        values.extend(betas.iter().map(|b| b[(col, 0)]));
         let upper = order_statistic_unsorted(&mut values, upper_idx).unwrap_or(f64::NAN);
         let lower = if lower_idx == upper_idx {
             upper
@@ -1168,12 +1171,7 @@ fn covariance_logit_weighted(
     let mut meat = Mat::<f64>::zeros(x.ncols(), x.ncols());
     for i in 0..x.nrows() {
         let weight = residuals[(i, 0)] * residuals[(i, 0)];
-        for col_i in 0..x.ncols() {
-            for col_j in 0..x.ncols() {
-                meat[(col_i, col_j)] =
-                    (x[(i, col_i)] * x[(i, col_j)]).mul_add(weight, meat[(col_i, col_j)]);
-            }
-        }
+        add_row_outer_product_scaled(&mut meat, x, i, weight);
     }
 
     sandwich_covariance(&xtwx, &meat)
@@ -1338,9 +1336,7 @@ fn sandwich_covariance(information: &Mat<f64>, meat: &Mat<f64>) -> Result<Mat<f6
     let left = solve_linear_system(information, meat).map_err(|_| TwoPartError::SolveFailed)?;
     let cov_t = solve_linear_system_ref(information.transpose(), left.transpose())
         .map_err(|_| TwoPartError::SolveFailed)?;
-    Ok(Mat::from_fn(cov_t.ncols(), cov_t.nrows(), |i, j| {
-        cov_t[(j, i)]
-    }))
+    Ok(cov_t.transpose().to_owned())
 }
 
 /// High-level interface for fitting two-part models.

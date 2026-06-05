@@ -24,8 +24,8 @@ use thiserror::Error;
 
 use crate::input::{InputError, ModelInput};
 use crate::utils::{
-    add_ridge_to_diagonal, add_row_outer_product_scaled, max_abs_diff, mean_column,
-    solve_linear_system, solve_linear_system_ref,
+    add_outer_product_scaled, add_ridge_to_diagonal, add_row_outer_product_scaled, max_abs_diff,
+    mean_column, solve_linear_system, solve_linear_system_ref,
 };
 
 /// Tuning parameters for log-normal fitting.
@@ -357,11 +357,14 @@ fn fit_lognormal_with_lambda(
     let lambda = options.l2_penalty.max(0.0);
     let mut iterations = 0;
 
+    // `xtx` and `xty` do not depend on `beta`, so they are loop-invariant;
+    // compute them once and reuse for every solve and for the robust covariance.
+    let mut xtx = x_pos.transpose() * &x_pos;
+    add_ridge_to_diagonal(&mut xtx, lambda, options.l2_penalty_exclude_intercept);
+    let xty = x_pos.transpose() * &y_log;
+
     for iteration in 0..options.max_iter {
         iterations = iteration + 1;
-        let mut xtx = x_pos.transpose() * &x_pos;
-        add_ridge_to_diagonal(&mut xtx, lambda, options.l2_penalty_exclude_intercept);
-        let xty = x_pos.transpose() * &y_log;
         let beta_next = solve_linear_system(&xtx, &xty).map_err(|_| LogNormalError::SolveFailed)?;
 
         if max_abs_diff(&beta_next, &beta) < options.tolerance {
@@ -376,8 +379,6 @@ fn fit_lognormal_with_lambda(
     let smearing = mean_column(&map_mat(&residuals, f64::exp));
 
     let (cov, se, clustered, cluster_count) = if options.robust_se {
-        let mut xtx = x_pos.transpose() * &x_pos;
-        add_ridge_to_diagonal(&mut xtx, lambda, options.l2_penalty_exclude_intercept);
         let (cov, clustered, cluster_count) =
             robust_covariance(&x_pos, &residuals, cluster_ids_pos.as_deref(), &xtx)?;
         let se = cov.as_ref().map(diagonal_sqrt);
@@ -452,11 +453,7 @@ fn robust_covariance(
             }
         }
         for sum in cluster_sums.values() {
-            for j in 0..p {
-                for k in 0..p {
-                    meat[(j, k)] = sum[j].mul_add(sum[k], meat[(j, k)]);
-                }
-            }
+            add_outer_product_scaled(&mut meat, sum, 1.0);
         }
         let cov = sandwich_covariance(xtx, &meat)?;
         return Ok((Some(cov), true, Some(cluster_sums.len())));
@@ -474,9 +471,7 @@ fn sandwich_covariance(xtx: &Mat<f64>, meat: &Mat<f64>) -> Result<Mat<f64>, LogN
     let left = solve_linear_system(xtx, meat).map_err(|_| LogNormalError::SolveFailed)?;
     let cov_t = solve_linear_system_ref(xtx.transpose(), left.transpose())
         .map_err(|_| LogNormalError::SolveFailed)?;
-    Ok(Mat::from_fn(cov_t.ncols(), cov_t.nrows(), |i, j| {
-        cov_t[(j, i)]
-    }))
+    Ok(cov_t.transpose().to_owned())
 }
 
 /// High-level interface for fitting log-normal models.

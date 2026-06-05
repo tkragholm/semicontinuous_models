@@ -8,7 +8,15 @@ fn tweedie_input_uses_sample_weights_for_intercept_only_gamma_fit() {
     let y = Mat::from_fn(4, 1, |row, _col| if row < 2 { 1.0 } else { 10.0 });
     let weights = Mat::from_fn(4, 1, |row, _col| if row < 2 { 10.0 } else { 1.0 });
 
-    let weighted_mean = (10.0 * 1.0 + 10.0 * 1.0 + 1.0 * 10.0 + 1.0 * 10.0) / 22.0;
+    // Weighted mean of the gamma fit: Σ wᵢ·yᵢ / Σ wᵢ over the four rows above.
+    let outcomes = [1.0, 1.0, 10.0, 10.0];
+    let row_weights = [10.0, 10.0, 1.0, 1.0];
+    let weighted_mean = outcomes
+        .iter()
+        .zip(row_weights.iter())
+        .map(|(y, w)| y * w)
+        .sum::<f64>()
+        / row_weights.iter().sum::<f64>();
     let input = ModelInput::new(x, y).with_sample_weights(weights);
 
     let options = TweedieOptions::builder()

@@ -285,6 +285,7 @@ pub(super) fn run_mcmc_chain(
     let family_rows = build_family_rows(context.row_to_family, state.family_effects.len());
     let mut counts = AcceptanceCounts::default();
     let mut draws = Vec::with_capacity(retained_draws);
+    let n_rows = row_cache.row_log_likelihood.len();
     let mut buffers = SamplerBuffers {
         alpha_proposal: vec![0.0; state.alpha.len()],
         beta_proposal: vec![0.0; state.beta.len()],
@@ -293,6 +294,10 @@ pub(super) fn run_mcmc_chain(
             .iter()
             .map(|effect| vec![0.0; effect.len()])
             .collect(),
+        row_scratch: Vec::with_capacity(n_rows),
+        binary_fixed_scratch: Vec::with_capacity(n_rows),
+        mean_fixed_scratch: Vec::with_capacity(n_rows),
+        family_row_scratch: Vec::new(),
     };
     let mut inverse_scratch = SpdInverseScratch::new(state.random_effects_cov.ncols());
 
@@ -303,7 +308,7 @@ pub(super) fn run_mcmc_chain(
             state,
             &mut posterior,
             &mut row_cache,
-            &mut buffers.alpha_proposal,
+            &mut buffers,
             &proposal_scales.alpha,
             tuning.min_draw_scale,
         ));
@@ -313,7 +318,7 @@ pub(super) fn run_mcmc_chain(
             state,
             &mut posterior,
             &mut row_cache,
-            &mut buffers.beta_proposal,
+            &mut buffers,
             &proposal_scales.beta,
             tuning.min_draw_scale,
         ));
@@ -334,6 +339,7 @@ pub(super) fn run_mcmc_chain(
             state,
             &mut posterior,
             &mut row_cache,
+            &mut buffers.family_row_scratch,
             &family_rows,
             proposal_scales.family_effects,
             tuning.min_draw_scale,
@@ -347,6 +353,7 @@ pub(super) fn run_mcmc_chain(
                 state,
                 &mut posterior,
                 &mut row_cache,
+                &mut buffers.row_scratch,
                 proposal_scales.kappa,
             ));
         }
@@ -356,6 +363,7 @@ pub(super) fn run_mcmc_chain(
             state,
             &mut posterior,
             &mut row_cache,
+            &mut buffers.row_scratch,
             proposal_scales.log_omega_sq,
         ));
 

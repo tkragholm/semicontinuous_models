@@ -613,9 +613,20 @@ pub(super) fn max_slice_abs_diff(current: &[f64], previous: &[f64]) -> f64 {
 }
 
 pub(super) fn linear_predictor(design_matrix: &Mat<f64>, coefficients: &[f64]) -> Vec<f64> {
-    (0..design_matrix.nrows())
-        .map(|row| dot_row(design_matrix, row, coefficients))
-        .collect()
+    let mut out = Vec::new();
+    linear_predictor_into(&mut out, design_matrix, coefficients);
+    out
+}
+
+/// `linear_predictor` variant that reuses `out` instead of allocating a fresh
+/// `Vec`, for use in the MCMC inner loop where it runs every iteration.
+pub(super) fn linear_predictor_into(
+    out: &mut Vec<f64>,
+    design_matrix: &Mat<f64>,
+    coefficients: &[f64],
+) {
+    out.clear();
+    out.extend((0..design_matrix.nrows()).map(|row| dot_row(design_matrix, row, coefficients)));
 }
 
 pub(super) fn subject_effect_log_prior(effect: &[f64], random_effects_precision: &Mat<f64>) -> f64 {

@@ -258,6 +258,21 @@ pub fn add_row_outer_product_scaled(meat: &mut Mat<f64>, x: &Mat<f64>, row: usiz
     }
 }
 
+/// Add the scaled outer product `scale * v vᵀ` of a vector into a "meat" matrix.
+///
+/// Slice-based companion to [`add_row_outer_product_scaled`] for cluster-robust
+/// sandwich estimators, where the contribution is the outer product of a
+/// per-cluster residual-sum vector rather than a design-matrix row.
+pub fn add_outer_product_scaled(meat: &mut Mat<f64>, v: &[f64], scale: f64) {
+    let p = v.len();
+    for j in 0..p {
+        let scaled_vj = scale * v[j];
+        for k in 0..p {
+            meat[(j, k)] = scaled_vj.mul_add(v[k], meat[(j, k)]);
+        }
+    }
+}
+
 #[must_use]
 pub fn calculate_quantile(sorted_values: &[f64], quantile: f64) -> f64 {
     if sorted_values.is_empty() {
@@ -318,22 +333,13 @@ pub fn calibration_bins_summary(
             }
 
             let count = rows.len();
-            let mean_predicted_probability = rows
-                .iter()
-                .map(|row| predicted_probability[*row])
-                .sum::<f64>()
-                / usize_to_f64(count);
-            let observed_positive_rate = rows
-                .iter()
-                .map(|row| {
-                    if input.outcome[(*row, 0)] > 0.0 {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                })
-                .sum::<f64>()
-                / usize_to_f64(count);
+            let (predicted_sum, positive_count) =
+                rows.iter().fold((0.0, 0usize), |(prob, pos), row| {
+                    let is_positive = usize::from(input.outcome[(*row, 0)] > 0.0);
+                    (prob + predicted_probability[*row], pos + is_positive)
+                });
+            let mean_predicted_probability = predicted_sum / usize_to_f64(count);
+            let observed_positive_rate = usize_to_f64(positive_count) / usize_to_f64(count);
 
             CalibrationBinSummary {
                 bin_index: idx,
@@ -349,19 +355,29 @@ pub fn calibration_bins_summary(
 
 #[must_use]
 pub fn summarize_draws(values: &[f64]) -> EffectIntervalSummary {
+    let mut sorted = values.to_vec();
+    summarize_draws_in_place(&mut sorted)
+}
+
+/// `summarize_draws` over a buffer the caller owns.
+///
+/// Computes the mean, then sorts `values` in place for the quantiles (no
+/// internal `to_vec`). Use when the draw buffer can be consumed — e.g.
+/// per-period effect draws that are summarized exactly once.
+#[must_use]
+pub fn summarize_draws_in_place(values: &mut [f64]) -> EffectIntervalSummary {
     if values.is_empty() {
         return EffectIntervalSummary::default();
     }
 
     let mean = values.iter().sum::<f64>() / usize_to_f64(values.len());
-    let mut sorted = values.to_vec();
-    sorted.sort_by(f64::total_cmp);
+    values.sort_by(f64::total_cmp);
 
     EffectIntervalSummary {
         mean,
-        q025: calculate_quantile(&sorted, 0.025),
-        q50: calculate_quantile(&sorted, 0.5),
-        q975: calculate_quantile(&sorted, 0.975),
+        q025: calculate_quantile(values, 0.025),
+        q50: calculate_quantile(values, 0.5),
+        q975: calculate_quantile(values, 0.975),
     }
 }
 

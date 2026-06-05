@@ -23,8 +23,8 @@ use crate::models::{
     AttemptDiagnostics, AttemptOutcome, FitMetadata, FitStrategy, Model, SolverKind,
 };
 use crate::utils::{
-    add_ridge_to_diagonal, add_row_outer_product_scaled, max_abs_diff, solve_linear_system,
-    solve_linear_system_ref, weighted_xtx, weighted_xtz,
+    add_outer_product_scaled, add_ridge_to_diagonal, add_row_outer_product_scaled, max_abs_diff,
+    solve_linear_system, solve_linear_system_ref, weighted_xtx, weighted_xtz,
 };
 
 const LINEAR_PREDICTOR_CLIP: f64 = 30.0;
@@ -630,11 +630,7 @@ fn robust_covariance(
             }
         }
         for sum in cluster_sums.values() {
-            for j in 0..p {
-                for k in 0..p {
-                    meat[(j, k)] = sum[j].mul_add(sum[k], meat[(j, k)]);
-                }
-            }
+            add_outer_product_scaled(&mut meat, sum, 1.0);
         }
         let cov = sandwich_covariance(xtwx, &meat)?;
         return Ok((Some(cov), true, Some(cluster_sums.len())));
@@ -651,9 +647,7 @@ fn robust_covariance(
 fn sandwich_covariance(xtwx: &Mat<f64>, meat: &Mat<f64>) -> Result<Mat<f64>, TweedieError> {
     let left = solve_with_stabilization(xtwx, meat)?;
     let cov_t = solve_with_stabilization_view(xtwx.transpose(), left.transpose())?;
-    Ok(Mat::from_fn(cov_t.ncols(), cov_t.nrows(), |i, j| {
-        cov_t[(j, i)]
-    }))
+    Ok(cov_t.transpose().to_owned())
 }
 
 fn backtracking_update(
@@ -671,9 +665,7 @@ fn backtracking_update(
     let mut best_deviance = f64::INFINITY;
     for _ in 0..BACKTRACKING_STEPS {
         if (step - 1.0).abs() < f64::EPSILON {
-            for row in 0..proposal.nrows() {
-                proposal[(row, 0)] = beta_candidate[(row, 0)];
-            }
+            proposal.clone_from(beta_candidate);
         } else {
             blend_betas_into(&mut proposal, beta_current, beta_candidate, step);
         }
@@ -684,9 +676,7 @@ fn backtracking_update(
         }
         if dev.is_finite() && dev < best_deviance {
             best_deviance = dev;
-            for row in 0..best_beta.nrows() {
-                best_beta[(row, 0)] = proposal[(row, 0)];
-            }
+            best_beta.clone_from(&proposal);
         }
         step *= 0.5;
     }

@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use faer::Mat;
 
 use crate::utils::usize_to_f64;
@@ -80,14 +78,12 @@ pub fn column_has_variation(x: &Mat<f64>, column: usize, tolerance: f64) -> bool
 
 #[must_use]
 fn nonconstant_column_indices(x: &Mat<f64>, tolerance: f64, always_keep: &[usize]) -> Vec<usize> {
-    let forced = always_keep
-        .iter()
-        .copied()
-        .filter(|idx| *idx < x.ncols())
-        .collect::<HashSet<_>>();
+    // `col` is always in `0..x.ncols()`, so any out-of-range `always_keep`
+    // index can never match — a direct slice lookup needs no `HashSet` or bounds
+    // filtering, and `always_keep` is tiny in practice.
     let mut cols = Vec::new();
     for col in 0..x.ncols() {
-        if forced.contains(&col) || column_has_variation(x, col, tolerance) {
+        if always_keep.contains(&col) || column_has_variation(x, col, tolerance) {
             cols.push(col);
         }
     }

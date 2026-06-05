@@ -574,19 +574,19 @@ fn build_cv_summary(
     if cv_default.include_two_part {
         rows.push(ModelScore {
             name: "two_part".to_string(),
-            metrics: cv_default.two_part_metrics.clone(),
+            metrics: cv_default.two_part_metrics,
         });
     }
     if let Some(elastic_net) = cv_elastic_net {
         rows.push(ModelScore {
             name: "two_part_elastic_net".to_string(),
-            metrics: elastic_net.two_part_metrics.clone(),
+            metrics: elastic_net.two_part_metrics,
         });
     }
     for candidate in &cv_default.tweedie_candidates {
         rows.push(ModelScore {
             name: format!("tweedie p={:.1}", candidate.power),
-            metrics: candidate.metrics.clone(),
+            metrics: candidate.metrics,
         });
     }
     if cv_default.include_lognormal
@@ -594,7 +594,7 @@ fn build_cv_summary(
     {
         rows.push(ModelScore {
             name: "lognormal".to_string(),
-            metrics: lognormal.clone(),
+            metrics: *lognormal,
         });
     }
     rows
@@ -656,47 +656,43 @@ struct MetricBest {
 }
 
 fn best_metrics(rows: &[ModelScore]) -> MetricBest {
-    MetricBest {
-        rmse: rows
-            .iter()
-            .map(|s| s.metrics.rmse)
-            .fold(f64::INFINITY, f64::min),
-        mae: rows
-            .iter()
-            .map(|s| s.metrics.mae)
-            .fold(f64::INFINITY, f64::min),
-        rmsle: rows
-            .iter()
-            .map(|s| s.metrics.rmsle)
-            .fold(f64::INFINITY, f64::min),
-        r2: rows
-            .iter()
-            .map(|s| s.metrics.r2)
-            .fold(f64::NEG_INFINITY, f64::max),
-        deviance: rows
-            .iter()
-            .map(|s| s.metrics.deviance)
-            .fold(f64::INFINITY, f64::min),
-        aic: f64::INFINITY,
-        bic: f64::INFINITY,
-        loglik: f64::NEG_INFINITY,
-    }
-}
-
-fn best_ic(rows: &[ModelInformationCriteria]) -> MetricBest {
-    MetricBest {
-        loglik: rows
-            .iter()
-            .map(|s| s.loglik)
-            .fold(f64::NEG_INFINITY, f64::max),
-        aic: rows.iter().map(|s| s.aic).fold(f64::INFINITY, f64::min),
-        bic: rows.iter().map(|s| s.bic).fold(f64::INFINITY, f64::min),
+    let mut best = MetricBest {
         rmse: f64::INFINITY,
         mae: f64::INFINITY,
         rmsle: f64::INFINITY,
         r2: f64::NEG_INFINITY,
         deviance: f64::INFINITY,
+        aic: f64::INFINITY,
+        bic: f64::INFINITY,
+        loglik: f64::NEG_INFINITY,
+    };
+    for score in rows {
+        best.rmse = best.rmse.min(score.metrics.rmse);
+        best.mae = best.mae.min(score.metrics.mae);
+        best.rmsle = best.rmsle.min(score.metrics.rmsle);
+        best.r2 = best.r2.max(score.metrics.r2);
+        best.deviance = best.deviance.min(score.metrics.deviance);
     }
+    best
+}
+
+fn best_ic(rows: &[ModelInformationCriteria]) -> MetricBest {
+    let mut best = MetricBest {
+        rmse: f64::INFINITY,
+        mae: f64::INFINITY,
+        rmsle: f64::INFINITY,
+        r2: f64::NEG_INFINITY,
+        deviance: f64::INFINITY,
+        aic: f64::INFINITY,
+        bic: f64::INFINITY,
+        loglik: f64::NEG_INFINITY,
+    };
+    for ic in rows {
+        best.loglik = best.loglik.max(ic.loglik);
+        best.aic = best.aic.min(ic.aic);
+        best.bic = best.bic.min(ic.bic);
+    }
+    best
 }
 
 fn best_tweedie_ranking(rows: &[TweedieRankingRow]) -> MetricBest {

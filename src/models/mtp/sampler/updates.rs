@@ -2,13 +2,13 @@ use rand::rngs::StdRng;
 
 use super::math::{
     SpdInverseScratch, covariance_from_subject_effects, invert_matrix_with_jitter_and_scratch,
-    linear_predictor, posterior_scale_matrix, random_walk_vector_into, sample_inverse_wishart,
+    linear_predictor_into, posterior_scale_matrix, random_walk_vector_into, sample_inverse_wishart,
     sample_standard_normal, should_accept, subject_effect_log_prior,
     usize_to_f64_reexport as usize_to_f64,
 };
 use super::{
-    ChainState, FamilyRandomEffects, PosteriorCache, RowLikelihoodCache, SamplerContext,
-    SubjectProposalEvaluation,
+    ChainState, FamilyRandomEffects, PosteriorCache, RowLikelihoodCache, SamplerBuffers,
+    SamplerContext, SubjectProposalEvaluation,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -18,26 +18,37 @@ pub(super) fn update_alpha_block(
     state: &mut ChainState,
     posterior: &mut PosteriorCache,
     row_cache: &mut RowLikelihoodCache,
-    proposal_buffer: &mut Vec<f64>,
+    buffers: &mut SamplerBuffers,
     scales: &[f64],
     min_draw_scale: f64,
 ) -> bool {
     let current_total = posterior.total();
-    random_walk_vector_into(proposal_buffer, &state.alpha, scales, rng, min_draw_scale);
-    std::mem::swap(&mut state.alpha, proposal_buffer);
+    random_walk_vector_into(
+        &mut buffers.alpha_proposal,
+        &state.alpha,
+        scales,
+        rng,
+        min_draw_scale,
+    );
+    std::mem::swap(&mut state.alpha, &mut buffers.alpha_proposal);
 
-    let candidate_binary_fixed = linear_predictor(&context.input.x_binary, &state.alpha);
-    let Some(candidate_rows) = context.recompute_all_rows_from_offsets(
+    linear_predictor_into(
+        &mut buffers.binary_fixed_scratch,
+        &context.input.x_binary,
+        &state.alpha,
+    );
+    if !context.recompute_all_rows_from_offsets_into(
+        &mut buffers.row_scratch,
         state,
-        &candidate_binary_fixed,
+        &buffers.binary_fixed_scratch,
         &row_cache.mean_fixed,
         &row_cache.binary_offset,
         &row_cache.mean_offset,
-    ) else {
-        std::mem::swap(&mut state.alpha, proposal_buffer);
+    ) {
+        std::mem::swap(&mut state.alpha, &mut buffers.alpha_proposal);
         return false;
-    };
-    let candidate_log_likelihood = candidate_rows.iter().sum::<f64>();
+    }
+    let candidate_log_likelihood = buffers.row_scratch.iter().sum::<f64>();
     let candidate_alpha_prior = context.log_alpha_prior(&state.alpha);
     let candidate_total = current_total - posterior.log_likelihood - posterior.log_prior_alpha
         + candidate_log_likelihood
@@ -46,9 +57,13 @@ pub(super) fn update_alpha_block(
     if accepted {
         posterior.log_likelihood = candidate_log_likelihood;
         posterior.log_prior_alpha = candidate_alpha_prior;
-        row_cache.replace_all_rows_with_binary(candidate_rows, candidate_binary_fixed);
+        row_cache.accept_rows_with_binary(
+            &mut buffers.row_scratch,
+            &mut buffers.binary_fixed_scratch,
+            candidate_log_likelihood,
+        );
     } else {
-        std::mem::swap(&mut state.alpha, proposal_buffer);
+        std::mem::swap(&mut state.alpha, &mut buffers.alpha_proposal);
     }
     accepted
 }
@@ -60,26 +75,37 @@ pub(super) fn update_beta_block(
     state: &mut ChainState,
     posterior: &mut PosteriorCache,
     row_cache: &mut RowLikelihoodCache,
-    proposal_buffer: &mut Vec<f64>,
+    buffers: &mut SamplerBuffers,
     scales: &[f64],
     min_draw_scale: f64,
 ) -> bool {
     let current_total = posterior.total();
-    random_walk_vector_into(proposal_buffer, &state.beta, scales, rng, min_draw_scale);
-    std::mem::swap(&mut state.beta, proposal_buffer);
+    random_walk_vector_into(
+        &mut buffers.beta_proposal,
+        &state.beta,
+        scales,
+        rng,
+        min_draw_scale,
+    );
+    std::mem::swap(&mut state.beta, &mut buffers.beta_proposal);
 
-    let candidate_mean_fixed = linear_predictor(&context.input.x_mean, &state.beta);
-    let Some(candidate_rows) = context.recompute_all_rows_from_offsets(
+    linear_predictor_into(
+        &mut buffers.mean_fixed_scratch,
+        &context.input.x_mean,
+        &state.beta,
+    );
+    if !context.recompute_all_rows_from_offsets_into(
+        &mut buffers.row_scratch,
         state,
         &row_cache.binary_fixed,
-        &candidate_mean_fixed,
+        &buffers.mean_fixed_scratch,
         &row_cache.binary_offset,
         &row_cache.mean_offset,
-    ) else {
-        std::mem::swap(&mut state.beta, proposal_buffer);
+    ) {
+        std::mem::swap(&mut state.beta, &mut buffers.beta_proposal);
         return false;
-    };
-    let candidate_log_likelihood = candidate_rows.iter().sum::<f64>();
+    }
+    let candidate_log_likelihood = buffers.row_scratch.iter().sum::<f64>();
     let candidate_beta_prior = context.log_beta_prior(&state.beta);
     let candidate_total = current_total - posterior.log_likelihood - posterior.log_prior_beta
         + candidate_log_likelihood
@@ -88,9 +114,13 @@ pub(super) fn update_beta_block(
     if accepted {
         posterior.log_likelihood = candidate_log_likelihood;
         posterior.log_prior_beta = candidate_beta_prior;
-        row_cache.replace_all_rows_with_mean(candidate_rows, candidate_mean_fixed);
+        row_cache.accept_rows_with_mean(
+            &mut buffers.row_scratch,
+            &mut buffers.mean_fixed_scratch,
+            candidate_log_likelihood,
+        );
     } else {
-        std::mem::swap(&mut state.beta, proposal_buffer);
+        std::mem::swap(&mut state.beta, &mut buffers.beta_proposal);
     }
     accepted
 }
@@ -265,6 +295,7 @@ pub(super) fn update_family_effects_block(
     state: &mut ChainState,
     posterior: &mut PosteriorCache,
     row_cache: &mut RowLikelihoodCache,
+    family_row_scratch: &mut Vec<f64>,
     family_rows: &[Vec<usize>],
     scales: [f64; 2],
     min_draw_scale: f64,
@@ -295,17 +326,18 @@ pub(super) fn update_family_effects_block(
                 .max(min_draw_scale)
                 .mul_add(sample_standard_normal(rng), current[1]),
         ];
-        let Some(candidate_rows) = context.family_candidate_rows_with_terms(
+        if !context.family_candidate_rows_into(
+            family_row_scratch,
             row_cache,
             rows,
             current,
             candidate_effect,
             state.omega_sq,
             context.effective_kappa(state),
-        ) else {
+        ) {
             continue;
-        };
-        let candidate_sum = candidate_rows.iter().sum::<f64>();
+        }
+        let candidate_sum = family_row_scratch.iter().sum::<f64>();
         let candidate_log_prior = context.family_effect_log_prior(candidate_effect);
 
         if should_accept(
@@ -313,7 +345,7 @@ pub(super) fn update_family_effects_block(
             rng,
         ) {
             state.family_effects[family_idx] = candidate_effect;
-            let likelihood_delta = row_cache.replace_rows(rows, &candidate_rows);
+            let likelihood_delta = row_cache.replace_rows(rows, family_row_scratch);
             row_cache.update_family_offsets(
                 rows,
                 candidate_effect[0] - current[0],
@@ -371,6 +403,7 @@ pub(super) fn update_kappa_block(
     state: &mut ChainState,
     posterior: &mut PosteriorCache,
     row_cache: &mut RowLikelihoodCache,
+    row_scratch: &mut Vec<f64>,
     scale: f64,
 ) -> bool {
     let current_total = posterior.total();
@@ -381,17 +414,18 @@ pub(super) fn update_kappa_block(
         .mul_add(sample_standard_normal(rng), state.kappa)
         .clamp(kappa_lower, kappa_upper);
 
-    let Some(candidate_rows) = context.recompute_all_rows_from_offsets(
+    if !context.recompute_all_rows_from_offsets_into(
+        row_scratch,
         state,
         &row_cache.binary_fixed,
         &row_cache.mean_fixed,
         &row_cache.binary_offset,
         &row_cache.mean_offset,
-    ) else {
+    ) {
         state.kappa = previous;
         return false;
-    };
-    let candidate_log_likelihood = candidate_rows.iter().sum::<f64>();
+    }
+    let candidate_log_likelihood = row_scratch.iter().sum::<f64>();
     let candidate_kappa_prior = context.log_kappa_prior(state.kappa);
     let candidate_total = current_total - posterior.log_likelihood - posterior.log_prior_kappa
         + candidate_log_likelihood
@@ -400,8 +434,7 @@ pub(super) fn update_kappa_block(
     if accepted {
         posterior.log_likelihood = candidate_log_likelihood;
         posterior.log_prior_kappa = candidate_kappa_prior;
-        row_cache.row_log_likelihood = candidate_rows;
-        row_cache.total = candidate_log_likelihood;
+        row_cache.accept_rows(row_scratch, candidate_log_likelihood);
     } else {
         state.kappa = previous;
     }
@@ -414,6 +447,7 @@ pub(super) fn update_omega_block(
     state: &mut ChainState,
     posterior: &mut PosteriorCache,
     row_cache: &mut RowLikelihoodCache,
+    row_scratch: &mut Vec<f64>,
     scale: f64,
 ) -> bool {
     let current_total = posterior.total();
@@ -421,17 +455,18 @@ pub(super) fn update_omega_block(
     let proposed_log_omega = scale.mul_add(sample_standard_normal(rng), previous.ln());
     state.omega_sq = proposed_log_omega.exp().max(1.0e-8);
 
-    let Some(candidate_rows) = context.recompute_all_rows_from_offsets(
+    if !context.recompute_all_rows_from_offsets_into(
+        row_scratch,
         state,
         &row_cache.binary_fixed,
         &row_cache.mean_fixed,
         &row_cache.binary_offset,
         &row_cache.mean_offset,
-    ) else {
+    ) {
         state.omega_sq = previous;
         return false;
-    };
-    let candidate_log_likelihood = candidate_rows.iter().sum::<f64>();
+    }
+    let candidate_log_likelihood = row_scratch.iter().sum::<f64>();
     let candidate_omega_prior = context.log_omega_prior(state.omega_sq);
     let candidate_total = current_total - posterior.log_likelihood - posterior.log_prior_omega
         + candidate_log_likelihood
@@ -441,8 +476,7 @@ pub(super) fn update_omega_block(
     if accepted {
         posterior.log_likelihood = candidate_log_likelihood;
         posterior.log_prior_omega = candidate_omega_prior;
-        row_cache.row_log_likelihood = candidate_rows;
-        row_cache.total = candidate_log_likelihood;
+        row_cache.accept_rows(row_scratch, candidate_log_likelihood);
     } else {
         state.omega_sq = previous;
     }

@@ -272,6 +272,31 @@ impl SamplerContext<'_> {
         binary_offset: &[f64],
         mean_offset: &[f64],
     ) -> Option<Vec<f64>> {
+        let mut rows = Vec::new();
+        self.recompute_all_rows_from_offsets_into(
+            &mut rows,
+            state,
+            binary_fixed,
+            mean_fixed,
+            binary_offset,
+            mean_offset,
+        )
+        .then_some(rows)
+    }
+
+    /// `recompute_all_rows_from_offsets` variant that fills `out` in place
+    /// instead of allocating, returning `false` (leaving `out` partially
+    /// filled) if any contribution is non-finite. The hot MCMC loop reuses a
+    /// single scratch buffer across iterations via this entry point.
+    pub(super) fn recompute_all_rows_from_offsets_into(
+        &self,
+        out: &mut Vec<f64>,
+        state: &ChainState,
+        binary_fixed: &[f64],
+        mean_fixed: &[f64],
+        binary_offset: &[f64],
+        mean_offset: &[f64],
+    ) -> bool {
         let omega = state.omega_sq.sqrt();
         let kappa = self.effective_kappa(state);
         let delta = kappa / kappa.mul_add(kappa, 1.0).sqrt();
@@ -282,7 +307,8 @@ impl SamplerContext<'_> {
                 0.0
             };
 
-        let mut rows = Vec::with_capacity(self.input.outcome.nrows());
+        out.clear();
+        out.reserve(self.input.outcome.nrows());
         for row in 0..self.input.outcome.nrows() {
             let contribution = self.row_log_likelihood_with_terms(
                 self.input.outcome[(row, 0)],
@@ -293,11 +319,11 @@ impl SamplerContext<'_> {
                 log_phi_omega_delta,
             );
             if !contribution.is_finite() {
-                return None;
+                return false;
             }
-            rows.push(contribution);
+            out.push(contribution);
         }
-        Some(rows)
+        true
     }
 
     pub(super) fn subject_candidate_rows_with_terms(
@@ -353,17 +379,25 @@ impl SamplerContext<'_> {
         Some(contributions)
     }
 
-    pub(super) fn family_candidate_rows_with_terms(
+    /// Family-effect candidate row contributions, written into `out` in place.
+    ///
+    /// Replaces the previous allocating `family_candidate_rows_with_terms`.
+    /// Returns `false` (leaving `out` partially filled) if any contribution is
+    /// non-finite. The family update loop reuses a single scratch buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn family_candidate_rows_into(
         &self,
+        out: &mut Vec<f64>,
         row_cache: &RowLikelihoodCache,
         rows: &[usize],
         current_family_effect: [f64; 2],
         family_effect: [f64; 2],
         omega_sq: f64,
         kappa: f64,
-    ) -> Option<Vec<f64>> {
+    ) -> bool {
+        out.clear();
         if rows.is_empty() {
-            return Some(Vec::new());
+            return true;
         }
 
         let omega = omega_sq.sqrt();
@@ -375,7 +409,7 @@ impl SamplerContext<'_> {
                 0.0
             };
 
-        let mut contributions = Vec::with_capacity(rows.len());
+        out.reserve(rows.len());
         for row in rows {
             let contribution = self.row_log_likelihood_with_terms(
                 self.input.outcome[(*row, 0)],
@@ -389,12 +423,12 @@ impl SamplerContext<'_> {
                 log_phi_omega_delta,
             );
             if !contribution.is_finite() {
-                return None;
+                return false;
             }
-            contributions.push(contribution);
+            out.push(contribution);
         }
 
-        Some(contributions)
+        true
     }
 
     pub(super) fn log_alpha_prior(&self, alpha: &[f64]) -> f64 {

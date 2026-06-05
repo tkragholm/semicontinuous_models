@@ -166,6 +166,14 @@ struct SamplerBuffers {
     alpha_proposal: Vec<f64>,
     beta_proposal: Vec<f64>,
     subject_proposals: Vec<Vec<f64>>,
+    /// Reused candidate row log-likelihoods (length `n_rows`) for the
+    /// alpha/beta/kappa/omega blocks, swapped into the cache on acceptance.
+    row_scratch: Vec<f64>,
+    /// Reused candidate fixed-effect linear predictors (length `n_rows`).
+    binary_fixed_scratch: Vec<f64>,
+    mean_fixed_scratch: Vec<f64>,
+    /// Reused family candidate row buffer (grows to the largest family).
+    family_row_scratch: Vec<f64>,
 }
 
 impl PosteriorCache {
@@ -256,20 +264,35 @@ impl RowLikelihoodCache {
         delta
     }
 
-    fn replace_all_rows_with_binary(
+    /// Accept an alpha proposal by swapping in the reused scratch buffers (no
+    /// allocation, no recomputed sum — the caller already summed the rows).
+    const fn accept_rows_with_binary(
         &mut self,
-        row_log_likelihood: Vec<f64>,
-        binary_fixed: Vec<f64>,
+        row_scratch: &mut Vec<f64>,
+        binary_fixed_scratch: &mut Vec<f64>,
+        total: f64,
     ) {
-        self.total = row_log_likelihood.iter().sum();
-        self.row_log_likelihood = row_log_likelihood;
-        self.binary_fixed = binary_fixed;
+        std::mem::swap(&mut self.row_log_likelihood, row_scratch);
+        std::mem::swap(&mut self.binary_fixed, binary_fixed_scratch);
+        self.total = total;
     }
 
-    fn replace_all_rows_with_mean(&mut self, row_log_likelihood: Vec<f64>, mean_fixed: Vec<f64>) {
-        self.total = row_log_likelihood.iter().sum();
-        self.row_log_likelihood = row_log_likelihood;
-        self.mean_fixed = mean_fixed;
+    /// Accept a beta proposal by swapping in the reused scratch buffers.
+    const fn accept_rows_with_mean(
+        &mut self,
+        row_scratch: &mut Vec<f64>,
+        mean_fixed_scratch: &mut Vec<f64>,
+        total: f64,
+    ) {
+        std::mem::swap(&mut self.row_log_likelihood, row_scratch);
+        std::mem::swap(&mut self.mean_fixed, mean_fixed_scratch);
+        self.total = total;
+    }
+
+    /// Accept a kappa/omega proposal: only the row log-likelihoods change.
+    const fn accept_rows(&mut self, row_scratch: &mut Vec<f64>, total: f64) {
+        std::mem::swap(&mut self.row_log_likelihood, row_scratch);
+        self.total = total;
     }
 
     fn update_subject_offsets(
@@ -1020,14 +1043,27 @@ mod tests {
                 .expect("posterior cache should build");
         let mut rng = StdRng::seed_from_u64(42);
         let alpha_scales = vec![0.05; state.alpha.len()];
-        let mut alpha_buffer = vec![0.0; state.alpha.len()];
+        let n_rows = row_cache.row_log_likelihood.len();
+        let mut buffers = SamplerBuffers {
+            alpha_proposal: vec![0.0; state.alpha.len()],
+            beta_proposal: vec![0.0; state.beta.len()],
+            subject_proposals: state
+                .subject_effects
+                .iter()
+                .map(|effect| vec![0.0; effect.len()])
+                .collect(),
+            row_scratch: Vec::with_capacity(n_rows),
+            binary_fixed_scratch: Vec::with_capacity(n_rows),
+            mean_fixed_scratch: Vec::with_capacity(n_rows),
+            family_row_scratch: Vec::new(),
+        };
         let _ = update_alpha_block(
             &context,
             &mut rng,
             &mut state,
             &mut posterior,
             &mut row_cache,
-            &mut alpha_buffer,
+            &mut buffers,
             &alpha_scales,
             1.0e-3,
         );
