@@ -337,7 +337,9 @@ impl Model for TwoPartModel {
 
         let eta_gamma = x * &self.beta_gamma;
         for i in 0..x.nrows() {
-            out.mean_positive[(i, 0)] = eta_gamma[(i, 0)].exp();
+            out.mean_positive[(i, 0)] = eta_gamma[(i, 0)]
+                .clamp(-GAMMA_LOG_LINK_ETA_CLAMP, GAMMA_LOG_LINK_ETA_CLAMP)
+                .exp();
         }
 
         for i in 0..x.nrows() {
@@ -972,6 +974,16 @@ fn fit_logit_weighted(
     Err(TwoPartError::NonConvergence)
 }
 
+/// Bound on the gamma log-link linear predictor during IRLS and prediction.
+/// `mu = exp(eta)`; clamping `eta` to ±30 keeps `mu` in roughly [9e-14, 1e13],
+/// orders of magnitude beyond any plausible fitted mean, so the bound never
+/// binds for a well-behaved fit. It only keeps a transient overshoot finite:
+/// heavy-tailed positive outcomes can otherwise drive `eta` large enough that
+/// `mu` overflows to +inf, making the IRLS working response non-finite and the
+/// solve diverge — a failure that most often surfaces as non-convergence inside
+/// a resampling bootstrap.
+const GAMMA_LOG_LINK_ETA_CLAMP: f64 = 30.0;
+
 fn fit_gamma_log_link_weighted(
     x: &Mat<f64>,
     y: &Mat<f64>,
@@ -989,7 +1001,11 @@ fn fit_gamma_log_link_weighted(
     }
 
     for iteration in 0..options.max_iter {
-        let eta = x * &beta;
+        // Clamp the linear predictor before exponentiating so `mu` stays finite
+        // and strictly positive on pathological resamples (see the constant).
+        let eta = map_mat(&(x * &beta), |value| {
+            value.clamp(-GAMMA_LOG_LINK_ETA_CLAMP, GAMMA_LOG_LINK_ETA_CLAMP)
+        });
         let mu = map_mat(&eta, f64::exp);
         let z = Mat::from_fn(eta.nrows(), 1, |i, _| {
             eta[(i, 0)] + (y[(i, 0)] - mu[(i, 0)]) / mu[(i, 0)]
@@ -998,6 +1014,12 @@ fn fit_gamma_log_link_weighted(
         let beta_next =
             weighted_least_squares(x, weights, &z, regularization, &mut weighted_xtz_buffer)?;
 
+        // A non-finite step means this resample is pathological at the current
+        // regularization level; report non-convergence so the Relaxed strategy
+        // retries with stronger ridge rather than propagating NaN downstream.
+        if !crate::utils::matrix_is_finite(&beta_next) {
+            return Err(TwoPartError::NonConvergence);
+        }
         if max_abs_diff(&beta_next, &beta) < options.tolerance {
             return Ok((beta_next, iteration + 1));
         }
@@ -1545,6 +1567,64 @@ mod tests {
             .expect("all-positive outcomes should still fit");
         assert_eq!(report.iterations_logit, 0);
         assert!(report.iterations_gamma > 0);
+    }
+
+    #[test]
+    fn gamma_fit_survives_heavy_tailed_outcome() {
+        // A mass of small positive values with a few extreme outliers. Before
+        // clamping the log-link predictor, the IRLS could drive mu = exp(eta) to
+        // +inf and diverge on this shape; it must now fit to finite coefficients.
+        let n = 80;
+        let x = Mat::from_fn(n, 2, |i, j| {
+            if j == 0 {
+                1.0
+            } else {
+                usize_to_f64(i) / usize_to_f64(n)
+            }
+        });
+        let y = Mat::from_fn(n, 1, |i, _| {
+            if i % 16 == 0 {
+                5.0e7
+            } else {
+                40.0 + usize_to_f64(i)
+            }
+        });
+        let w = Mat::from_fn(n, 1, |_, _| 1.0);
+
+        let (beta, iterations) =
+            fit_gamma_log_link_weighted(&x, &y, &w, FitOptions::stable_defaults())
+                .expect("heavy-tailed gamma fit should converge");
+        assert!(iterations >= 1);
+        assert!(
+            crate::utils::matrix_is_finite(&beta),
+            "estimated coefficients must be finite"
+        );
+    }
+
+    #[test]
+    fn gamma_prediction_clamps_extreme_linear_predictor() {
+        // Fit a benign model, then predict at an extreme covariate. Without the
+        // clamp, exp(eta) overflows to +inf; the clamp keeps the predicted mean
+        // (and expected outcome) finite.
+        let n = 30;
+        let x = Mat::from_fn(n, 2, |i, j| {
+            if j == 0 {
+                1.0
+            } else {
+                usize_to_f64(i) / 10.0
+            }
+        });
+        let y = Mat::from_fn(n, 1, |i, _| 10.0 + usize_to_f64(i));
+        let (model, _report) =
+            fit_two_part(&x, &y, FitOptions::stable_defaults()).expect("benign fit");
+
+        let x_extreme = Mat::from_fn(1, 2, |_, j| if j == 0 { 1.0 } else { 1.0e6 });
+        let prediction = model.predict(&x_extreme);
+        assert!(
+            prediction.mean_positive[(0, 0)].is_finite(),
+            "clamp must keep exp(eta) finite at extreme covariates"
+        );
+        assert!(prediction.expected_outcome[(0, 0)].is_finite());
     }
 
     #[test]
