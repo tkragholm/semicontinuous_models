@@ -199,7 +199,8 @@ pub(crate) fn fit_tweedie(
     power: f64,
     options: TweedieOptions,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
-    fit_tweedie_weighted(x, y, None, clusters, power, options)
+    // Raw entry point: validate the data (finiteness / negativity) inside the fit.
+    fit_tweedie_weighted(x, y, None, clusters, power, options, false)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -210,6 +211,11 @@ fn fit_tweedie_weighted(
     clusters: Option<&[u64]>,
     power: f64,
     options: TweedieOptions,
+    // When the caller already validated the data via `ModelInput::validate` (e.g.
+    // `fit_tweedie_input`, and every bootstrap replicate through it), skip the two
+    // O(n·p) finiteness / negativity scans here — a row-gather of finite, non-negative
+    // rows is still finite and non-negative. The cheap O(1) shape checks always run.
+    assume_validated: bool,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
     let start_time = Instant::now();
     if !(1.0..=2.0).contains(&power) {
@@ -235,11 +241,13 @@ fn fit_tweedie_weighted(
             rows: y.nrows(),
         });
     }
-    if !crate::utils::matrix_is_finite(x) || !crate::utils::matrix_is_finite(y) {
+    if !assume_validated
+        && (!crate::utils::matrix_is_finite(x) || !crate::utils::matrix_is_finite(y))
+    {
         return Err(TweedieError::NonFiniteInput);
     }
     validate_sample_weights(y, sample_weights)?;
-    if (0..y.nrows()).any(|i| y[(i, 0)] < 0.0) {
+    if !assume_validated && (0..y.nrows()).any(|i| y[(i, 0)] < 0.0) {
         return Err(TweedieError::NegativeOutcome);
     }
 
@@ -371,7 +379,7 @@ fn fit_tweedie_with_lambda(
         }
         let xtw_rhs = weighted_xtz(x, &weights, &z);
         let beta_candidate = solve_with_stabilization(&xtwx, &xtw_rhs)?;
-        let beta_next = backtracking_update(
+        let (beta_next, dev_next) = backtracking_update(
             x,
             y,
             sample_weights,
@@ -380,10 +388,6 @@ fn fit_tweedie_with_lambda(
             current_deviance,
             power,
         );
-
-        let eta_next = x * &beta_next;
-        let mu_next = map_mat(&eta_next, exp_clamped);
-        let dev_next = weighted_deviance(y, &mu_next, power, sample_weights);
 
         let beta_converged = max_abs_diff(&beta_next, &beta) < options.tolerance;
         let dev_converged = relative_change(current_deviance, dev_next) < options.tolerance;
@@ -523,6 +527,8 @@ pub fn fit_tweedie_input(
         input.cluster_ids.as_deref(),
         power,
         options,
+        // input.validate() above already scanned finiteness + negativity.
+        true,
     )
 }
 
@@ -650,6 +656,10 @@ fn sandwich_covariance(xtwx: &Mat<f64>, meat: &Mat<f64>) -> Result<Mat<f64>, Twe
     Ok(cov_t.transpose().to_owned())
 }
 
+/// Returns the accepted step's `(beta, deviance)`. The deviance is the one already
+/// computed for the returned beta inside the line search, so the caller reuses it
+/// instead of recomputing `x*beta`, `exp`, and the deviance a second time per IRLS
+/// iteration (the value is identical — same beta, same deviance function).
 fn backtracking_update(
     x: &Mat<f64>,
     y: &Mat<f64>,
@@ -658,7 +668,7 @@ fn backtracking_update(
     beta_candidate: &Mat<f64>,
     current_deviance: f64,
     power: f64,
-) -> Mat<f64> {
+) -> (Mat<f64>, f64) {
     let mut step = 1.0_f64;
     let mut proposal = beta_candidate.clone();
     let mut best_beta = beta_candidate.clone();
@@ -672,7 +682,7 @@ fn backtracking_update(
         let mu = map_mat(&(x * &proposal), exp_clamped);
         let dev = weighted_deviance(y, &mu, power, sample_weights);
         if dev.is_finite() && dev <= current_deviance {
-            return proposal;
+            return (proposal, dev);
         }
         if dev.is_finite() && dev < best_deviance {
             best_deviance = dev;
@@ -680,7 +690,15 @@ fn backtracking_update(
         }
         step *= 0.5;
     }
-    best_beta
+    // No trial reduced the deviance. Report best_beta's deviance — recomputed when the
+    // search never recorded a finite one (all steps non-finite), so the returned value
+    // matches what the caller would have computed for best_beta.
+    let dev = if best_deviance.is_finite() {
+        best_deviance
+    } else {
+        weighted_deviance(y, &map_mat(&(x * &best_beta), exp_clamped), power, sample_weights)
+    };
+    (best_beta, dev)
 }
 
 fn blend_betas_into(
