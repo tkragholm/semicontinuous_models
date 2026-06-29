@@ -98,6 +98,13 @@ pub struct FitOptions {
     /// If true, compute sandwich (robust) covariance.
     #[builder(default = false)]
     pub robust_se: bool,
+    /// If true (the default), compute the model-based coefficient covariance / SEs
+    /// during the fit. A clustered bootstrap draws hundreds–thousands of replicate
+    /// fits and reads ONLY the coefficients (the CI comes from the spread of betas
+    /// across replicates), so it sets this false to skip the per-replicate covariance
+    /// — two `X'WX` builds and two p×p solves that would be computed and discarded.
+    #[builder(default = true)]
+    pub compute_covariance: bool,
     /// Strategy for handling non-convergence.
     #[builder(default = FitStrategy::Strict)]
     pub strategy: FitStrategy,
@@ -111,6 +118,7 @@ impl Default for FitOptions {
             min_weight: 1e-6,
             regularization: Regularization::None,
             robust_se: false,
+            compute_covariance: true,
             strategy: FitStrategy::Strict,
         }
     }
@@ -598,20 +606,27 @@ pub(crate) fn fit_two_part_weighted(
     let (beta_gamma, iterations_gamma) =
         fit_gamma_log_link_weighted(&x_pos, &y_pos, &w_pos, options)?;
 
-    let cov_logit = Some(covariance_logit_weighted(
-        x,
-        &is_positive,
-        weights,
-        &beta_logit,
-        options,
-    )?);
-    let cov_gamma = Some(covariance_gamma_weighted(
-        &x_pos,
-        &y_pos,
-        &w_pos,
-        &beta_gamma,
-        options,
-    )?);
+    // The model-based covariance is computed only when requested. The clustered
+    // bootstrap disables it (it reads only the coefficients), and the cluster-robust
+    // path recomputes a sandwich covariance over this anyway — so for both, these two
+    // `X'WX` builds + p×p solves would be pure waste. `None` here keeps the report's
+    // se/cov optional fields exactly as an "SEs not computed" fit already reports them.
+    let (cov_logit, cov_gamma) = if options.compute_covariance {
+        (
+            Some(covariance_logit_weighted(
+                x,
+                &is_positive,
+                weights,
+                &beta_logit,
+                options,
+            )?),
+            Some(covariance_gamma_weighted(
+                &x_pos, &y_pos, &w_pos, &beta_gamma, options,
+            )?),
+        )
+    } else {
+        (None, None)
+    };
     let se_logit = cov_logit.as_ref().map(diag_sqrt);
     let se_gamma = cov_gamma.as_ref().map(diag_sqrt);
 
@@ -1808,6 +1823,42 @@ mod tests {
         let mean_pos = Mat::from_fn(2, 1, |_i, _| 1.0);
         let ll = log_likelihood(&y, &prob, &mean_pos);
         assert!(ll.is_nan());
+    }
+
+    #[test]
+    fn compute_covariance_false_keeps_coefficients_and_drops_ses() {
+        // The bootstrap-replicate path sets compute_covariance=false to skip the
+        // model-based covariance it never reads. That MUST leave the fitted
+        // coefficients byte-identical (the bootstrap CI is the spread of these
+        // betas) and only suppress the unused se/cov fields.
+        let n = 60;
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 20.0 });
+        // A two-part shape: a zero spike plus positive values.
+        let y = Mat::from_fn(n, 1, |i, _| if i % 3 == 0 { 0.0 } else { 1.0 + usize_to_f64(i) });
+
+        let with_cov = FitOptions::default();
+        let without_cov = FitOptions {
+            compute_covariance: false,
+            ..FitOptions::default()
+        };
+
+        let (model_a, report_a) =
+            fit_two_part(&x, &y, with_cov).expect("fit with covariance");
+        let (model_b, report_b) =
+            fit_two_part(&x, &y, without_cov).expect("fit without covariance");
+
+        // Coefficients are identical — the optimization only removes discarded work.
+        for j in 0..model_a.beta_logit.nrows() {
+            assert_eq!(model_a.beta_logit[(j, 0)], model_b.beta_logit[(j, 0)]);
+        }
+        for j in 0..model_a.beta_gamma.nrows() {
+            assert_eq!(model_a.beta_gamma[(j, 0)], model_b.beta_gamma[(j, 0)]);
+        }
+
+        // Default fit reports SEs; the covariance-free fit reports none.
+        assert!(report_a.se_logit.is_some() && report_a.se_gamma.is_some());
+        assert!(report_b.se_logit.is_none() && report_b.se_gamma.is_none());
+        assert!(report_b.cov_logit.is_none() && report_b.cov_gamma.is_none());
     }
 
     #[test]
