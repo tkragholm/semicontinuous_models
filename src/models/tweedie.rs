@@ -705,10 +705,17 @@ fn robust_covariance(
 ) -> Result<RobustCovarianceResult, TweedieError> {
     let p = x.ncols();
     let mut meat = Mat::<f64>::zeros(p, p);
+    // Sandwich score per observation is the GLM estimating-equation contribution
+    //   u_i = x_i * (dμ/dη)/V(μ) * (y_i - μ_i) * base_weight.
+    // `weights` carries the FISHER weight W_i = base * (dμ/dη)²/V(μ) (= base*μ^(2-power)
+    // for this log-link Tweedie family), so the score weight is W_i/(dμ/dη) = W_i/μ_i.
+    // Using the raw response residual (y-μ)*W_i instead would inflate the meat by a
+    // factor of μ (≈ mean cost, 1e4–1e5 DKK), blowing up the robust SE — so divide by μ
+    // to use the WORKING residual. μ is exp-clamped strictly positive.
     if let Some(clusters) = clusters {
         let mut cluster_sums: HashMap<u64, Vec<f64>> = HashMap::new();
         for i in 0..x.nrows() {
-            let resid = (y[(i, 0)] - mu[(i, 0)]) * weights[(i, 0)];
+            let resid = (y[(i, 0)] - mu[(i, 0)]) * weights[(i, 0)] / mu[(i, 0)];
             let entry = cluster_sums
                 .entry(clusters[i])
                 .or_insert_with(|| vec![0.0; p]);
@@ -1030,6 +1037,42 @@ mod tests {
         assert!(report.robust);
         assert!(report.clustered);
         assert!(report.se.is_some());
+    }
+
+    #[test]
+    fn robust_se_is_scale_invariant_for_log_link_gamma() {
+        // Regression guard: the sandwich score must use the WORKING residual (y-μ)/μ,
+        // not the raw response residual (y-μ). Under a log link, scaling y by a constant
+        // shifts only the intercept and leaves every coefficient's robust SE unchanged.
+        // The old bug used the raw residual, so SE(c*y) ≈ c*SE(y) — which on cost-scale
+        // outcomes (μ ~ 1e4–1e5 DKK) inflated the gamma SEs by ~1e4×.
+        let n = 60;
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i % 6) });
+        // Strictly positive, associated with the covariate, with within-level scatter so
+        // the residuals (and hence the robust SE) are non-degenerate.
+        let make_y = |scale: f64| {
+            Mat::from_fn(n, 1, |i, _| {
+                let lin = 0.4f64.mul_add(usize_to_f64(i % 6), 1.0);
+                let perturb = 0.4f64.mul_add(usize_to_f64(i % 3) - 1.0, 1.0); // 0.6, 1.0, 1.4
+                lin.exp() * perturb * scale
+            })
+        };
+        let clusters: Vec<u64> = (0..n).map(|i| (i / 4) as u64).collect();
+        let slope_se = |scale: f64| {
+            let options = TweedieOptions::builder().robust_se(true).build();
+            let (_m, report) =
+                fit_tweedie(&x, &make_y(scale), Some(&clusters), 2.0, options).expect("fit");
+            report.se.expect("se")[(1, 0)]
+        };
+        let se_base = slope_se(1.0);
+        let se_scaled = slope_se(1000.0);
+        // Scale-invariant to <1% (the raw-residual bug gives ~1000x here).
+        assert!(
+            (se_scaled - se_base).abs() / se_base < 0.01,
+            "robust SE not scale-invariant: base={se_base} scaled={se_scaled}"
+        );
+        // ...and a sane log-scale magnitude, not cost-scale.
+        assert!(se_base < 1.0, "robust SE implausibly large: {se_base}");
     }
 
     #[test]
