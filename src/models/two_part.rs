@@ -45,9 +45,9 @@ use crate::models::{
 #[cfg(feature = "bench-internals")]
 use crate::utils::weighted_xtz;
 use crate::utils::{
-    add_ridge_to_diagonal, add_row_outer_product_scaled, max_abs_diff, mean_column, mean_vector,
-    solve_linear_system, solve_linear_system_ref, std_vector, weighted_xtx,
-    weighted_xtz_with_buffer,
+    CachedFactor, add_ridge_to_diagonal, add_row_outer_product_scaled, matvec_into, max_abs_diff,
+    mean_column, mean_vector, solve_linear_system, solve_linear_system_ref, std_vector,
+    weighted_xtx, weighted_xtz_with_buffer,
 };
 use faer::Mat;
 use rand::prelude::*;
@@ -1065,19 +1065,57 @@ fn fit_gamma_log_link_weighted(
         }
     };
 
+    // The gamma log-link Fisher-scoring weight is the fixed prior weight (`μ^0 == 1`),
+    // so `X'WX` is invariant across iterations: only the working-response RHS changes.
+    // For ridge / no penalty, factor it once and back-substitute each pass, dropping the
+    // O(n·p²) Gram build + O(p³) factorization from every iteration but the first.
+    // ElasticNet uses coordinate descent (no single factorization) and keeps the
+    // per-iteration path. Exact — the cached factor is the true information matrix.
+    let cached = if matches!(regularization, Regularization::ElasticNet { .. }) {
+        None
+    } else {
+        let mut xtwx = weighted_xtx(x, weights);
+        if let Some((lambda, exclude_intercept)) = ridge_from_regularization(regularization)
+            && lambda > 0.0
+        {
+            add_ridge_to_diagonal(&mut xtwx, lambda, exclude_intercept);
+        }
+        Some(CachedFactor::factor(&xtwx))
+    };
+
+    // Column buffers reused across iterations (the bootstrap runs thousands of these
+    // fits in parallel; per-iteration allocation churns the allocator).
+    let n = x.nrows();
+    let mut eta = Mat::<f64>::zeros(n, 1);
+    let mut mu = Mat::<f64>::zeros(n, 1);
+    let mut z = Mat::<f64>::zeros(n, 1);
+
     for iteration in 0..options.max_iter {
         // Clamp the linear predictor before exponentiating so `mu` stays finite
         // and strictly positive on pathological resamples (see the constant).
-        let eta = map_mat(&(x * &beta), |value| {
-            value.clamp(-GAMMA_LOG_LINK_ETA_CLAMP, GAMMA_LOG_LINK_ETA_CLAMP)
-        });
-        let mu = map_mat(&eta, f64::exp);
-        let z = Mat::from_fn(eta.nrows(), 1, |i, _| {
-            eta[(i, 0)] + (y[(i, 0)] - mu[(i, 0)]) / mu[(i, 0)]
-        });
+        matvec_into(&mut eta, x, &beta);
+        for i in 0..n {
+            eta[(i, 0)] = eta[(i, 0)].clamp(-GAMMA_LOG_LINK_ETA_CLAMP, GAMMA_LOG_LINK_ETA_CLAMP);
+            mu[(i, 0)] = eta[(i, 0)].exp();
+            z[(i, 0)] = eta[(i, 0)] + (y[(i, 0)] - mu[(i, 0)]) / mu[(i, 0)];
+        }
 
-        let beta_next =
-            weighted_least_squares(x, weights, &z, regularization, &mut weighted_xtz_buffer)?;
+        let beta_next = if let Some(factor) = &cached {
+            let rhs = weighted_xtz_with_buffer(x, weights, &z, &mut weighted_xtz_buffer);
+            match factor.solve(rhs.as_ref()) {
+                Ok(candidate) => candidate,
+                // Pathological RHS: fall back to the stabilized per-iteration solve.
+                Err(_) => weighted_least_squares(
+                    x,
+                    weights,
+                    &z,
+                    regularization,
+                    &mut weighted_xtz_buffer,
+                )?,
+            }
+        } else {
+            weighted_least_squares(x, weights, &z, regularization, &mut weighted_xtz_buffer)?
+        };
 
         // A non-finite step means this resample is pathological at the current
         // regularization level; report non-convergence so the Relaxed strategy

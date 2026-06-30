@@ -23,8 +23,9 @@ use crate::models::{
     AttemptDiagnostics, AttemptOutcome, FitMetadata, FitStrategy, Model, SolverKind,
 };
 use crate::utils::{
-    add_outer_product_scaled, add_ridge_to_diagonal, add_row_outer_product_scaled, max_abs_diff,
-    solve_linear_system, solve_linear_system_ref, weighted_xtx, weighted_xtz,
+    CachedFactor, add_outer_product_scaled, add_ridge_to_diagonal, add_row_outer_product_scaled,
+    constant_irls_weights, matvec_into, max_abs_diff, solve_linear_system, solve_linear_system_ref,
+    weighted_xtx, weighted_xtz_with_buffer,
 };
 
 const LINEAR_PREDICTOR_CLIP: f64 = 30.0;
@@ -362,25 +363,83 @@ fn fit_tweedie_with_lambda(
         .cloned()
         .unwrap_or_else(|| initial_beta(x, y, sample_weights, options.min_weight));
 
-    for iteration in 0..options.max_iter {
-        let eta = x * &beta;
-        let mu = map_mat(&eta, exp_clamped);
-        let current_deviance = weighted_deviance(y, &mu, power, sample_weights);
-
-        let weights = Mat::from_fn(mu.nrows(), 1, |i, _| {
-            let base_weight = sample_weight_at(sample_weights, i);
-            let w = mu[(i, 0)].powf(2.0 - power).max(options.min_weight);
-            base_weight * w
-        });
-        let z = Mat::from_fn(mu.nrows(), 1, |i, _| {
-            eta[(i, 0)] + (y[(i, 0)] - mu[(i, 0)]) / mu[(i, 0)]
-        });
+    // For power == 2 (gamma) the Fisher-scoring weight `μ^(2-power) == 1`, so the
+    // information matrix `X'WX` (W = the fixed sample weights) is invariant across
+    // iterations. Build and factor it once here; each iteration then only recomputes
+    // the working-response RHS and back-substitutes — removing the O(n·p²) Gram build
+    // and O(p³) factorization from every pass but the first. Exact, not an
+    // approximation: the cached factor is the true information matrix at every iterate,
+    // so the β-path is identical to rebuilding it each iteration.
+    let constant_weight = if (2.0 - power).abs() < 1e-12 {
+        let weights = constant_irls_weights(sample_weights, x.nrows());
         let mut xtwx = weighted_xtx(x, &weights);
         if lambda > 0.0 {
             add_ridge_to_diagonal(&mut xtwx, lambda, options.l2_penalty_exclude_intercept);
         }
-        let xtw_rhs = weighted_xtz(x, &weights, &z);
-        let beta_candidate = solve_with_stabilization(&xtwx, &xtw_rhs)?;
+        Some((weights, CachedFactor::factor(&xtwx)))
+    } else {
+        None
+    };
+
+    // Column buffers reused across iterations so the per-replicate IRLS does not churn
+    // the allocator (the bootstrap runs thousands of these fits in parallel). `eta`/`mu`/
+    // `z` are the linear predictor, mean and working response; `search_*` are line-search
+    // scratch; `weight_buffer` holds the per-iteration weight on the variable-weight path.
+    let n = x.nrows();
+    let mut eta = Mat::<f64>::zeros(n, 1);
+    let mut mu = Mat::<f64>::zeros(n, 1);
+    let mut z = Mat::<f64>::zeros(n, 1);
+    let mut xtz_buffer: Vec<f64> = Vec::new();
+    let mut search_eta = Mat::<f64>::zeros(n, 1);
+    let mut search_mu = Mat::<f64>::zeros(n, 1);
+    let mut weight_buffer = Mat::<f64>::zeros(n, 1);
+
+    for iteration in 0..options.max_iter {
+        matvec_into(&mut eta, x, &beta);
+        for i in 0..n {
+            mu[(i, 0)] = exp_clamped(eta[(i, 0)]);
+        }
+        let current_deviance = weighted_deviance(y, &mu, power, sample_weights);
+
+        // Working response `z = η + (y - μ)/μ`; independent of the IRLS weights.
+        for i in 0..n {
+            z[(i, 0)] = eta[(i, 0)] + (y[(i, 0)] - mu[(i, 0)]) / mu[(i, 0)];
+        }
+
+        let beta_candidate = if let Some((weights, factor)) = &constant_weight {
+            // Constant-weight path: reuse the cached factor; only the RHS changes.
+            let xtw_rhs = weighted_xtz_with_buffer(x, weights, &z, &mut xtz_buffer);
+            match factor.solve(xtw_rhs.as_ref()) {
+                Ok(candidate) => candidate,
+                Err(_) => {
+                    // Pathological RHS: stabilized solve on the (constant) matrix.
+                    let mut xtwx = weighted_xtx(x, weights);
+                    if lambda > 0.0 {
+                        add_ridge_to_diagonal(
+                            &mut xtwx,
+                            lambda,
+                            options.l2_penalty_exclude_intercept,
+                        );
+                    }
+                    solve_with_stabilization(&xtwx, &xtw_rhs)?
+                }
+            }
+        } else {
+            // Variable-weight path (1 < power < 2): the weight depends on μ, so the
+            // information matrix must be rebuilt and factored each iteration.
+            for i in 0..n {
+                let base_weight = sample_weight_at(sample_weights, i);
+                let w = mu[(i, 0)].powf(2.0 - power).max(options.min_weight);
+                weight_buffer[(i, 0)] = base_weight * w;
+            }
+            let mut xtwx = weighted_xtx(x, &weight_buffer);
+            if lambda > 0.0 {
+                add_ridge_to_diagonal(&mut xtwx, lambda, options.l2_penalty_exclude_intercept);
+            }
+            let xtw_rhs = weighted_xtz_with_buffer(x, &weight_buffer, &z, &mut xtz_buffer);
+            solve_with_stabilization(&xtwx, &xtw_rhs)?
+        };
+
         let (beta_next, dev_next) = backtracking_update(
             x,
             y,
@@ -389,6 +448,8 @@ fn fit_tweedie_with_lambda(
             &beta_candidate,
             current_deviance,
             power,
+            &mut search_eta,
+            &mut search_mu,
         );
 
         let beta_converged = max_abs_diff(&beta_next, &beta) < options.tolerance;
@@ -680,6 +741,7 @@ fn sandwich_covariance(xtwx: &Mat<f64>, meat: &Mat<f64>) -> Result<Mat<f64>, Twe
 /// computed for the returned beta inside the line search, so the caller reuses it
 /// instead of recomputing `x*beta`, `exp`, and the deviance a second time per IRLS
 /// iteration (the value is identical — same beta, same deviance function).
+#[allow(clippy::too_many_arguments)]
 fn backtracking_update(
     x: &Mat<f64>,
     y: &Mat<f64>,
@@ -688,6 +750,8 @@ fn backtracking_update(
     beta_candidate: &Mat<f64>,
     current_deviance: f64,
     power: f64,
+    scratch_eta: &mut Mat<f64>,
+    scratch_mu: &mut Mat<f64>,
 ) -> (Mat<f64>, f64) {
     let mut step = 1.0_f64;
     let mut proposal = beta_candidate.clone();
@@ -699,8 +763,7 @@ fn backtracking_update(
         } else {
             blend_betas_into(&mut proposal, beta_current, beta_candidate, step);
         }
-        let mu = map_mat(&(x * &proposal), exp_clamped);
-        let dev = weighted_deviance(y, &mu, power, sample_weights);
+        let dev = trial_deviance(x, y, sample_weights, &proposal, power, scratch_eta, scratch_mu);
         if dev.is_finite() && dev <= current_deviance {
             return (proposal, dev);
         }
@@ -716,9 +779,27 @@ fn backtracking_update(
     let dev = if best_deviance.is_finite() {
         best_deviance
     } else {
-        weighted_deviance(y, &map_mat(&(x * &best_beta), exp_clamped), power, sample_weights)
+        trial_deviance(x, y, sample_weights, &best_beta, power, scratch_eta, scratch_mu)
     };
     (best_beta, dev)
+}
+
+/// Deviance at `beta`, reusing the caller's `scratch_eta`/`scratch_mu` columns so the
+/// line search allocates nothing per trial step.
+fn trial_deviance(
+    x: &Mat<f64>,
+    y: &Mat<f64>,
+    sample_weights: Option<&Mat<f64>>,
+    beta: &Mat<f64>,
+    power: f64,
+    scratch_eta: &mut Mat<f64>,
+    scratch_mu: &mut Mat<f64>,
+) -> f64 {
+    matvec_into(scratch_eta, x, beta);
+    for i in 0..scratch_eta.nrows() {
+        scratch_mu[(i, 0)] = exp_clamped(scratch_eta[(i, 0)]);
+    }
+    weighted_deviance(y, scratch_mu, power, sample_weights)
 }
 
 fn blend_betas_into(
@@ -978,6 +1059,62 @@ mod tests {
             }
             Err(other) => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn power_two_factor_once_recovers_group_log_means() {
+        // Gamma (power == 2) log-link with intercept + one binary covariate: the MLE is
+        // exactly the per-group log-means. This exercises the cached-factor
+        // (constant-weight) IRLS path end to end and pins it to the correct optimum.
+        let n = 200;
+        let x = Mat::from_fn(n, 2, |i, j| {
+            if j == 0 {
+                1.0
+            } else {
+                f64::from(u32::from(i % 2 == 1))
+            }
+        });
+        // Group 0 (even rows) mean 10, group 1 (odd rows) mean 30.
+        let y = Mat::from_fn(n, 1, |i, _| if i % 2 == 0 { 10.0 } else { 30.0 });
+
+        let (model, report) =
+            fit_tweedie(&x, &y, None, 2.0, TweedieOptions::default()).expect("power-2 fit");
+
+        // Intercept -> ln(10); slope -> ln(30) - ln(10) = ln(3).
+        assert!(
+            (model.beta[(0, 0)] - 10f64.ln()).abs() < 1e-4,
+            "intercept = {}",
+            model.beta[(0, 0)]
+        );
+        assert!(
+            (model.beta[(1, 0)] - 3f64.ln()).abs() < 1e-4,
+            "slope = {}",
+            model.beta[(1, 0)]
+        );
+        assert!(report.meta.converged);
+    }
+
+    #[test]
+    fn power_two_factor_once_respects_sample_weights() {
+        // With constant weights the cached factor is X'diag(w)X; up-weighting one group
+        // must still recover that group's log-mean (the weights cancel within a group),
+        // confirming the cached factor carries the prior weights correctly.
+        let n = 120;
+        let x = Mat::from_fn(n, 2, |i, j| {
+            if j == 0 {
+                1.0
+            } else {
+                f64::from(u32::from(i % 2 == 1))
+            }
+        });
+        let y = Mat::from_fn(n, 1, |i, _| if i % 2 == 0 { 5.0 } else { 50.0 });
+        let w = Mat::from_fn(n, 1, |i, _| if i % 2 == 0 { 3.0 } else { 1.0 });
+        let input = ModelInput::new(x, y).with_sample_weights(w);
+
+        let (model, _) =
+            fit_tweedie_input(&input, 2.0, TweedieOptions::default()).expect("weighted power-2 fit");
+        assert!((model.beta[(0, 0)] - 5f64.ln()).abs() < 1e-4);
+        assert!((model.beta[(1, 0)] - (50f64.ln() - 5f64.ln())).abs() < 1e-4);
     }
 
     #[test]

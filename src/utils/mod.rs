@@ -11,8 +11,11 @@
 //! Shared helpers for solving linear systems, computing summary statistics,
 //! and working with faer matrices.
 
+use faer::linalg::matmul::matmul;
+use faer::linalg::matmul::triangular::{self, BlockStructure};
+use faer::linalg::solvers::{Llt, PartialPivLu};
 use faer::prelude::*;
-use faer::{Mat, MatRef, Side};
+use faer::{Accum, Mat, MatMut, MatRef, Side, get_global_parallelism};
 use num_traits::ToPrimitive;
 
 use crate::input::LongitudinalModelInput;
@@ -97,6 +100,75 @@ pub(crate) fn solve_linear_system_ref(
 /// Returns `TwoPartError::SolveFailed` if the solve produces non-finite values.
 pub fn solve_linear_system(a: &Mat<f64>, b: &Mat<f64>) -> Result<Mat<f64>, TwoPartError> {
     solve_linear_system_ref(a.as_ref(), b.as_ref())
+}
+
+/// A factorization of a fixed left-hand side, cached so an IRLS loop whose
+/// information matrix `X'WX` is invariant across iterations factors it once and
+/// only back-substitutes the changing right-hand side each pass.
+///
+/// This applies to log-link GLMs whose Fisher-scoring weight `μ^(2-power)` is
+/// β-independent — the gamma / Tweedie-power-2 case, where `W` is the fixed
+/// sample weights — so the cached factor is the *exact* information matrix at
+/// every iterate. The build mirrors [`solve_linear_system_ref`]: a Cholesky of
+/// the symmetric, positive-definite ridged Gram matrix, with incremental jitter
+/// on the rare failure, falling back to a pivoted LU.
+pub(crate) enum CachedFactor {
+    Llt(Llt<f64>),
+    Lu(PartialPivLu<f64>),
+}
+
+impl CachedFactor {
+    /// Factor a (ridged) Gram matrix `X'WX` once for reuse across IRLS iterations.
+    pub(crate) fn factor(matrix: &Mat<f64>) -> Self {
+        if let Ok(llt) = matrix.as_ref().llt(Side::Lower) {
+            return Self::Llt(llt);
+        }
+        // Cholesky failed (numerically indefinite); jitter the diagonal and retry,
+        // matching the stabilization the per-iteration solver applies on failure.
+        let dim = matrix.nrows().min(matrix.ncols());
+        let mut jitter = 1e-10;
+        for _ in 0..8 {
+            let stabilized = Mat::from_fn(matrix.nrows(), matrix.ncols(), |r, c| {
+                if r == c && r < dim {
+                    matrix[(r, c)] + jitter
+                } else {
+                    matrix[(r, c)]
+                }
+            });
+            if let Ok(llt) = stabilized.as_ref().llt(Side::Lower) {
+                return Self::Llt(llt);
+            }
+            jitter *= 10.0;
+        }
+        Self::Lu(matrix.as_ref().partial_piv_lu())
+    }
+
+    /// Back-substitute the cached factor against `rhs`. Returns `SolveFailed` if the
+    /// solution is non-finite (a pathological RHS), so the caller can fall back.
+    pub(crate) fn solve(&self, rhs: MatRef<'_, f64>) -> Result<Mat<f64>, TwoPartError> {
+        let solution = match self {
+            Self::Llt(factor) => factor.solve(rhs),
+            Self::Lu(factor) => factor.solve(rhs),
+        };
+        if matrix_is_finite(&solution) {
+            Ok(solution)
+        } else {
+            Err(TwoPartError::SolveFailed)
+        }
+    }
+}
+
+/// IRLS weights for a log-link GLM whose Fisher-scoring weight is β-independent
+/// (gamma / Tweedie power 2): the working weight is exactly the fixed prior
+/// (sample/bootstrap) weight, so it is constant across iterations.
+///
+/// Reproduces the per-iteration computation bit-for-bit. The Tweedie loop forms
+/// `base_weight * (μ^(2-power)).max(min_weight)`; at power 2 the variance factor
+/// is `1.0` (above `min_weight`), so the weight is precisely `base_weight` with no
+/// flooring of the prior weight itself — matched here.
+#[must_use]
+pub(crate) fn constant_irls_weights(sample_weights: Option<&Mat<f64>>, n_rows: usize) -> Mat<f64> {
+    Mat::from_fn(n_rows, 1, |i, _| sample_weights.map_or(1.0, |w| w[(i, 0)]))
 }
 
 #[must_use]
@@ -217,10 +289,45 @@ pub fn quadratic_form_vec(vector: &[f64], matrix: &Mat<f64>) -> f64 {
 pub fn weighted_xtx(x: &Mat<f64>, weights: &Mat<f64>) -> Mat<f64> {
     let n = x.nrows();
     let p = x.ncols();
+    // `A = sqrt(W) X`, so `X'WX = AᵀA` is symmetric positive-semidefinite. Compute only
+    // the lower triangle via a symmetric-rank-k (syrk-style) triangular matmul — half the
+    // flops of a full GEMM — then mirror it into the upper triangle so the result is
+    // exactly symmetric (better-conditioned for the downstream Cholesky).
     let weighted_x = Mat::from_fn(n, p, |row, col| {
         x[(row, col)] * weights[(row, 0)].max(0.0).sqrt()
     });
-    weighted_x.transpose() * &weighted_x
+    let mut xtx = Mat::<f64>::zeros(p, p);
+    triangular::matmul(
+        xtx.as_mut(),
+        BlockStructure::TriangularLower,
+        Accum::Replace,
+        weighted_x.transpose(),
+        BlockStructure::Rectangular,
+        weighted_x.as_ref(),
+        BlockStructure::Rectangular,
+        1.0,
+        get_global_parallelism(),
+    );
+    for col in 0..p {
+        for row in (col + 1)..p {
+            xtx[(col, row)] = xtx[(row, col)];
+        }
+    }
+    xtx
+}
+
+/// In-place matrix-vector product `dst <- x * beta`, reusing `dst`'s storage so an
+/// IRLS loop does not allocate a fresh linear-predictor column every iteration.
+pub(crate) fn matvec_into(dst: &mut Mat<f64>, x: &Mat<f64>, beta: &Mat<f64>) {
+    let target: MatMut<'_, f64> = dst.as_mut();
+    matmul(
+        target,
+        Accum::Replace,
+        x.as_ref(),
+        beta.as_ref(),
+        1.0,
+        get_global_parallelism(),
+    );
 }
 
 #[must_use]
