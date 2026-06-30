@@ -200,10 +200,10 @@ pub(crate) fn fit_tweedie(
     options: TweedieOptions,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
     // Raw entry point: validate the data (finiteness / negativity) inside the fit.
-    fit_tweedie_weighted(x, y, None, clusters, power, options, false)
+    fit_tweedie_weighted(x, y, None, clusters, power, options, false, None)
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn fit_tweedie_weighted(
     x: &Mat<f64>,
     y: &Mat<f64>,
@@ -216,6 +216,10 @@ fn fit_tweedie_weighted(
     // O(n·p) finiteness / negativity scans here — a row-gather of finite, non-negative
     // rows is still finite and non-negative. The cheap O(1) shape checks always run.
     assume_validated: bool,
+    // Warm-start coefficients for the IRLS. A bootstrap replicate is a perturbation of
+    // the full sample, so seeding from the full-sample fit converges in far fewer
+    // iterations to the SAME optimum. `None` cold-starts from the intercept-only model.
+    initial_beta: Option<&Mat<f64>>,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
     let start_time = Instant::now();
     if !(1.0..=2.0).contains(&power) {
@@ -261,8 +265,6 @@ fn fit_tweedie_weighted(
         FitStrategy::Relaxed { max_retries, .. } => 1 + max_retries,
     };
 
-    let warm_start_beta: Option<Mat<f64>> = None;
-
     for attempt_idx in 0..max_attempts {
         if attempt_idx > 0
             && let FitStrategy::Relaxed {
@@ -297,7 +299,7 @@ fn fit_tweedie_weighted(
             power,
             options: current_options,
             lambda: current_options.l2_penalty,
-            initial_beta_override: warm_start_beta.as_ref(),
+            initial_beta_override: initial_beta,
         });
 
         match result {
@@ -519,6 +521,23 @@ pub fn fit_tweedie_input(
     power: f64,
     options: TweedieOptions,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
+    fit_tweedie_input_warm(input, power, options, None)
+}
+
+/// Fit a Tweedie GLM from a `ModelInput`, warm-starting the IRLS from `initial_beta`.
+///
+/// A bootstrap replicate is a perturbation of the full sample, so seeding the IRLS with
+/// the full-sample coefficients converges in far fewer iterations to the same optimum.
+///
+/// # Errors
+///
+/// Returns `TweedieError` if inputs are malformed or the solver fails.
+pub fn fit_tweedie_input_warm(
+    input: &ModelInput,
+    power: f64,
+    options: TweedieOptions,
+    initial_beta: Option<&Mat<f64>>,
+) -> Result<(TweedieModel, TweedieReport), TweedieError> {
     input.validate().map_err(TweedieError::from)?;
     fit_tweedie_weighted(
         &input.design_matrix,
@@ -529,6 +548,7 @@ pub fn fit_tweedie_input(
         options,
         // input.validate() above already scanned finiteness + negativity.
         true,
+        initial_beta,
     )
 }
 
@@ -958,5 +978,35 @@ mod tests {
             }
             Err(other) => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn warm_start_matches_cold_start_and_converges_faster() {
+        let n = 60;
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 20.0 });
+        let y = Mat::from_fn(n, 1, |i, _| 1.0 + usize_to_f64(i));
+        let input = ModelInput::new(x, y);
+        let options = TweedieOptions::default();
+
+        let (cold, cold_report) = fit_tweedie_input(&input, 2.0, options).expect("cold fit");
+        let (warm, warm_report) =
+            fit_tweedie_input_warm(&input, 2.0, options, Some(&cold.beta)).expect("warm fit");
+
+        // Same optimum to the IRLS convergence tolerance. (IRLS stops on a small STEP,
+        // so cold and warm both land within tolerance of the unique MLE but not at the
+        // identical point — they agree to ~the step tolerance, far below any reported
+        // precision, which is exactly the warm-start guarantee.)
+        for i in 0..cold.beta.nrows() {
+            assert!(
+                (cold.beta[(i, 0)] - warm.beta[(i, 0)]).abs() < 1e-3,
+                "coefficient {i} diverged: cold={} warm={}",
+                cold.beta[(i, 0)],
+                warm.beta[(i, 0)]
+            );
+        }
+        // Starting at the converged solution converges essentially immediately, and
+        // never in more iterations than the cold start.
+        assert!(warm_report.meta.iterations <= cold_report.meta.iterations);
+        assert!(warm_report.meta.iterations <= 2);
     }
 }

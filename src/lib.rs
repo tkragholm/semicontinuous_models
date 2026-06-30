@@ -35,14 +35,15 @@ pub use crate::models::{FitMetadata, Model, SolverKind};
 pub use models::two_part::{
     BootstrapOptions, BootstrapResult, BootstrapSummary, ConfidenceInterval, FitOptions,
     Regularization, TwoPartError, TwoPartModel, TwoPartPrediction, TwoPartReport, TwoPartTrainer,
-    bootstrap as bootstrap_two_part, bootstrap_percentile_ci, bootstrap_summary,
+    TwoPartWarmStart, bootstrap as bootstrap_two_part, bootstrap_percentile_ci, bootstrap_summary,
     coefficient_confidence_intervals, fit_two_part_clustered_input, fit_two_part_input,
-    fit_two_part_weighted_input, log_likelihood as two_part_log_likelihood,
+    fit_two_part_input_warm, fit_two_part_weighted_input,
+    log_likelihood as two_part_log_likelihood,
 };
 
 pub use models::tweedie::{
     TweedieError, TweedieModel, TweedieOptions, TweediePrediction, TweedieReport, TweedieTrainer,
-    deviance as tweedie_deviance, fit_tweedie_input,
+    deviance as tweedie_deviance, fit_tweedie_input, fit_tweedie_input_warm,
     quasi_log_likelihood as tweedie_quasi_log_likelihood,
 };
 

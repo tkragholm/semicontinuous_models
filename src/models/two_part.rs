@@ -238,7 +238,7 @@ where
     fn fit_binary(&self, data: &Self::BinaryData) -> Result<Self::BinaryResult, String> {
         let (x, y, w) = data;
         let options = self.options();
-        fit_logit_weighted(x, y, w, options).map_err(|e| e.to_string())
+        fit_logit_weighted(x, y, w, options, None).map_err(|e| e.to_string())
     }
 }
 
@@ -258,7 +258,7 @@ where
     ) -> Result<Self::ContinuousResult, String> {
         let (x, y, w) = data;
         let options = self.options();
-        fit_gamma_log_link_weighted(x, y, w, options).map_err(|e| e.to_string())
+        fit_gamma_log_link_weighted(x, y, w, options, None).map_err(|e| e.to_string())
     }
 }
 
@@ -428,7 +428,19 @@ pub(crate) fn fit_two_part(
     options: FitOptions,
 ) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
     let weights = Mat::from_fn(y.nrows(), 1, |_, _| 1.0);
-    fit_two_part_weighted(x, y, &weights, options)
+    fit_two_part_weighted(x, y, &weights, options, None)
+}
+
+/// Full-sample coefficients used to warm-start a bootstrap replicate's two-part IRLS.
+///
+/// The replicate design has the same covariate columns as the full sample, so the
+/// full-sample logit and gamma coefficients seed the replicate's two IRLS loops; they
+/// converge to the same optimum in far fewer iterations. Ignored if the dimensions do
+/// not match (the leaf fitters fall back to their cold start).
+#[derive(Clone, Debug)]
+pub struct TwoPartWarmStart {
+    pub beta_logit: Mat<f64>,
+    pub beta_gamma: Mat<f64>,
 }
 
 /// Fit a two-part model from a `ModelInput` container.
@@ -439,6 +451,24 @@ pub(crate) fn fit_two_part(
 pub fn fit_two_part_input(
     input: &ModelInput,
     options: FitOptions,
+) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
+    fit_two_part_input_warm(input, options, None)
+}
+
+/// Fit a two-part model from a `ModelInput`, warm-starting the IRLS from `warm`.
+///
+/// A bootstrap replicate is a perturbation of the full sample, so seeding both the logit
+/// and gamma IRLS loops with the full-sample coefficients converges in far fewer
+/// iterations to the same optimum. The warm start is applied on the weighted paths (the
+/// bootstrap always carries weights); the unweighted paths cold-start.
+///
+/// # Errors
+///
+/// Returns `TwoPartError` if inputs are malformed or the solver fails to converge.
+pub fn fit_two_part_input_warm(
+    input: &ModelInput,
+    options: FitOptions,
+    warm: Option<&TwoPartWarmStart>,
 ) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
     input.validate()?;
 
@@ -496,12 +526,14 @@ pub fn fit_two_part_input(
                 weights,
                 clusters,
                 current_options,
+                warm,
             ),
             (Some(weights), None) => fit_two_part_weighted(
                 &input.design_matrix,
                 &input.outcome,
                 weights,
                 current_options,
+                warm,
             ),
             (None, Some(clusters)) => fit_two_part_clustered(
                 &input.design_matrix,
@@ -583,11 +615,13 @@ pub(crate) fn fit_two_part_weighted(
     y: &Mat<f64>,
     weights: &Mat<f64>,
     options: FitOptions,
+    warm: Option<&TwoPartWarmStart>,
 ) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
     let start_time = Instant::now();
 
     let is_positive = Mat::from_fn(y.nrows(), 1, |i, _| if y[(i, 0)] > 0.0 { 1.0 } else { 0.0 });
-    let (beta_logit, iterations_logit) = fit_logit_weighted(x, &is_positive, weights, options)?;
+    let (beta_logit, iterations_logit) =
+        fit_logit_weighted(x, &is_positive, weights, options, warm.map(|w| &w.beta_logit))?;
 
     let positive_indices: Vec<usize> = (0..y.nrows()).filter(|&idx| y[(idx, 0)] > 0.0).collect();
 
@@ -604,7 +638,7 @@ pub(crate) fn fit_two_part_weighted(
     }
 
     let (beta_gamma, iterations_gamma) =
-        fit_gamma_log_link_weighted(&x_pos, &y_pos, &w_pos, options)?;
+        fit_gamma_log_link_weighted(&x_pos, &y_pos, &w_pos, options, warm.map(|w| &w.beta_gamma))?;
 
     // The model-based covariance is computed only when requested. The clustered
     // bootstrap disables it (it reads only the coefficients), and the cluster-robust
@@ -691,7 +725,7 @@ pub(crate) fn fit_two_part_clustered(
     options: FitOptions,
 ) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
     let weights = Mat::from_fn(y.nrows(), 1, |_, _| 1.0);
-    fit_two_part_clustered_weighted(x, y, &weights, clusters, options)
+    fit_two_part_clustered_weighted(x, y, &weights, clusters, options, None)
 }
 
 /// Fit a weighted two-part model with cluster-robust covariance.
@@ -705,8 +739,9 @@ pub(crate) fn fit_two_part_clustered_weighted(
     weights: &Mat<f64>,
     clusters: &[u64],
     options: FitOptions,
+    warm: Option<&TwoPartWarmStart>,
 ) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
-    let (model, base_report) = fit_two_part_weighted(x, y, weights, options)?;
+    let (model, base_report) = fit_two_part_weighted(x, y, weights, options, warm)?;
     if !options.robust_se {
         return Ok((model, base_report));
     }
@@ -931,6 +966,7 @@ fn fit_logit_weighted(
     y: &Mat<f64>,
     weights: &Mat<f64>,
     options: FitOptions,
+    initial_beta: Option<&Mat<f64>>,
 ) -> Result<(Mat<f64>, usize), TwoPartError> {
     // Degenerate outcome guards:
     // If the binary outcome is constant (all 0 or all 1), IRLS will not
@@ -961,7 +997,11 @@ fn fit_logit_weighted(
         return Ok((beta, 0));
     }
 
-    let mut beta = Mat::<f64>::zeros(x.ncols(), 1);
+    // Warm-start from the full-sample logit coefficients when supplied; else start at 0.
+    let mut beta = match initial_beta {
+        Some(init) if init.nrows() == x.ncols() && init.ncols() == 1 => init.clone(),
+        _ => Mat::<f64>::zeros(x.ncols(), 1),
+    };
     let regularization = options.regularization;
     let mut weighted_xtz_buffer = Vec::new();
 
@@ -1004,16 +1044,26 @@ fn fit_gamma_log_link_weighted(
     y: &Mat<f64>,
     weights: &Mat<f64>,
     options: FitOptions,
+    initial_beta: Option<&Mat<f64>>,
 ) -> Result<(Mat<f64>, usize), TwoPartError> {
-    let mut beta = Mat::<f64>::zeros(x.ncols(), 1);
     let regularization = options.regularization;
     let mut weighted_xtz_buffer = Vec::new();
-    if x.ncols() > 0 {
-        let mean = mean_column(y);
-        if mean > 0.0 {
-            beta[(0, 0)] = mean.ln();
+    // Warm-start from the full-sample coefficients when supplied (a bootstrap replicate
+    // converges to the same optimum in fewer iterations); otherwise start from the
+    // intercept-only model (log of the outcome mean).
+    let mut beta = match initial_beta {
+        Some(init) if init.nrows() == x.ncols() && init.ncols() == 1 => init.clone(),
+        _ => {
+            let mut beta = Mat::<f64>::zeros(x.ncols(), 1);
+            if x.ncols() > 0 {
+                let mean = mean_column(y);
+                if mean > 0.0 {
+                    beta[(0, 0)] = mean.ln();
+                }
+            }
+            beta
         }
-    }
+    };
 
     for iteration in 0..options.max_iter {
         // Clamp the linear predictor before exponentiating so `mu` stays finite
@@ -1607,7 +1657,7 @@ mod tests {
         let w = Mat::from_fn(n, 1, |_, _| 1.0);
 
         let (beta, iterations) =
-            fit_gamma_log_link_weighted(&x, &y, &w, FitOptions::stable_defaults())
+            fit_gamma_log_link_weighted(&x, &y, &w, FitOptions::stable_defaults(), None)
                 .expect("heavy-tailed gamma fit should converge");
         assert!(iterations >= 1);
         assert!(
@@ -1859,6 +1909,38 @@ mod tests {
         assert!(report_a.se_logit.is_some() && report_a.se_gamma.is_some());
         assert!(report_b.se_logit.is_none() && report_b.se_gamma.is_none());
         assert!(report_b.cov_logit.is_none() && report_b.cov_gamma.is_none());
+    }
+
+    #[test]
+    fn two_part_warm_start_matches_cold_start() {
+        // A weighted input hits the warm-startable path (the bootstrap carries weights).
+        let n = 80;
+        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 20.0 });
+        let y =
+            Mat::from_fn(n, 1, |i, _| if i % 3 == 0 { 0.0 } else { 1.0 + usize_to_f64(i) });
+        let input =
+            ModelInput::new(x, y).with_sample_weights(Mat::from_fn(n, 1, |_, _| 1.0));
+        let options = FitOptions::default();
+
+        let (cold, _) = fit_two_part_input(&input, options).expect("cold fit");
+        let warm_start = TwoPartWarmStart {
+            beta_logit: cold.beta_logit.clone(),
+            beta_gamma: cold.beta_gamma.clone(),
+        };
+        let (warm, _) =
+            fit_two_part_input_warm(&input, options, Some(&warm_start)).expect("warm fit");
+
+        // Both IRLS loops converge to the same optimum (to the step-convergence
+        // tolerance — see the Tweedie warm-start test for the precision rationale).
+        for i in 0..cold.beta_logit.nrows() {
+            assert!((cold.beta_logit[(i, 0)] - warm.beta_logit[(i, 0)]).abs() < 1e-3);
+        }
+        for i in 0..cold.beta_gamma.nrows() {
+            assert!((cold.beta_gamma[(i, 0)] - warm.beta_gamma[(i, 0)]).abs() < 1e-3);
+        }
+        // Warm-starting from the converged fit converges in no more iterations.
+        assert!(warm.report.iterations_logit <= cold.report.iterations_logit);
+        assert!(warm.report.iterations_gamma <= cold.report.iterations_gamma);
     }
 
     #[test]
