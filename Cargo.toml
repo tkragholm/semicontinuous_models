@@ -25,7 +25,11 @@ bench-internals = []
 [dependencies]
 bon = "3"
 thiserror = "2.0.18"
-faer = { version = "0.24.0", features = ["nightly", "perf-warn"] }
+# Dense linear algebra. default-features disabled to drop unused faer trees
+# (sparse, rand, npy, perf-warn/log); `linalg` is required for the `.solve()`
+# calls (Llt/PartialPivLu), `rayon` for the multithreaded gemm this crate leans
+# on (get_global_parallelism), `nightly` for AVX-512 codegen on the x86 server.
+faer = { version = "0.24", default-features = false, features = ["std", "rayon", "nightly", "linalg"] }
 rand = "0.10.0"
 rand_distr = "0.6.0"
 statrs = "0.18.0"
