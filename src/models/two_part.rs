@@ -38,7 +38,10 @@ pub trait CanFitContinuousPart {
     fn fit_continuous(&self, data: &Self::ContinuousData)
     -> Result<Self::ContinuousResult, String>;
 }
-use crate::models::matrix_ops::{map_mat, select_rows, select_values};
+use crate::models::matrix_ops::{
+    center_beta, center_columns, map_mat, max_abs_linear_predictor, select_rows, select_values,
+    uncenter_beta, weighted_column_means,
+};
 use crate::models::{
     AttemptDiagnostics, AttemptOutcome, FitMetadata, FitStrategy, Model, SolverKind,
 };
@@ -1048,14 +1051,34 @@ fn fit_gamma_log_link_weighted(
 ) -> Result<(Mat<f64>, usize), TwoPartError> {
     let regularization = options.regularization;
     let mut weighted_xtz_buffer = Vec::new();
+
+    // Center the covariate columns for numerical conditioning (see the module note in
+    // `matrix_ops`). IRLS runs on the centered design `cx`, keeping the intercept near
+    // `ln(mean y)` and η in the data-supported range instead of drifting into the log-link
+    // clamp; the converged coefficients are un-centered back to the raw-x scale on return,
+    // so the stored `beta_gamma` and every prediction operate on the original design.
+    let col_means = weighted_column_means(x, Some(weights));
+    let centered_storage;
+    let cx: &Mat<f64> = match &col_means {
+        Some(means) => {
+            centered_storage = center_columns(x, means);
+            &centered_storage
+        }
+        None => x,
+    };
+
     // Warm-start from the full-sample coefficients when supplied (a bootstrap replicate
     // converges to the same optimum in fewer iterations); otherwise start from the
-    // intercept-only model (log of the outcome mean).
+    // intercept-only model (log of the outcome mean). A supplied warm-start is on the
+    // raw-x scale, so map it onto the centered scale first.
     let mut beta = match initial_beta {
-        Some(init) if init.nrows() == x.ncols() && init.ncols() == 1 => init.clone(),
+        Some(init) if init.nrows() == cx.ncols() && init.ncols() == 1 => match &col_means {
+            Some(means) => center_beta(init, means),
+            None => init.clone(),
+        },
         _ => {
-            let mut beta = Mat::<f64>::zeros(x.ncols(), 1);
-            if x.ncols() > 0 {
+            let mut beta = Mat::<f64>::zeros(cx.ncols(), 1);
+            if cx.ncols() > 0 {
                 let mean = mean_column(y);
                 if mean > 0.0 {
                     beta[(0, 0)] = mean.ln();
@@ -1074,7 +1097,7 @@ fn fit_gamma_log_link_weighted(
     let cached = if matches!(regularization, Regularization::ElasticNet { .. }) {
         None
     } else {
-        let mut xtwx = weighted_xtx(x, weights);
+        let mut xtwx = weighted_xtx(cx, weights);
         if let Some((lambda, exclude_intercept)) = ridge_from_regularization(regularization)
             && lambda > 0.0
         {
@@ -1085,15 +1108,16 @@ fn fit_gamma_log_link_weighted(
 
     // Column buffers reused across iterations (the bootstrap runs thousands of these
     // fits in parallel; per-iteration allocation churns the allocator).
-    let n = x.nrows();
+    let n = cx.nrows();
     let mut eta = Mat::<f64>::zeros(n, 1);
     let mut mu = Mat::<f64>::zeros(n, 1);
     let mut z = Mat::<f64>::zeros(n, 1);
 
     for iteration in 0..options.max_iter {
         // Clamp the linear predictor before exponentiating so `mu` stays finite
-        // and strictly positive on pathological resamples (see the constant).
-        matvec_into(&mut eta, x, &beta);
+        // and strictly positive on pathological resamples (see the constant). With the
+        // centered design this ceiling is a dormant safety net for well-posed data.
+        matvec_into(&mut eta, cx, &beta);
         for i in 0..n {
             eta[(i, 0)] = eta[(i, 0)].clamp(-GAMMA_LOG_LINK_ETA_CLAMP, GAMMA_LOG_LINK_ETA_CLAMP);
             mu[(i, 0)] = eta[(i, 0)].exp();
@@ -1101,12 +1125,12 @@ fn fit_gamma_log_link_weighted(
         }
 
         let beta_next = if let Some(factor) = &cached {
-            let rhs = weighted_xtz_with_buffer(x, weights, &z, &mut weighted_xtz_buffer);
+            let rhs = weighted_xtz_with_buffer(cx, weights, &z, &mut weighted_xtz_buffer);
             match factor.solve(rhs.as_ref()) {
                 Ok(candidate) => candidate,
                 // Pathological RHS: fall back to the stabilized per-iteration solve.
                 Err(_) => weighted_least_squares(
-                    x,
+                    cx,
                     weights,
                     &z,
                     regularization,
@@ -1114,7 +1138,7 @@ fn fit_gamma_log_link_weighted(
                 )?,
             }
         } else {
-            weighted_least_squares(x, weights, &z, regularization, &mut weighted_xtz_buffer)?
+            weighted_least_squares(cx, weights, &z, regularization, &mut weighted_xtz_buffer)?
         };
 
         // A non-finite step means this resample is pathological at the current
@@ -1124,7 +1148,20 @@ fn fit_gamma_log_link_weighted(
             return Err(TwoPartError::NonConvergence);
         }
         if max_abs_diff(&beta_next, &beta) < options.tolerance {
-            return Ok((beta_next, iteration + 1));
+            // Saturation guard: if the converged fit still reaches the log-link ceiling
+            // its predicted means are distorted — report non-convergence so the Relaxed
+            // strategy retries with stronger ridge rather than returning a degenerate fit.
+            // (η is evaluated on the centered design, but `cx·β̃ == x·β` row-for-row.)
+            if max_abs_linear_predictor(cx, &beta_next) >= GAMMA_LOG_LINK_ETA_CLAMP {
+                return Err(TwoPartError::NonConvergence);
+            }
+            // Un-center back to the raw-x scale so the stored coefficients and every
+            // prediction operate on the original design.
+            let beta_raw = match &col_means {
+                Some(means) => uncenter_beta(&beta_next, means),
+                None => beta_next,
+            };
+            return Ok((beta_raw, iteration + 1));
         }
         beta = beta_next;
     }

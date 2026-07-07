@@ -18,7 +18,10 @@ use std::time::Instant;
 use faer::{Mat, MatRef};
 
 use crate::input::{InputError, ModelInput};
-use crate::models::matrix_ops::map_mat;
+use crate::models::matrix_ops::{
+    center_beta, center_columns, map_mat, max_abs_linear_predictor, uncenter_beta,
+    weighted_column_means,
+};
 use crate::models::{
     AttemptDiagnostics, AttemptOutcome, FitMetadata, FitStrategy, Model, SolverKind,
 };
@@ -359,9 +362,31 @@ fn fit_tweedie_with_lambda(
         initial_beta_override,
     } = request;
 
-    let mut beta = initial_beta_override
-        .cloned()
-        .unwrap_or_else(|| initial_beta(x, y, sample_weights, options.min_weight));
+    // Center the covariate columns for numerical conditioning (see the module note in
+    // `matrix_ops`). The IRLS below runs entirely on the centered design `cx`, so the
+    // intercept stays near `ln(mean y)` and η stays in the data-supported range instead of
+    // drifting into the `exp_clamped` saturation ceiling. `col_means` is `None` when the
+    // design has no usable intercept in column 0, in which case `cx == x` (no centering).
+    // The converged coefficients are un-centered back to the raw-x scale before
+    // `finalize_fit`, which then computes SE/cov (and everything downstream — predict, the
+    // marginal standardisation) on the original design exactly as before.
+    let col_means = weighted_column_means(x, sample_weights);
+    let centered_storage;
+    let cx: &Mat<f64> = match &col_means {
+        Some(means) => {
+            centered_storage = center_columns(x, means);
+            &centered_storage
+        }
+        None => x,
+    };
+
+    let mut beta = match (initial_beta_override, &col_means) {
+        // Warm-start coefficients arrive on the raw-x scale; map them onto the centered
+        // scale so IRLS resumes from the same fitted model.
+        (Some(init), Some(means)) => center_beta(init, means),
+        (Some(init), None) => init.clone(),
+        (None, _) => initial_beta(cx, y, sample_weights, options.min_weight),
+    };
 
     // For power == 2 (gamma) the Fisher-scoring weight `μ^(2-power) == 1`, so the
     // information matrix `X'WX` (W = the fixed sample weights) is invariant across
@@ -371,8 +396,8 @@ fn fit_tweedie_with_lambda(
     // approximation: the cached factor is the true information matrix at every iterate,
     // so the β-path is identical to rebuilding it each iteration.
     let constant_weight = if (2.0 - power).abs() < 1e-12 {
-        let weights = constant_irls_weights(sample_weights, x.nrows());
-        let mut xtwx = weighted_xtx(x, &weights);
+        let weights = constant_irls_weights(sample_weights, cx.nrows());
+        let mut xtwx = weighted_xtx(cx, &weights);
         if lambda > 0.0 {
             add_ridge_to_diagonal(&mut xtwx, lambda, options.l2_penalty_exclude_intercept);
         }
@@ -385,7 +410,7 @@ fn fit_tweedie_with_lambda(
     // the allocator (the bootstrap runs thousands of these fits in parallel). `eta`/`mu`/
     // `z` are the linear predictor, mean and working response; `search_*` are line-search
     // scratch; `weight_buffer` holds the per-iteration weight on the variable-weight path.
-    let n = x.nrows();
+    let n = cx.nrows();
     let mut eta = Mat::<f64>::zeros(n, 1);
     let mut mu = Mat::<f64>::zeros(n, 1);
     let mut z = Mat::<f64>::zeros(n, 1);
@@ -395,7 +420,7 @@ fn fit_tweedie_with_lambda(
     let mut weight_buffer = Mat::<f64>::zeros(n, 1);
 
     for iteration in 0..options.max_iter {
-        matvec_into(&mut eta, x, &beta);
+        matvec_into(&mut eta, cx, &beta);
         for i in 0..n {
             mu[(i, 0)] = exp_clamped(eta[(i, 0)]);
         }
@@ -408,12 +433,12 @@ fn fit_tweedie_with_lambda(
 
         let beta_candidate = if let Some((weights, factor)) = &constant_weight {
             // Constant-weight path: reuse the cached factor; only the RHS changes.
-            let xtw_rhs = weighted_xtz_with_buffer(x, weights, &z, &mut xtz_buffer);
+            let xtw_rhs = weighted_xtz_with_buffer(cx, weights, &z, &mut xtz_buffer);
             match factor.solve(xtw_rhs.as_ref()) {
                 Ok(candidate) => candidate,
                 Err(_) => {
                     // Pathological RHS: stabilized solve on the (constant) matrix.
-                    let mut xtwx = weighted_xtx(x, weights);
+                    let mut xtwx = weighted_xtx(cx, weights);
                     if lambda > 0.0 {
                         add_ridge_to_diagonal(
                             &mut xtwx,
@@ -432,16 +457,16 @@ fn fit_tweedie_with_lambda(
                 let w = mu[(i, 0)].powf(2.0 - power).max(options.min_weight);
                 weight_buffer[(i, 0)] = base_weight * w;
             }
-            let mut xtwx = weighted_xtx(x, &weight_buffer);
+            let mut xtwx = weighted_xtx(cx, &weight_buffer);
             if lambda > 0.0 {
                 add_ridge_to_diagonal(&mut xtwx, lambda, options.l2_penalty_exclude_intercept);
             }
-            let xtw_rhs = weighted_xtz_with_buffer(x, &weight_buffer, &z, &mut xtz_buffer);
+            let xtw_rhs = weighted_xtz_with_buffer(cx, &weight_buffer, &z, &mut xtz_buffer);
             solve_with_stabilization(&xtwx, &xtw_rhs)?
         };
 
         let (beta_next, dev_next) = backtracking_update(
-            x,
+            cx,
             y,
             sample_weights,
             &beta,
@@ -455,6 +480,12 @@ fn fit_tweedie_with_lambda(
         let beta_converged = max_abs_diff(&beta_next, &beta) < options.tolerance;
         let dev_converged = relative_change(current_deviance, dev_next) < options.tolerance;
         if beta_converged || dev_converged {
+            // Un-center back to the raw-x scale so SE/cov, predict and the marginal
+            // standardisation all operate on the original design.
+            let beta_raw = match &col_means {
+                Some(means) => uncenter_beta(&beta_next, means),
+                None => beta_next,
+            };
             return finalize_fit(
                 x,
                 y,
@@ -463,7 +494,7 @@ fn fit_tweedie_with_lambda(
                 power,
                 options,
                 lambda,
-                beta_next,
+                beta_raw,
                 iteration + 1,
             );
         }
@@ -530,6 +561,16 @@ fn finalize_fit(
     beta_final: Mat<f64>,
     iterations: usize,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
+    // Saturation guard: a converged fit whose linear predictor still reaches the
+    // `exp_clamped` ceiling has distorted, non-multiplicative predictions (the marginal
+    // ratio collapses toward 1 and the counterfactual means blow up). Report it as
+    // non-convergence instead of a degenerate "ok" fit — under the Relaxed strategy this
+    // retries with stronger ridge (which shrinks η back into range); if it still saturates
+    // the fit fails loudly rather than exporting a meaningless estimate. Centering keeps η
+    // well inside the range for well-posed data, so this only fires on genuine divergence.
+    if max_abs_linear_predictor(x, &beta_final) >= LINEAR_PREDICTOR_CLIP {
+        return Err(TweedieError::NonConvergence);
+    }
     let eta = x * &beta_final;
     let mu = map_mat(&eta, exp_clamped);
     let weights = Mat::from_fn(mu.nrows(), 1, |i, _| {
@@ -1012,6 +1053,108 @@ mod tests {
         assert_eq!(pred.mean.nrows(), n);
         let dev = deviance(&y, &pred.mean, 1.5);
         assert!(dev.is_finite());
+    }
+
+    // Mean of a single-column prediction matrix (the g-computation counterfactual mean).
+    fn mean_of(pred: &Mat<f64>) -> f64 {
+        (0..pred.nrows()).map(|i| pred[(i, 0)]).sum::<f64>() / pred.nrows() as f64
+    }
+
+    // Set the exposure column (index 1) to a constant `value` for the whole design — the
+    // counterfactual design the runner feeds the marginal standardisation.
+    fn set_exposure(x: &Mat<f64>, value: f64) -> Mat<f64> {
+        Mat::from_fn(x.nrows(), x.ncols(), |i, j| if j == 1 { value } else { x[(i, j)] })
+    }
+
+    #[test]
+    fn gamma_marginal_ratio_equals_exposure_coefficient() {
+        // Regression guard for the counterfactual-mean explosion (run_010726 fully_adjusted:
+        // exposed/unexposed means ~35M DKK, marginal_ratio 1.007 vs exp(β_exposed)=4.85).
+        // For a log-link gamma the g-computation ratio is EXACTLY exp(β_exposed) — unless the
+        // fit saturates the η-clamp, which collapses the ratio toward 1. Design: intercept,
+        // binary exposure (col 1), and a large-offset covariate (col 2 ~1000) that makes the
+        // UNCENTERED fit ill-conditioned. With centering the identity must hold tightly and
+        // the means must stay on the data scale.
+        let n = 400;
+        let x = Mat::from_fn(n, 3, |i, j| match j {
+            0 => 1.0,
+            1 => f64::from(u32::try_from(i % 2).unwrap()),
+            _ => 1000.0 + usize_to_f64(i % 50),
+        });
+        // log μ = 9 + 0.02·(cov-1025) + 1.3·exposed, with deterministic within-cell scatter.
+        let y = Mat::from_fn(n, 1, |i, _| {
+            let cov = 1000.0 + usize_to_f64(i % 50);
+            let exposed = f64::from(u32::try_from(i % 2).unwrap());
+            let lin = 1.3f64.mul_add(exposed, 0.02f64.mul_add(cov - 1025.0, 9.0));
+            let perturb = [0.7, 1.0, 1.4][i % 3];
+            lin.exp() * perturb
+        });
+
+        let (model, _report) =
+            fit_tweedie(&x, &y, None, 2.0, TweedieOptions::default()).expect("fit");
+
+        let mean_exposed = mean_of(&model.predict(&set_exposure(&x, 1.0)).mean);
+        let mean_unexposed = mean_of(&model.predict(&set_exposure(&x, 0.0)).mean);
+        let ratio = mean_exposed / mean_unexposed;
+        let expected = model.beta[(1, 0)].exp();
+
+        assert!(
+            (ratio - expected).abs() / expected < 1e-6,
+            "marginal ratio {ratio} != exp(beta_exposed) {expected} (clamp saturation?)"
+        );
+        // ...and the counterfactual means are on the data scale, not blown up past the clamp.
+        let max_y = (0..n).map(|i| y[(i, 0)]).fold(0.0_f64, f64::max);
+        assert!(
+            mean_exposed.is_finite() && mean_exposed < 100.0 * max_y,
+            "exposed counterfactual mean exploded: {mean_exposed} (max y {max_y})"
+        );
+    }
+
+    #[test]
+    fn gamma_fit_conditions_large_offset_covariate() {
+        // Centering must keep η in the data-supported range for a covariate whose raw scale
+        // (~1000) would otherwise ill-condition the fit and let η drift toward the ±30 clamp.
+        // The fitted mean tracks the data mean and no row's |η| approaches the ceiling.
+        let n = 300;
+        let x = Mat::from_fn(n, 2, |i, j| {
+            if j == 0 { 1.0 } else { 1000.0 + usize_to_f64(i % 40) }
+        });
+        let y = Mat::from_fn(n, 1, |i, _| {
+            let cov = 1000.0 + usize_to_f64(i % 40);
+            0.01f64.mul_add(cov - 1020.0, 8.5).exp() * [0.8, 1.0, 1.2][i % 3]
+        });
+
+        let (model, _report) =
+            fit_tweedie(&x, &y, None, 2.0, TweedieOptions::default()).expect("fit");
+
+        let max_abs_eta = max_abs_linear_predictor(&x, &model.beta);
+        assert!(
+            max_abs_eta < LINEAR_PREDICTOR_CLIP,
+            "linear predictor reached the clamp: max|eta| = {max_abs_eta}"
+        );
+        let mean_pred = mean_of(&model.predict(&x).mean);
+        let mean_y = (0..n).map(|i| y[(i, 0)]).sum::<f64>() / n as f64;
+        assert!(
+            (mean_pred - mean_y).abs() / mean_y < 0.05,
+            "fitted mean {mean_pred} does not track data mean {mean_y}"
+        );
+    }
+
+    #[test]
+    fn gamma_fit_fails_loudly_when_outcome_forces_clamp() {
+        // Saturation guard: an outcome so large that its log-mean exceeds the ±30 clamp
+        // (exp(34) ≈ 5.8e14) cannot be represented below the ceiling. The fit must report
+        // an error rather than silently returning a degenerate model whose predictions are
+        // pinned at exp(30) — the failure mode that produced the meaningless fully_adjusted
+        // headline. Strict strategy (the default) surfaces it directly with no ridge retry.
+        let n = 50;
+        let x = Mat::from_fn(n, 1, |_, _| 1.0); // intercept-only
+        let y = Mat::from_fn(n, 1, |_, _| 34.0_f64.exp());
+        let result = fit_tweedie(&x, &y, None, 2.0, TweedieOptions::default());
+        assert!(
+            result.is_err(),
+            "a fit that can only converge at a saturated linear predictor must fail loudly"
+        );
     }
 
     #[test]
