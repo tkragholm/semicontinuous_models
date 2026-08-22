@@ -90,8 +90,30 @@ pub struct FitOptions {
     #[builder(default = 50_usize)]
     pub max_iter: usize,
     /// Convergence tolerance on coefficient changes.
+    ///
+    /// Retained as a SECONDARY criterion. It is absolute and therefore
+    /// scale-dependent: a logit whose coefficients sit at 1e3 -- which is what
+    /// separation produces -- would need ten significant digits of agreement
+    /// between iterates to satisfy it, so on those fits it is unreachable and
+    /// the loop always exhausts `max_iter`. `deviance_tolerance` is the primary
+    /// test.
     #[builder(default = 1e-6_f64)]
     pub tolerance: f64,
+    /// Relative-deviance convergence tolerance: the PRIMARY criterion.
+    ///
+    /// `|dev - dev_prev| / (|dev| + 0.1) < deviance_tolerance`, which is what
+    /// `glm.fit` uses (its `epsilon`, same default). Scale-free, so it behaves
+    /// the same on a well-conditioned fit and on one whose coefficients have
+    /// drifted large.
+    #[builder(default = 1e-8_f64)]
+    pub deviance_tolerance: f64,
+    /// How many times a step may be halved when it fails to improve the deviance.
+    ///
+    /// `glm.fit` does the same. Without it the full Newton step is taken
+    /// unconditionally, which on a near-separated logit oscillates and burns
+    /// every iteration.
+    #[builder(default = 25_usize)]
+    pub max_step_halvings: usize,
     /// Lower bound on IRLS weights.
     #[builder(default = 1e-6_f64)]
     pub min_weight: f64,
@@ -118,6 +140,8 @@ impl Default for FitOptions {
         Self {
             max_iter: 50,
             tolerance: 1e-6,
+            deviance_tolerance: 1e-8,
+            max_step_halvings: 25,
             min_weight: 1e-6,
             regularization: Regularization::None,
             robust_se: false,
@@ -979,10 +1003,12 @@ fn fit_logit_weighted(
     let mut weighted_positive = 0.0;
     let mut saw_positive = false;
     let mut saw_zero = false;
+    let mut count_positive = 0usize;
     for i in 0..y.nrows() {
         let yi = y[(i, 0)];
         if yi > 0.0 {
             saw_positive = true;
+            count_positive += 1;
         } else {
             saw_zero = true;
         }
@@ -990,7 +1016,27 @@ fn fit_logit_weighted(
         weighted_sum += wi;
         weighted_positive = yi.mul_add(wi, weighted_positive);
     }
-    if !saw_positive || !saw_zero {
+    // Minority-class count, which decides whether a logit is identified at all.
+    let minority = count_positive.min(y.nrows() - count_positive);
+
+    // A constant outcome has no logit to fit. NEITHER does one whose minority
+    // class is no larger than the parameter count: with p parameters and m <= p
+    // observations in the smaller class a separating hyperplane always exists, so
+    // the MLE is at infinity and IRLS chases it until `max_iter`.
+    //
+    // Measured on the SCD cost components: `primary_sector` has 0 zeros in 1664,
+    // hits the constant-outcome branch below, and fits in 0.10s with no failures.
+    // `lmdb` and `lpr_kontakt` have ONE zero in 1664 against 31 parameters, miss
+    // the branch, and spend 4.5s each while 45% of their bootstrap replicates
+    // report non-convergence. `lpr_sghforlob` has two, and every one of its 1000
+    // replicates "converged" to the identical coefficient 349.9 -- a fitted
+    // probability of 1 to machine precision, and a logit contributing no
+    // bootstrap variability whatever.
+    //
+    // All four are the same degeneracy. This widens the guard from "no variation"
+    // to "not enough variation to identify a slope", and they all take the
+    // intercept-only prevalence model that the first case already took.
+    if !saw_positive || !saw_zero || minority <= x.ncols() {
         let mut beta = Mat::<f64>::zeros(x.ncols(), 1);
         if weighted_sum > 0.0 && x.ncols() > 0 {
             let p = (weighted_positive / weighted_sum)
@@ -1008,28 +1054,111 @@ fn fit_logit_weighted(
     let regularization = options.regularization;
     let mut weighted_xtz_buffer = Vec::new();
 
+    let prior = weights;
+    let mut eta = logit_eta(x, &beta);
+    let mut p = logistic(&eta);
+    let mut deviance = logit_deviance(y, &p, prior);
+
     for iteration in 0..options.max_iter {
-        let eta = x * &beta;
-        let p = logistic(&eta);
-        let weights = Mat::from_fn(p.nrows(), 1, |i, _| {
-            let value = p[(i, 0)] * (1.0 - p[(i, 0)]);
-            (value.max(options.min_weight)) * weights[(i, 0)]
+        // IRLS weight: the prior weight times the variance function, floored so a
+        // fitted probability at 0 or 1 cannot make `X'WX` singular.
+        let irls_weights = Mat::from_fn(p.nrows(), 1, |i, _| {
+            let variance = p[(i, 0)] * (1.0 - p[(i, 0)]);
+            variance.max(options.min_weight) * prior[(i, 0)]
         });
 
+        // Working response. The residual is divided by the VARIANCE FUNCTION, not
+        // by the IRLS weight: dividing by `variance * prior` cancels the prior
+        // weight out of `X'Wz`, leaving the score equation `X'(y - p) = 0` -- the
+        // UNWEIGHTED one. The gamma loop below already divides by its variance
+        // term rather than by `W`; this makes the two agree. Inert while every
+        // prior weight is 1, which is the case whenever the panel carries no
+        // weight column, and wrong the moment one does.
         let z = Mat::from_fn(eta.nrows(), 1, |i, _| {
-            eta[(i, 0)] + (y[(i, 0)] - p[(i, 0)]) / weights[(i, 0)]
+            let variance = (p[(i, 0)] * (1.0 - p[(i, 0)])).max(options.min_weight);
+            eta[(i, 0)] + (y[(i, 0)] - p[(i, 0)]) / variance
         });
 
-        let beta_next =
-            weighted_least_squares(x, &weights, &z, regularization, &mut weighted_xtz_buffer)?;
+        let proposal = weighted_least_squares(
+            x,
+            &irls_weights,
+            &z,
+            regularization,
+            &mut weighted_xtz_buffer,
+        )?;
+        let step = &proposal - &beta;
 
-        if max_abs_diff(&beta_next, &beta) < options.tolerance {
-            return Ok((beta_next, iteration + 1));
-        }
+        // Step-halving, as `glm.fit` does: a full Newton step that makes the
+        // deviance worse (or non-finite) is halved until it does not. Without it
+        // the step is taken unconditionally and a near-separated logit oscillates
+        // until `max_iter`.
+        let mut halvings = 0usize;
+        let (beta_next, eta_next, p_next, deviance_next) = loop {
+            let scale = 0.5f64.powi(i32::try_from(halvings).unwrap_or(i32::MAX));
+            let candidate = &beta + &(step.as_ref() * scale);
+            let candidate_eta = logit_eta(x, &candidate);
+            let candidate_p = logistic(&candidate_eta);
+            let candidate_deviance = logit_deviance(y, &candidate_p, prior);
+            if candidate_deviance.is_finite() && candidate_deviance <= deviance {
+                break (candidate, candidate_eta, candidate_p, candidate_deviance);
+            }
+            halvings += 1;
+            if halvings > options.max_step_halvings {
+                // No downhill step exists at this point. That is convergence to a
+                // stationary point, not a failure: report the current iterate.
+                return Ok((beta, iteration + 1));
+            }
+        };
+
+        // Relative change in deviance, `glm.fit`'s criterion. The absolute
+        // coefficient test is kept as a secondary: it is what a well-conditioned
+        // fit used to stop on, and keeping it means such a fit stops no later
+        // than it did before.
+        let converged_deviance = (deviance_next - deviance).abs() / (deviance_next.abs() + 0.1)
+            < options.deviance_tolerance;
+        let converged_step = max_abs_diff(&beta_next, &beta) < options.tolerance;
+
         beta = beta_next;
+        eta = eta_next;
+        p = p_next;
+        deviance = deviance_next;
+
+        if converged_deviance || converged_step {
+            return Ok((beta, iteration + 1));
+        }
     }
 
     Err(TwoPartError::NonConvergence)
+}
+
+/// Bound on the logit linear predictor.
+///
+/// `logistic(36)` is already 1.0 in f64, so beyond this the fitted probability
+/// carries no information and only the working response keeps growing. The gamma
+/// loop has had such a clamp since heavy-tailed outcomes were found to drive
+/// `exp(eta)` to infinity; the logit loop -- the one that actually diverges on
+/// this data -- had none.
+const LOGIT_ETA_CLAMP: f64 = 40.0;
+
+fn logit_eta(x: &Mat<f64>, beta: &Mat<f64>) -> Mat<f64> {
+    let eta = x * beta;
+    map_mat(&eta, |value| value.clamp(-LOGIT_ETA_CLAMP, LOGIT_ETA_CLAMP))
+}
+
+/// Weighted binomial deviance, `-2 sum w_i [y ln p + (1-y) ln(1-p)]`.
+///
+/// `p` is clamped off 0 and 1 so a saturated fit gives a large finite deviance
+/// rather than an infinity that no comparison can order.
+fn logit_deviance(y: &Mat<f64>, p: &Mat<f64>, weights: &Mat<f64>) -> f64 {
+    const EPS: f64 = 1e-12;
+    let mut deviance = 0.0;
+    for i in 0..y.nrows() {
+        let prob = p[(i, 0)].clamp(EPS, 1.0 - EPS);
+        let outcome = f64::from(y[(i, 0)] > 0.0);
+        let term = outcome.mul_add(prob.ln(), (1.0 - outcome) * (1.0 - prob).ln());
+        deviance = weights[(i, 0)].mul_add(-2.0 * term, deviance);
+    }
+    deviance
 }
 
 /// Bound on the gamma log-link linear predictor during IRLS and prediction.
@@ -2029,11 +2158,19 @@ mod tests {
 
     #[test]
     fn fit_strategy_relaxed_handles_convergence_failure_with_retry() {
-        // Create a problem that is hard to converge without regularization
-        // by having very few observations or high collinearity.
+        // A problem that is hard to converge without regularization, via high
+        // collinearity and a hard iteration cap.
+        //
+        // This used to put a SINGLE zero against two parameters, which is not a
+        // hard fit -- it is a separated one, where the logit MLE is at infinity.
+        // The separation guard now returns the intercept-only prevalence model
+        // for that shape in zero iterations, so there was nothing left to retry
+        // and this test failed on `fallback_attempts > 0`. The minority class is
+        // now larger than the parameter count, which keeps the logit identified
+        // and leaves `max_iter: 1` as the thing that forces the retry.
         let n = 10;
         let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) });
-        let y = Mat::from_fn(n, 1, |i, _| if i == 0 { 0.0 } else { 1.0 });
+        let y = Mat::from_fn(n, 1, |i, _| if i % 3 == 0 { 0.0 } else { 1.0 });
 
         let options = FitOptions {
             max_iter: 1, // Force early failure
