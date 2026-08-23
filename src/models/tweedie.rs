@@ -811,7 +811,15 @@ fn backtracking_update(
         } else {
             blend_betas_into(&mut proposal, beta_current, beta_candidate, step);
         }
-        let dev = trial_deviance(x, y, sample_weights, &proposal, power, scratch_eta, scratch_mu);
+        let dev = trial_deviance(
+            x,
+            y,
+            sample_weights,
+            &proposal,
+            power,
+            scratch_eta,
+            scratch_mu,
+        );
         if dev.is_finite() && dev <= current_deviance {
             return (proposal, dev);
         }
@@ -827,7 +835,15 @@ fn backtracking_update(
     let dev = if best_deviance.is_finite() {
         best_deviance
     } else {
-        trial_deviance(x, y, sample_weights, &best_beta, power, scratch_eta, scratch_mu)
+        trial_deviance(
+            x,
+            y,
+            sample_weights,
+            &best_beta,
+            power,
+            scratch_eta,
+            scratch_mu,
+        )
     };
     (best_beta, dev)
 }
@@ -1063,7 +1079,11 @@ mod tests {
     // Set the exposure column (index 1) to a constant `value` for the whole design — the
     // counterfactual design the runner feeds the marginal standardisation.
     fn set_exposure(x: &Mat<f64>, value: f64) -> Mat<f64> {
-        Mat::from_fn(x.nrows(), x.ncols(), |i, j| if j == 1 { value } else { x[(i, j)] })
+        Mat::from_fn(
+            x.nrows(),
+            x.ncols(),
+            |i, j| if j == 1 { value } else { x[(i, j)] },
+        )
     }
 
     #[test]
@@ -1117,7 +1137,11 @@ mod tests {
         // The fitted mean tracks the data mean and no row's |η| approaches the ceiling.
         let n = 300;
         let x = Mat::from_fn(n, 2, |i, j| {
-            if j == 0 { 1.0 } else { 1000.0 + usize_to_f64(i % 40) }
+            if j == 0 {
+                1.0
+            } else {
+                1000.0 + usize_to_f64(i % 40)
+            }
         });
         let y = Mat::from_fn(n, 1, |i, _| {
             let cov = 1000.0 + usize_to_f64(i % 40);
@@ -1297,8 +1321,8 @@ mod tests {
         let w = Mat::from_fn(n, 1, |i, _| if i % 2 == 0 { 3.0 } else { 1.0 });
         let input = ModelInput::new(x, y).with_sample_weights(w);
 
-        let (model, _) =
-            fit_tweedie_input(&input, 2.0, TweedieOptions::default()).expect("weighted power-2 fit");
+        let (model, _) = fit_tweedie_input(&input, 2.0, TweedieOptions::default())
+            .expect("weighted power-2 fit");
         assert!((model.beta[(0, 0)] - 5f64.ln()).abs() < 1e-4);
         assert!((model.beta[(1, 0)] - (50f64.ln() - 5f64.ln())).abs() < 1e-4);
     }
@@ -1306,7 +1330,11 @@ mod tests {
     #[test]
     fn warm_start_matches_cold_start_and_converges_faster() {
         let n = 60;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 20.0 });
+        let x = Mat::from_fn(
+            n,
+            2,
+            |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 20.0 },
+        );
         let y = Mat::from_fn(n, 1, |i, _| 1.0 + usize_to_f64(i));
         let input = ModelInput::new(x, y);
         let options = TweedieOptions::default();

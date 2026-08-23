@@ -647,8 +647,13 @@ pub(crate) fn fit_two_part_weighted(
     let start_time = Instant::now();
 
     let is_positive = Mat::from_fn(y.nrows(), 1, |i, _| if y[(i, 0)] > 0.0 { 1.0 } else { 0.0 });
-    let (beta_logit, iterations_logit) =
-        fit_logit_weighted(x, &is_positive, weights, options, warm.map(|w| &w.beta_logit))?;
+    let (beta_logit, iterations_logit) = fit_logit_weighted(
+        x,
+        &is_positive,
+        weights,
+        options,
+        warm.map(|w| &w.beta_logit),
+    )?;
 
     let positive_indices: Vec<usize> = (0..y.nrows()).filter(|&idx| y[(idx, 0)] > 0.0).collect();
 
@@ -682,7 +687,11 @@ pub(crate) fn fit_two_part_weighted(
                 options,
             )?),
             Some(covariance_gamma_weighted(
-                &x_pos, &y_pos, &w_pos, &beta_gamma, options,
+                &x_pos,
+                &y_pos,
+                &w_pos,
+                &beta_gamma,
+                options,
             )?),
         )
     } else {
@@ -1495,12 +1504,14 @@ fn covariance_gamma_weighted(
     let mut meat = Mat::<f64>::zeros(x.ncols(), x.ncols());
     for i in 0..x.nrows() {
         let weight = residuals[(i, 0)] * residuals[(i, 0)];
-        for col_i in 0..x.ncols() {
-            for col_j in 0..x.ncols() {
-                meat[(col_i, col_j)] =
-                    (x[(i, col_i)] * x[(i, col_j)]).mul_add(weight, meat[(col_i, col_j)]);
-            }
-        }
+        // Was an inline double loop, the only one of six meat accumulations in
+        // this crate not going through the helper -- and not an equivalent
+        // spelling of it: this multiplied `x_j * x_k` and then fused the
+        // weight, where the helper scales `x_j` first and fuses `x_k`. Same
+        // quantity, different association, so the gamma part's robust
+        // covariance disagreed with the logit part's in the last bits for
+        // identical inputs.
+        add_row_outer_product_scaled(&mut meat, x, i, weight);
     }
 
     sandwich_covariance(&xtx, &meat)
@@ -1876,13 +1887,13 @@ mod tests {
         // clamp, exp(eta) overflows to +inf; the clamp keeps the predicted mean
         // (and expected outcome) finite.
         let n = 30;
-        let x = Mat::from_fn(n, 2, |i, j| {
-            if j == 0 {
-                1.0
-            } else {
-                usize_to_f64(i) / 10.0
-            }
-        });
+        let x = Mat::from_fn(
+            n,
+            2,
+            |i, j| {
+                if j == 0 { 1.0 } else { usize_to_f64(i) / 10.0 }
+            },
+        );
         let y = Mat::from_fn(n, 1, |i, _| 10.0 + usize_to_f64(i));
         let (model, _report) =
             fit_two_part(&x, &y, FitOptions::stable_defaults()).expect("benign fit");
@@ -2086,9 +2097,19 @@ mod tests {
         // coefficients byte-identical (the bootstrap CI is the spread of these
         // betas) and only suppress the unused se/cov fields.
         let n = 60;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 20.0 });
+        let x = Mat::from_fn(
+            n,
+            2,
+            |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 20.0 },
+        );
         // A two-part shape: a zero spike plus positive values.
-        let y = Mat::from_fn(n, 1, |i, _| if i % 3 == 0 { 0.0 } else { 1.0 + usize_to_f64(i) });
+        let y = Mat::from_fn(n, 1, |i, _| {
+            if i % 3 == 0 {
+                0.0
+            } else {
+                1.0 + usize_to_f64(i)
+            }
+        });
 
         let with_cov = FitOptions::default();
         let without_cov = FitOptions {
@@ -2096,8 +2117,7 @@ mod tests {
             ..FitOptions::default()
         };
 
-        let (model_a, report_a) =
-            fit_two_part(&x, &y, with_cov).expect("fit with covariance");
+        let (model_a, report_a) = fit_two_part(&x, &y, with_cov).expect("fit with covariance");
         let (model_b, report_b) =
             fit_two_part(&x, &y, without_cov).expect("fit without covariance");
 
@@ -2119,11 +2139,19 @@ mod tests {
     fn two_part_warm_start_matches_cold_start() {
         // A weighted input hits the warm-startable path (the bootstrap carries weights).
         let n = 80;
-        let x = Mat::from_fn(n, 2, |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 20.0 });
-        let y =
-            Mat::from_fn(n, 1, |i, _| if i % 3 == 0 { 0.0 } else { 1.0 + usize_to_f64(i) });
-        let input =
-            ModelInput::new(x, y).with_sample_weights(Mat::from_fn(n, 1, |_, _| 1.0));
+        let x = Mat::from_fn(
+            n,
+            2,
+            |i, j| if j == 0 { 1.0 } else { usize_to_f64(i) / 20.0 },
+        );
+        let y = Mat::from_fn(n, 1, |i, _| {
+            if i % 3 == 0 {
+                0.0
+            } else {
+                1.0 + usize_to_f64(i)
+            }
+        });
+        let input = ModelInput::new(x, y).with_sample_weights(Mat::from_fn(n, 1, |_, _| 1.0));
         let options = FitOptions::default();
 
         let (cold, _) = fit_two_part_input(&input, options).expect("cold fit");

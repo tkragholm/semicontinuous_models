@@ -52,10 +52,7 @@ fn column_is_constant(x: &Mat<f64>, column: usize) -> bool {
 /// gets `0.0` so centering leaves it intact (centering a constant column would zero it and
 /// make `XᵀWX` singular). Every remaining column gets its weighted mean.
 #[must_use]
-pub(crate) fn weighted_column_means(
-    x: &Mat<f64>,
-    weights: Option<&Mat<f64>>,
-) -> Option<Vec<f64>> {
+pub(crate) fn weighted_column_means(x: &Mat<f64>, weights: Option<&Mat<f64>>) -> Option<Vec<f64>> {
     let (n, p) = (x.nrows(), x.ncols());
     if n == 0 || p == 0 || !column_is_constant(x, 0) {
         return None;
@@ -91,7 +88,9 @@ pub(crate) fn center_columns(x: &Mat<f64>, means: &[f64]) -> Mat<f64> {
 #[must_use]
 pub(crate) fn uncenter_beta(beta_centered: &Mat<f64>, means: &[f64]) -> Mat<f64> {
     let mut beta = beta_centered.clone();
-    let shift: f64 = (1..beta.nrows()).map(|j| beta_centered[(j, 0)] * means[j]).sum();
+    let shift: f64 = (1..beta.nrows())
+        .map(|j| beta_centered[(j, 0)] * means[j])
+        .sum();
     beta[(0, 0)] -= shift;
     beta
 }
@@ -174,8 +173,14 @@ mod tests {
             _ => f64::from(u32::try_from(i).unwrap()), // 0,1,2,3 -> mean 1.5
         });
         let means = weighted_column_means(&x, None).expect("intercept present");
-        assert!((means[0] - 0.0).abs() < 1e-12, "intercept must not be centered");
-        assert!((means[1] - 0.0).abs() < 1e-12, "constant column must not be centered");
+        assert!(
+            (means[0] - 0.0).abs() < 1e-12,
+            "intercept must not be centered"
+        );
+        assert!(
+            (means[1] - 0.0).abs() < 1e-12,
+            "constant column must not be centered"
+        );
         assert!((means[2] - 1.5).abs() < 1e-12, "varying column mean");
     }
 
