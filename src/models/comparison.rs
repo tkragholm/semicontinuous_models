@@ -600,9 +600,40 @@ fn build_cv_summary(
     rows
 }
 
+/// How far past the mean predictor a CV score may fall and still be a score.
+///
+/// Matches the runner's `DEFAULT_MAGNITUDE_GUARD_K`: something is implausible
+/// once it exceeds its reference scale by 50x. Here the reference is the
+/// trivial mean predictor, whose RMSE is the outcome's own spread and whose r2
+/// is 0 by definition, so `rmse > 50 * rmse_mean` is exactly `r2 < -2499`.
+const CV_MAGNITUDE_GUARD_K: f64 = 50.0;
+
+/// Whether a cross-validated score can be compared with the others at all.
+///
+/// A model that generalises badly still has a score: `two_part` at r2 = -0.06
+/// and a Tweedie at r2 = -3.7 are poor fits, and ranking them is meaningful.
+/// A model whose held-out RMSE is ten orders of magnitude above the outcome
+/// scale has not produced a score, it has failed, and putting it in a ranked
+/// list says it came last when what happened is that it did not run.
+fn cv_score_is_comparable(metrics: &ModelFitMetrics) -> bool {
+    metrics.rmse.is_finite()
+        && metrics.r2.is_finite()
+        && metrics.r2 >= 1.0 - CV_MAGNITUDE_GUARD_K * CV_MAGNITUDE_GUARD_K
+}
+
+/// Comparable scores first, ordered by RMSE; failures after them, and within
+/// each group ties broken by name so the order does not depend on the order the
+/// candidates happened to be built in.
+fn cv_order(a: &ModelScore, b: &ModelScore) -> std::cmp::Ordering {
+    cv_score_is_comparable(&b.metrics)
+        .cmp(&cv_score_is_comparable(&a.metrics))
+        .then_with(|| a.metrics.rmse.total_cmp(&b.metrics.rmse))
+        .then_with(|| a.name.cmp(&b.name))
+}
+
 fn build_cv_ranking(cv_summary: &[ModelScore]) -> Vec<ModelScore> {
     let mut rows = cv_summary.to_vec();
-    rows.sort_by(|a, b| a.metrics.rmse.total_cmp(&b.metrics.rmse));
+    rows.sort_by(cv_order);
     rows
 }
 
@@ -611,7 +642,12 @@ fn build_tweedie_cv_ranking(
     tweedie_candidates: &[TweedieCandidate],
 ) -> Vec<TweedieRankingRow> {
     let mut candidates = cv_default.tweedie_candidates.clone();
-    candidates.sort_by(|a, b| a.metrics.rmse.total_cmp(&b.metrics.rmse));
+    candidates.sort_by(|a, b| {
+        cv_score_is_comparable(&b.metrics)
+            .cmp(&cv_score_is_comparable(&a.metrics))
+            .then_with(|| a.metrics.rmse.total_cmp(&b.metrics.rmse))
+            .then_with(|| a.power.total_cmp(&b.power))
+    });
     candidates
         .into_iter()
         .map(|candidate| {
@@ -765,6 +801,44 @@ mod tests {
             }
         });
         ModelInput::new(design_matrix, outcome)
+    }
+
+    fn score(name: &str, rmse: f64, r2: f64) -> ModelScore {
+        ModelScore {
+            name: name.to_string(),
+            metrics: ModelFitMetrics {
+                rmse,
+                mae: 0.0,
+                rmsle: 0.0,
+                r2,
+                deviance: 0.0,
+            },
+        }
+    }
+
+    #[test]
+    fn a_failed_cv_fit_ranks_below_every_real_one() {
+        // A model that generalises badly keeps its place; one whose held-out
+        // error is orders of magnitude past the outcome scale did not produce a
+        // score and must not be ranked as though it merely came last.
+        let ranked = build_cv_ranking(&[
+            score("diverged", 2.7e11, -1.1e13),
+            score("poor", 276_867.0, -3.71),
+            score("mediocre", 149_339.0, -0.06),
+            score("best", 144_962.0, 0.009),
+        ]);
+
+        let names: Vec<&str> = ranked.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["best", "mediocre", "poor", "diverged"]);
+    }
+
+    #[test]
+    fn cv_ties_break_on_name_not_construction_order() {
+        // Equal RMSE must not leave the order to whatever built the list.
+        let one = build_cv_ranking(&[score("b", 1.0, 0.5), score("a", 1.0, 0.5)]);
+        let other = build_cv_ranking(&[score("a", 1.0, 0.5), score("b", 1.0, 0.5)]);
+        assert_eq!(one[0].name, "a");
+        assert_eq!(one[0].name, other[0].name);
     }
 
     #[test]
