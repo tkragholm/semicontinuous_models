@@ -16,28 +16,6 @@
 //! standard errors, and bootstrap utilities for inference.
 
 use crate::input::{InputError, ModelInput};
-use cgp::prelude::*;
-
-#[cgp_component(BinaryModel)]
-#[allow(clippy::missing_errors_doc)]
-pub trait CanFitBinaryPart {
-    type BinaryData;
-    type BinaryResult;
-
-    /// Fit the binary part of the model.
-    fn fit_binary(&self, data: &Self::BinaryData) -> Result<Self::BinaryResult, String>;
-}
-
-#[cgp_component(ContinuousModel)]
-#[allow(clippy::missing_errors_doc)]
-pub trait CanFitContinuousPart {
-    type ContinuousData;
-    type ContinuousResult;
-
-    /// Fit the continuous part of the model.
-    fn fit_continuous(&self, data: &Self::ContinuousData)
-    -> Result<Self::ContinuousResult, String>;
-}
 use crate::models::matrix_ops::{
     center_beta, center_columns, map_mat, max_abs_linear_predictor, select_rows, select_values,
     uncenter_beta, weighted_column_means,
@@ -233,59 +211,6 @@ impl From<InputError> for TwoPartError {
                 panic!("duplicate labels should be caught in validation: {labels}")
             }
         }
-    }
-}
-
-#[cgp_component(FitOptionsProvider)]
-pub trait HasFitOptions {
-    fn options(&self) -> FitOptions;
-}
-
-pub struct TwoPartModelContext<'a> {
-    pub options: FitOptions,
-    pub _marker: PhantomData<&'a ()>,
-}
-
-impl HasFitOptions for TwoPartModelContext<'_> {
-    fn options(&self) -> FitOptions {
-        self.options
-    }
-}
-
-pub struct LogisticBinaryPart;
-
-#[cgp_impl(LogisticBinaryPart)]
-impl<Context> BinaryModel for Context
-where
-    Context: HasFitOptions,
-{
-    type BinaryData = (Mat<f64>, Mat<f64>, Mat<f64>);
-    type BinaryResult = (Mat<f64>, usize);
-
-    fn fit_binary(&self, data: &Self::BinaryData) -> Result<Self::BinaryResult, String> {
-        let (x, y, w) = data;
-        let options = self.options();
-        fit_logit_weighted(x, y, w, options, None).map_err(|e| e.to_string())
-    }
-}
-
-pub struct GammaContinuousPart;
-
-#[cgp_impl(GammaContinuousPart)]
-impl<Context> ContinuousModel for Context
-where
-    Context: HasFitOptions,
-{
-    type ContinuousData = (Mat<f64>, Mat<f64>, Mat<f64>);
-    type ContinuousResult = (Mat<f64>, usize);
-
-    fn fit_continuous(
-        &self,
-        data: &Self::ContinuousData,
-    ) -> Result<Self::ContinuousResult, String> {
-        let (x, y, w) = data;
-        let options = self.options();
-        fit_gamma_log_link_weighted(x, y, w, options, None).map_err(|e| e.to_string())
     }
 }
 
