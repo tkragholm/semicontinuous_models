@@ -27,8 +27,7 @@ use crate::models::{
 };
 use crate::utils::{
     CachedFactor, add_ridge_to_diagonal, constant_irls_weights, linear_predictor, matvec_into,
-    max_abs_diff, solve_linear_system, solve_linear_system_ref, weighted_xtx,
-    weighted_xtz_with_buffer,
+    max_abs_diff, solve_linear_system_ref, weighted_xtx, weighted_xtz_with_buffer,
 };
 
 const LINEAR_PREDICTOR_CLIP: f64 = 30.0;
@@ -446,7 +445,7 @@ fn fit_tweedie_with_lambda(
                             options.l2_penalty_exclude_intercept,
                         );
                     }
-                    solve_with_stabilization(&xtwx, &xtw_rhs)?
+                    solve_with_stabilization(xtwx.as_ref(), xtw_rhs.as_ref())?
                 }
             }
         } else {
@@ -462,7 +461,7 @@ fn fit_tweedie_with_lambda(
                 add_ridge_to_diagonal(&mut xtwx, lambda, options.l2_penalty_exclude_intercept);
             }
             let xtw_rhs = weighted_xtz_with_buffer(cx, &weight_buffer, &z, &mut xtz_buffer);
-            solve_with_stabilization(&xtwx, &xtw_rhs)?
+            solve_with_stabilization(xtwx.as_ref(), xtw_rhs.as_ref())?
         };
 
         let (beta_next, dev_next) = backtracking_update(
@@ -755,7 +754,7 @@ fn robust_covariance(
         ),
         None => score_meat(x, |i| (y[(i, 0)] - mu[(i, 0)]) * weights[(i, 0)], None),
     };
-    let cov = sandwich(xtwx, &meat, solve_with_stabilization_view)?;
+    let cov = sandwich(xtwx, &meat, solve_with_stabilization)?;
     Ok((Some(cov), cluster_count.is_some(), cluster_count))
 }
 
@@ -865,27 +864,9 @@ fn exp_clamped(value: f64) -> f64 {
         .exp()
 }
 
-fn solve_with_stabilization(lhs: &Mat<f64>, rhs: &Mat<f64>) -> Result<Mat<f64>, TweedieError> {
-    if let Ok(solution) = solve_linear_system(lhs, rhs) {
-        return Ok(solution);
-    }
-
-    let mut stabilized = lhs.clone();
-    let dim = lhs.nrows().min(lhs.ncols());
-    let mut jitter = 1e-10;
-    for _ in 0..8 {
-        for idx in 0..dim {
-            stabilized[(idx, idx)] = lhs[(idx, idx)] + jitter;
-        }
-        if let Ok(solution) = solve_linear_system(&stabilized, rhs) {
-            return Ok(solution);
-        }
-        jitter *= 10.0;
-    }
-    Err(TweedieError::SolveFailed)
-}
-
-fn solve_with_stabilization_view(
+/// Solve `lhs * x = rhs`, retrying with growing diagonal jitter from 1e-10 when the
+/// unregularised solve fails.
+fn solve_with_stabilization(
     lhs: MatRef<'_, f64>,
     rhs: MatRef<'_, f64>,
 ) -> Result<Mat<f64>, TweedieError> {
