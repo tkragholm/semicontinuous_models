@@ -23,7 +23,8 @@ use crate::models::matrix_ops::{
     weighted_column_means,
 };
 use crate::models::{
-    AttemptDiagnostics, AttemptOutcome, FitMetadata, FitStrategy, Model, SolverKind,
+    AttemptDiagnostics, FitMetadata, FitStrategy, Model, RetryableError, SolverKind,
+    run_with_retries,
 };
 use crate::utils::{
     CachedFactor, add_ridge_to_diagonal, constant_irls_weights, linear_predictor, matvec_into,
@@ -258,81 +259,40 @@ fn fit_tweedie_weighted(
         return Err(TweedieError::NegativeOutcome);
     }
 
-    let mut current_options = options;
-    let mut attempts = Vec::new();
-    let mut last_err = TweedieError::NonConvergence;
+    let retried = run_with_retries(
+        options,
+        options.strategy,
+        start_time,
+        TweedieError::NonConvergence,
+        |base, fallback_lambda, scale| TweedieOptions {
+            l2_penalty: fallback_lambda.mul_add(scale, base.l2_penalty).max(1e-8),
+            ..base
+        },
+        |current| current.l2_penalty,
+        |current_options| {
+            fit_tweedie_with_lambda(TweedieFitRequest {
+                x,
+                y,
+                sample_weights,
+                clusters,
+                power,
+                options: current_options,
+                lambda: current_options.l2_penalty,
+                initial_beta_override: initial_beta,
+            })
+        },
+    )?;
 
-    let strategy = options.strategy;
-    let max_attempts = match strategy {
-        FitStrategy::Strict => 1,
-        FitStrategy::Relaxed { max_retries, .. } => 1 + max_retries,
-    };
+    let (mut model, mut report) = retried.fit;
+    let attempts = retried.attempts;
+    let attempt_idx = retried.attempt_idx;
+    crate::finalize_retry_fit!(model, report, attempts, start_time, attempt_idx);
+}
 
-    for attempt_idx in 0..max_attempts {
-        if attempt_idx > 0
-            && let FitStrategy::Relaxed {
-                fallback_lambda,
-                time_budget,
-                ..
-            } = strategy
-        {
-            if let Some(budget) = time_budget
-                && start_time.elapsed() >= budget
-            {
-                attempts.push(AttemptDiagnostics {
-                    attempt: attempt_idx,
-                    lambda_used: 0.0,
-                    meta: FitMetadata::default(),
-                    outcome: AttemptOutcome::TimedOut,
-                });
-                break;
-            }
-
-            // Incremental regularization fallback
-            let scale = 10.0f64.powi(i32::try_from(attempt_idx - 1).unwrap_or(0));
-            current_options.l2_penalty =
-                fallback_lambda.mul_add(scale, options.l2_penalty).max(1e-8);
-        }
-
-        let result = fit_tweedie_with_lambda(TweedieFitRequest {
-            x,
-            y,
-            sample_weights,
-            clusters,
-            power,
-            options: current_options,
-            lambda: current_options.l2_penalty,
-            initial_beta_override: initial_beta,
-        });
-
-        match result {
-            Ok((mut model, mut report)) => {
-                crate::finalize_retry_fit!(model, report, attempts, start_time, attempt_idx);
-            }
-            Err(e @ (TweedieError::NonConvergence | TweedieError::SolveFailed)) => {
-                attempts.push(AttemptDiagnostics {
-                    attempt: attempt_idx,
-                    lambda_used: current_options.l2_penalty,
-                    meta: FitMetadata {
-                        converged: false,
-                        execution_time: start_time.elapsed(),
-                        ..FitMetadata::default()
-                    },
-                    outcome: AttemptOutcome::Diverged,
-                });
-                last_err = e;
-                if let FitStrategy::Relaxed {
-                    warm_start: true, ..
-                } = strategy
-                {
-                    // Could potentially capture partial beta here if we changed fit_tweedie_with_lambda
-                }
-            }
-            Err(e) => return Err(e),
-        }
+impl RetryableError for TweedieError {
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::NonConvergence | Self::SolveFailed)
     }
-
-    Err(last_err)
 }
 
 #[derive(Clone, Copy)]

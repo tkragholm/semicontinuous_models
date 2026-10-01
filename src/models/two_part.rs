@@ -22,7 +22,8 @@ use crate::models::matrix_ops::{
     uncenter_beta, weighted_column_means,
 };
 use crate::models::{
-    AttemptDiagnostics, AttemptOutcome, FitMetadata, FitStrategy, Model, SolverKind,
+    AttemptDiagnostics, FitMetadata, FitStrategy, Model, RetryableError, SolverKind,
+    run_with_retries,
 };
 #[cfg(feature = "bench-internals")]
 use crate::utils::weighted_xtz;
@@ -426,53 +427,26 @@ pub fn fit_two_part_input_warm(
     input.validate()?;
 
     let start_time = Instant::now();
-    let mut current_options = options;
-    let mut attempts = Vec::new();
-    let mut last_err = TwoPartError::NonConvergence;
-
-    let strategy = options.strategy;
-    let max_attempts = match strategy {
-        FitStrategy::Strict => 1,
-        FitStrategy::Relaxed { max_retries, .. } => 1 + max_retries,
-    };
-
-    for attempt_idx in 0..max_attempts {
-        if attempt_idx > 0
-            && let FitStrategy::Relaxed {
-                fallback_lambda,
-                time_budget,
-                ..
-            } = strategy
-        {
-            if let Some(budget) = time_budget
-                && start_time.elapsed() >= budget
-            {
-                attempts.push(AttemptDiagnostics {
-                    attempt: attempt_idx,
-                    lambda_used: 0.0, // N/A
-                    meta: FitMetadata::default(),
-                    outcome: AttemptOutcome::TimedOut,
-                });
-                break;
-            }
-
-            // Increase regularization strength with each attempt
-            let scale = 10.0f64.powi(i32::try_from(attempt_idx - 1).unwrap_or(0));
-            current_options.regularization = Regularization::Ridge {
+    let retried = run_with_retries(
+        options,
+        options.strategy,
+        start_time,
+        TwoPartError::NonConvergence,
+        |base, fallback_lambda, scale| FitOptions {
+            regularization: Regularization::Ridge {
                 lambda: fallback_lambda * scale,
                 exclude_intercept: true,
-            };
-        }
-
-        let lambda_used = match current_options.regularization {
+            },
+            ..base
+        },
+        |current| match current.regularization {
             Regularization::Ridge { lambda, .. } | Regularization::ElasticNet { lambda, .. } => {
                 lambda
             }
             Regularization::BayesianRidge { prior_scale, .. } => 1.0 / (prior_scale * prior_scale),
             Regularization::None => 0.0,
-        };
-
-        let result = match (&input.sample_weights, &input.cluster_ids) {
+        },
+        |current_options| match (&input.sample_weights, &input.cluster_ids) {
             (Some(weights), Some(clusters)) => fit_two_part_clustered_weighted(
                 &input.design_matrix,
                 &input.outcome,
@@ -495,33 +469,20 @@ pub fn fit_two_part_input_warm(
                 current_options,
             ),
             (None, None) => fit_two_part(&input.design_matrix, &input.outcome, current_options),
-        };
+        },
+    )?;
 
-        match result {
-            Ok((mut model, mut report)) => {
-                report.attempts = attempts;
-                report.meta.fallback_attempts = attempt_idx;
-                model.report = report.clone();
-                return Ok((model, report));
-            }
-            Err(e @ (TwoPartError::NonConvergence | TwoPartError::SolveFailed)) => {
-                attempts.push(AttemptDiagnostics {
-                    attempt: attempt_idx,
-                    lambda_used,
-                    meta: FitMetadata {
-                        converged: false,
-                        execution_time: start_time.elapsed(),
-                        ..FitMetadata::default()
-                    },
-                    outcome: AttemptOutcome::Diverged,
-                });
-                last_err = e;
-            }
-            Err(e) => return Err(e),
-        }
+    let (mut model, mut report) = retried.fit;
+    report.attempts = retried.attempts;
+    report.meta.fallback_attempts = retried.attempt_idx;
+    model.report = report.clone();
+    Ok((model, report))
+}
+
+impl RetryableError for TwoPartError {
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::NonConvergence | Self::SolveFailed)
     }
-
-    Err(last_err)
 }
 
 /// Fit a weighted two-part model from a `ModelInput` container.

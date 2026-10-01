@@ -18,7 +18,8 @@ use faer::Mat;
 use crate::models::covariance::{diag_sqrt, sandwich, score_meat};
 use crate::models::matrix_ops::{map_mat, select_rows, select_values};
 use crate::models::{
-    AttemptDiagnostics, AttemptOutcome, FitMetadata, FitStrategy, Model, SolverKind,
+    AttemptDiagnostics, FitMetadata, FitStrategy, Model, RetryableError, SolverKind,
+    run_with_retries,
 };
 use thiserror::Error;
 
@@ -269,66 +270,29 @@ pub(crate) fn fit_lognormal_smearing(
         return Err(LogNormalError::NegativeOutcome);
     }
 
-    let mut current_options = options;
-    let mut attempts = Vec::new();
-    let mut last_err = LogNormalError::SolveFailed;
+    let retried = run_with_retries(
+        options,
+        options.strategy,
+        start_time,
+        LogNormalError::SolveFailed,
+        |base, fallback_lambda, scale| LogNormalOptions {
+            l2_penalty: fallback_lambda.mul_add(scale, base.l2_penalty).max(1e-8),
+            ..base
+        },
+        |current| current.l2_penalty,
+        |current_options| fit_lognormal_with_lambda(x, y, clusters, current_options),
+    )?;
 
-    let strategy = options.strategy;
-    let max_attempts = match strategy {
-        FitStrategy::Strict => 1,
-        FitStrategy::Relaxed { max_retries, .. } => 1 + max_retries,
-    };
+    let (mut model, mut report) = retried.fit;
+    let attempts = retried.attempts;
+    let attempt_idx = retried.attempt_idx;
+    crate::finalize_retry_fit!(model, report, attempts, start_time, attempt_idx);
+}
 
-    for attempt_idx in 0..max_attempts {
-        if attempt_idx > 0
-            && let FitStrategy::Relaxed {
-                fallback_lambda,
-                time_budget,
-                ..
-            } = strategy
-        {
-            if let Some(budget) = time_budget
-                && start_time.elapsed() >= budget
-            {
-                attempts.push(AttemptDiagnostics {
-                    attempt: attempt_idx,
-                    lambda_used: 0.0,
-                    meta: FitMetadata::default(),
-                    outcome: AttemptOutcome::TimedOut,
-                });
-                break;
-            }
-
-            // Incremental regularization fallback
-            let scale = 10.0f64.powi(i32::try_from(attempt_idx - 1).unwrap_or(0));
-            current_options.l2_penalty =
-                fallback_lambda.mul_add(scale, options.l2_penalty).max(1e-8);
-        }
-
-        let result = fit_lognormal_with_lambda(x, y, clusters, current_options);
-
-        match result {
-            Ok((mut model, mut report)) => {
-                crate::finalize_retry_fit!(model, report, attempts, start_time, attempt_idx);
-            }
-            Err(e @ (LogNormalError::SolveFailed | LogNormalError::NonConvergence)) => {
-                attempts.push(AttemptDiagnostics {
-                    attempt: attempt_idx,
-                    lambda_used: current_options.l2_penalty,
-                    meta: FitMetadata {
-                        converged: false,
-                        execution_time: start_time.elapsed(),
-                        ..FitMetadata::default()
-                    },
-                    outcome: AttemptOutcome::Diverged,
-                });
-                last_err = e;
-            }
-            Err(e) => return Err(e),
-        }
+impl RetryableError for LogNormalError {
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::SolveFailed | Self::NonConvergence)
     }
-
-    Err(last_err)
 }
 
 fn fit_lognormal_with_lambda(

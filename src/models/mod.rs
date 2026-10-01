@@ -112,3 +112,94 @@ pub struct AttemptDiagnostics {
     pub meta: FitMetadata,
     pub outcome: AttemptOutcome,
 }
+
+/// An error a fit may be retried after under [`FitStrategy::Relaxed`].
+pub(crate) trait RetryableError {
+    /// True for non-convergence and failed solves, which stronger regularisation can fix.
+    fn is_retryable(&self) -> bool;
+}
+
+/// A successful fit from [`run_with_retries`]: the fitted value, the failed attempts
+/// before it, and the index of the attempt that succeeded.
+pub(crate) struct RetriedFit<T> {
+    pub fit: T,
+    pub attempts: Vec<AttemptDiagnostics>,
+    pub attempt_idx: usize,
+}
+
+/// Run `fit` once under [`FitStrategy::Strict`], or up to `1 + max_retries` times under
+/// [`FitStrategy::Relaxed`].
+///
+/// Attempt `k > 0` fits with `relax(base, fallback_lambda, 10^(k-1))`. A retryable
+/// failure is recorded as `Diverged` with `lambda_used(options)` and the next attempt
+/// runs. Any other error is returned at once. When the time budget is spent before an
+/// attempt, a `TimedOut` record is added and no further attempt runs. If every attempt
+/// fails, the last retryable error is returned, or `initial_err` if none ran.
+pub(crate) fn run_with_retries<O: Copy, T, E: RetryableError>(
+    base: O,
+    strategy: FitStrategy,
+    start_time: std::time::Instant,
+    initial_err: E,
+    relax: impl Fn(O, f64, f64) -> O,
+    lambda_used: impl Fn(&O) -> f64,
+    mut fit: impl FnMut(O) -> Result<T, E>,
+) -> Result<RetriedFit<T>, E> {
+    let max_attempts = match strategy {
+        FitStrategy::Strict => 1,
+        FitStrategy::Relaxed { max_retries, .. } => 1 + max_retries,
+    };
+    let mut current = base;
+    let mut attempts = Vec::new();
+    let mut last_err = initial_err;
+
+    for attempt_idx in 0..max_attempts {
+        if attempt_idx > 0
+            && let FitStrategy::Relaxed {
+                fallback_lambda,
+                time_budget,
+                ..
+            } = strategy
+        {
+            if let Some(budget) = time_budget
+                && start_time.elapsed() >= budget
+            {
+                attempts.push(AttemptDiagnostics {
+                    attempt: attempt_idx,
+                    lambda_used: 0.0,
+                    meta: FitMetadata::default(),
+                    outcome: AttemptOutcome::TimedOut,
+                });
+                break;
+            }
+            let scale = 10.0f64.powi(i32::try_from(attempt_idx - 1).unwrap_or(0));
+            current = relax(base, fallback_lambda, scale);
+        }
+
+        let lambda = lambda_used(&current);
+        match fit(current) {
+            Ok(fit) => {
+                return Ok(RetriedFit {
+                    fit,
+                    attempts,
+                    attempt_idx,
+                });
+            }
+            Err(err) if err.is_retryable() => {
+                attempts.push(AttemptDiagnostics {
+                    attempt: attempt_idx,
+                    lambda_used: lambda,
+                    meta: FitMetadata {
+                        converged: false,
+                        execution_time: start_time.elapsed(),
+                        ..FitMetadata::default()
+                    },
+                    outcome: AttemptOutcome::Diverged,
+                });
+                last_err = err;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_err)
+}
