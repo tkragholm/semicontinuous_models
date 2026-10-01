@@ -23,12 +23,12 @@ pub(super) fn covariance_logit(
 ) -> Result<Mat<f64>, TwoPartError> {
     let eta = linear_predictor(x, beta);
     let p = logistic(&eta);
-    let weights = Mat::from_fn(p.nrows(), 1, |i, _| {
+    let irls_weights = Mat::from_fn(p.nrows(), 1, |i, _| {
         let value = p[(i, 0)] * (1.0 - p[(i, 0)]);
         (value.max(options.min_weight)) * weights[(i, 0)]
     });
 
-    let mut xtwx = weighted_xtx(x, &weights);
+    let mut xtwx = weighted_xtx(x, &irls_weights);
     if let Some((lambda, exclude_intercept)) = ridge_from_regularization(options.regularization)
         && lambda > 0.0
     {
@@ -38,6 +38,8 @@ pub(super) fn covariance_logit(
         return covariance_from_information(&xtwx);
     }
 
+    // The logit score under the canonical link is `x_i (y_i - p_i)` times the prior
+    // weight. The variance p(1 - p) belongs in the bread only.
     let residuals = Mat::from_fn(y.nrows(), 1, |i, _| {
         (y[(i, 0)] - p[(i, 0)]) * weights[(i, 0)]
     });
