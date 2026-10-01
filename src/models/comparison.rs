@@ -691,17 +691,25 @@ struct MetricBest {
     loglik: f64,
 }
 
+impl MetricBest {
+    /// The starting point every row improves on: infinite errors and criteria,
+    /// and negative infinity for r2 and the log-likelihood.
+    const fn worst() -> Self {
+        Self {
+            rmse: f64::INFINITY,
+            mae: f64::INFINITY,
+            rmsle: f64::INFINITY,
+            r2: f64::NEG_INFINITY,
+            deviance: f64::INFINITY,
+            aic: f64::INFINITY,
+            bic: f64::INFINITY,
+            loglik: f64::NEG_INFINITY,
+        }
+    }
+}
+
 fn best_metrics(rows: &[ModelScore]) -> MetricBest {
-    let mut best = MetricBest {
-        rmse: f64::INFINITY,
-        mae: f64::INFINITY,
-        rmsle: f64::INFINITY,
-        r2: f64::NEG_INFINITY,
-        deviance: f64::INFINITY,
-        aic: f64::INFINITY,
-        bic: f64::INFINITY,
-        loglik: f64::NEG_INFINITY,
-    };
+    let mut best = MetricBest::worst();
     for score in rows {
         best.rmse = best.rmse.min(score.metrics.rmse);
         best.mae = best.mae.min(score.metrics.mae);
@@ -713,16 +721,7 @@ fn best_metrics(rows: &[ModelScore]) -> MetricBest {
 }
 
 fn best_ic(rows: &[ModelInformationCriteria]) -> MetricBest {
-    let mut best = MetricBest {
-        rmse: f64::INFINITY,
-        mae: f64::INFINITY,
-        rmsle: f64::INFINITY,
-        r2: f64::NEG_INFINITY,
-        deviance: f64::INFINITY,
-        aic: f64::INFINITY,
-        bic: f64::INFINITY,
-        loglik: f64::NEG_INFINITY,
-    };
+    let mut best = MetricBest::worst();
     for ic in rows {
         best.loglik = best.loglik.max(ic.loglik);
         best.aic = best.aic.min(ic.aic);
@@ -732,16 +731,7 @@ fn best_ic(rows: &[ModelInformationCriteria]) -> MetricBest {
 }
 
 fn best_tweedie_ranking(rows: &[TweedieRankingRow]) -> MetricBest {
-    let mut best = MetricBest {
-        rmse: f64::INFINITY,
-        mae: f64::INFINITY,
-        rmsle: f64::INFINITY,
-        r2: f64::NEG_INFINITY,
-        deviance: f64::INFINITY,
-        aic: f64::INFINITY,
-        bic: f64::INFINITY,
-        loglik: f64::NEG_INFINITY,
-    };
+    let mut best = MetricBest::worst();
     for row in rows {
         best.rmse = best.rmse.min(row.metrics.rmse);
         best.mae = best.mae.min(row.metrics.mae);

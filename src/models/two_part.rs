@@ -293,19 +293,15 @@ impl Model for TwoPartModel {
 
     fn predict_into(&self, x: &Mat<f64>, out: &mut Self::Prediction) {
         let eta_logit = linear_predictor(x, &self.beta_logit);
-        for i in 0..x.nrows() {
-            out.prob_positive[(i, 0)] = 1.0 / (1.0 + (-eta_logit[(i, 0)]).exp());
-        }
-
         let eta_gamma = linear_predictor(x, &self.beta_gamma);
         for i in 0..x.nrows() {
-            out.mean_positive[(i, 0)] = eta_gamma[(i, 0)]
+            let prob = 1.0 / (1.0 + (-eta_logit[(i, 0)]).exp());
+            let mean = eta_gamma[(i, 0)]
                 .clamp(-GAMMA_LOG_LINK_ETA_CLAMP, GAMMA_LOG_LINK_ETA_CLAMP)
                 .exp();
-        }
-
-        for i in 0..x.nrows() {
-            out.expected_outcome[(i, 0)] = out.prob_positive[(i, 0)] * out.mean_positive[(i, 0)];
+            out.prob_positive[(i, 0)] = prob;
+            out.mean_positive[(i, 0)] = mean;
+            out.expected_outcome[(i, 0)] = prob * mean;
         }
     }
 
@@ -1405,11 +1401,7 @@ fn normal_quantile(p: f64) -> f64 {
 }
 
 fn cluster_count(clusters: &[u64]) -> usize {
-    let mut unique = HashSet::new();
-    for &cluster in clusters {
-        unique.insert(cluster);
-    }
-    unique.len()
+    clusters.iter().collect::<HashSet<_>>().len()
 }
 
 fn covariance_from_information(information: &Mat<f64>) -> Result<Mat<f64>, TwoPartError> {
