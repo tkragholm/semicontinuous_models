@@ -6,8 +6,14 @@
 //! HC0 standard errors computed in R from `glm` fits on the same rows, and a
 //! clustered fit with one row per cluster must reproduce the unclustered sandwich.
 
-use faer::Mat;
-use semicontinuous_models::{FitOptions, ModelInput, fit_two_part_input};
+use faer::prelude::*;
+use faer::{Mat, Side};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use rand_distr::{Distribution, Gamma};
+use semicontinuous_models::{
+    FitOptions, ModelInput, TweedieOptions, fit_tweedie_input, fit_two_part_input,
+};
 
 const N_ROWS: usize = 20_000;
 
@@ -51,6 +57,36 @@ fn two_part_fixture() -> (Mat<f64>, Mat<f64>) {
         }
     }
     (x, y)
+}
+
+fn positive_rows(x: &Mat<f64>, y: &Mat<f64>) -> (Mat<f64>, Mat<f64>) {
+    let rows: Vec<usize> = (0..y.nrows()).filter(|&i| y[(i, 0)] > 0.0).collect();
+    (
+        Mat::from_fn(rows.len(), x.ncols(), |i, j| x[(rows[i], j)]),
+        Mat::from_fn(rows.len(), 1, |i, _| y[(rows[i], 0)]),
+    )
+}
+
+/// Model-based standard errors of a log-link Tweedie fit with unit dispersion,
+/// `sqrt(diag((X' diag(mu^(2 - power)) X)^-1))`. The crate reports no model-based
+/// covariance for Tweedie fits, so the test forms it here.
+fn tweedie_model_based_se(x: &Mat<f64>, beta: &Mat<f64>, power: f64) -> Vec<f64> {
+    let p = x.ncols();
+    let mut information = Mat::<f64>::zeros(p, p);
+    for i in 0..x.nrows() {
+        let eta: f64 = (0..p).map(|j| x[(i, j)] * beta[(j, 0)]).sum();
+        let weight = eta.exp().powf(2.0 - power);
+        for j in 0..p {
+            for k in 0..p {
+                information[(j, k)] += weight * x[(i, j)] * x[(i, k)];
+            }
+        }
+    }
+    let inverse = information
+        .llt(Side::Lower)
+        .expect("positive-definite information")
+        .solve(Mat::<f64>::identity(p, p));
+    (0..p).map(|j| inverse[(j, j)].sqrt()).collect()
 }
 
 fn column(m: &Mat<f64>) -> Vec<f64> {
@@ -114,6 +150,65 @@ fn two_part_singleton_clusters_reproduce_the_unclustered_sandwich() {
         "gamma",
         &column(clustered.se_gamma.as_ref().expect("SE")),
         &column(plain.se_gamma.as_ref().expect("SE")),
+        1e-9,
+    );
+}
+
+#[test]
+fn tweedie_gamma_robust_se_matches_model_based_and_r() {
+    let (x, y) = two_part_fixture();
+    let (x_pos, y_pos) = positive_rows(&x, &y);
+    let input = ModelInput::new(x_pos, y_pos);
+    let options = TweedieOptions::builder().robust_se(true).build();
+    let (model, report) = fit_tweedie_input(&input, 2.0, options).expect("fit");
+
+    let robust_se = column(report.se.as_ref().expect("robust SE"));
+    let model_se = tweedie_model_based_se(&input.design_matrix, &model.beta, 2.0);
+    assert_close(
+        "tweedie(2) robust vs model-based",
+        &robust_se,
+        &model_se,
+        0.1,
+    );
+    assert_close("tweedie(2) robust vs R", &robust_se, &R_HC0_GAMMA, 1e-6);
+}
+
+#[test]
+fn tweedie_robust_se_matches_model_based_at_power_one_and_a_half() {
+    // Gamma(shape = sqrt(mu), scale = sqrt(mu)) has mean mu and variance mu^1.5,
+    // the Tweedie variance function at power 1.5 with unit dispersion.
+    let mut stream = Stream(20_261_003);
+    let mut rng = StdRng::seed_from_u64(20_261_003);
+    let mut x = Mat::<f64>::zeros(N_ROWS, 3);
+    let mut y = Mat::<f64>::zeros(N_ROWS, 1);
+    for i in 0..N_ROWS {
+        x[(i, 0)] = 1.0;
+        x[(i, 1)] = 2.0f64.mul_add(stream.uniform(), -1.0);
+        x[(i, 2)] = if stream.uniform() < 0.3 { 1.0 } else { 0.0 };
+        let mu = 0.3f64.mul_add(x[(i, 1)], 2.0 + 0.2 * x[(i, 2)]).exp();
+        y[(i, 0)] = Gamma::new(mu.sqrt(), mu.sqrt())
+            .expect("gamma parameters")
+            .sample(&mut rng);
+    }
+    let input = ModelInput::new(x, y);
+    let options = TweedieOptions::builder().robust_se(true).build();
+    let (model, report) = fit_tweedie_input(&input, 1.5, options).expect("fit");
+    let robust_se = column(report.se.as_ref().expect("robust SE"));
+    let model_se = tweedie_model_based_se(&input.design_matrix, &model.beta, 1.5);
+    assert_close(
+        "tweedie(1.5) robust vs model-based",
+        &robust_se,
+        &model_se,
+        0.1,
+    );
+
+    let clusters: Vec<u64> = (0..N_ROWS as u64).collect();
+    let (_, clustered) =
+        fit_tweedie_input(&input.with_cluster_ids(clusters), 1.5, options).expect("clustered fit");
+    assert_close(
+        "tweedie(1.5) singleton clusters",
+        &column(clustered.se.as_ref().expect("SE")),
+        &robust_se,
         1e-9,
     );
 }

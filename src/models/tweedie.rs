@@ -543,7 +543,7 @@ fn finalize_fit(
     }
     let (cov, se, clustered, cluster_count) = if options.robust_se {
         let (cov, clustered, cluster_count) =
-            robust_covariance(x, y, &mu, &weights, clusters, &xtwx)?;
+            robust_covariance(x, y, &mu, sample_weights, power, clusters, &xtwx)?;
         let se = cov.as_ref().map(diag_sqrt);
         (cov, se, clustered, cluster_count)
     } else {
@@ -691,29 +691,27 @@ pub fn quasi_log_likelihood(y: &Mat<f64>, mu: &Mat<f64>, power: f64) -> f64 {
     if dev.is_finite() { -0.5 * dev } else { dev }
 }
 
+/// Sandwich covariance from the Tweedie log-link quasi-score.
+///
+/// Row `i` contributes `u_i = x_i * w_i * (y_i - mu_i) * (dmu/deta) / V(mu_i)` with
+/// prior weight `w_i`, `V(mu) = mu^power` and `dmu/deta = mu`, so the score residual
+/// is `w_i * (y_i - mu_i) * mu_i^(1 - power)`. The clustered and unclustered meat
+/// are built from this one residual.
 fn robust_covariance(
     x: &Mat<f64>,
     y: &Mat<f64>,
     mu: &Mat<f64>,
-    weights: &Mat<f64>,
+    sample_weights: Option<&Mat<f64>>,
+    power: f64,
     clusters: Option<&[u64]>,
     xtwx: &Mat<f64>,
 ) -> Result<RobustCovarianceResult, TweedieError> {
-    // Sandwich score per observation is the GLM estimating-equation contribution
-    //   u_i = x_i * (dμ/dη)/V(μ) * (y_i - μ_i) * base_weight.
-    // `weights` carries the FISHER weight W_i = base * (dμ/dη)²/V(μ) (= base*μ^(2-power)
-    // for this log-link Tweedie family), so the score weight is W_i/(dμ/dη) = W_i/μ_i.
-    // Using the raw response residual (y-μ)*W_i instead would inflate the meat by a
-    // factor of μ (≈ mean cost, 1e4–1e5 DKK), blowing up the robust SE — so divide by μ
-    // to use the WORKING residual. μ is exp-clamped strictly positive.
-    let (meat, cluster_count) = match clusters {
-        Some(clusters) => score_meat(
-            x,
-            |i| (y[(i, 0)] - mu[(i, 0)]) * weights[(i, 0)] / mu[(i, 0)],
-            Some(clusters),
-        ),
-        None => score_meat(x, |i| (y[(i, 0)] - mu[(i, 0)]) * weights[(i, 0)], None),
+    let score_residual = |i: usize| {
+        sample_weight_at(sample_weights, i)
+            * (y[(i, 0)] - mu[(i, 0)])
+            * mu[(i, 0)].powf(1.0 - power)
     };
+    let (meat, cluster_count) = score_meat(x, score_residual, clusters);
     let cov = sandwich(xtwx, &meat, solve_with_stabilization)?;
     Ok((Some(cov), cluster_count.is_some(), cluster_count))
 }
