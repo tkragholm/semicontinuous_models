@@ -112,7 +112,7 @@ pub(crate) fn center_beta(beta_raw: &Mat<f64>, means: &[f64]) -> Mat<f64> {
 /// non-convergence rather than silently reporting a degenerate "ok" fit.
 #[must_use]
 pub(crate) fn max_abs_linear_predictor(x: &Mat<f64>, beta: &Mat<f64>) -> f64 {
-    let eta = x * beta;
+    let eta = crate::utils::linear_predictor(x, beta);
     (0..eta.nrows()).fold(0.0_f64, |acc, i| acc.max(eta[(i, 0)].abs()))
 }
 

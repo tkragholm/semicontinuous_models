@@ -16,6 +16,7 @@
 //! standard errors, and bootstrap utilities for inference.
 
 use crate::input::{InputError, ModelInput};
+use crate::models::covariance::score_meat;
 use crate::models::matrix_ops::{
     center_beta, center_columns, map_mat, max_abs_linear_predictor, select_rows, select_values,
     uncenter_beta, weighted_column_means,
@@ -26,15 +27,15 @@ use crate::models::{
 #[cfg(feature = "bench-internals")]
 use crate::utils::weighted_xtz;
 use crate::utils::{
-    CachedFactor, add_ridge_to_diagonal, add_row_outer_product_scaled, matvec_into, max_abs_diff,
-    mean_column, mean_vector, solve_linear_system, solve_linear_system_ref, std_vector,
-    weighted_xtx, weighted_xtz_with_buffer,
+    CachedFactor, add_ridge_to_diagonal, linear_predictor, matvec_into, max_abs_diff, mean_column,
+    mean_vector, solve_linear_system, solve_linear_system_ref, std_vector, weighted_xtx,
+    weighted_xtz_with_buffer,
 };
 use faer::Mat;
 use rand::prelude::*;
 use statrs::distribution::{ContinuousCDF, Normal};
 use statrs::function::gamma::ln_gamma;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Instant;
 use thiserror::Error;
 
@@ -290,12 +291,12 @@ impl Model for TwoPartModel {
     }
 
     fn predict_into(&self, x: &Mat<f64>, out: &mut Self::Prediction) {
-        let eta_logit = x * &self.beta_logit;
+        let eta_logit = linear_predictor(x, &self.beta_logit);
         for i in 0..x.nrows() {
             out.prob_positive[(i, 0)] = 1.0 / (1.0 + (-eta_logit[(i, 0)]).exp());
         }
 
-        let eta_gamma = x * &self.beta_gamma;
+        let eta_gamma = linear_predictor(x, &self.beta_gamma);
         for i in 0..x.nrows() {
             out.mean_positive[(i, 0)] = eta_gamma[(i, 0)]
                 .clamp(-GAMMA_LOG_LINK_ETA_CLAMP, GAMMA_LOG_LINK_ETA_CLAMP)
@@ -604,18 +605,20 @@ pub(crate) fn fit_two_part_weighted(
     // se/cov optional fields exactly as an "SEs not computed" fit already reports them.
     let (cov_logit, cov_gamma) = if options.compute_covariance {
         (
-            Some(covariance_logit_weighted(
+            Some(covariance_logit(
                 x,
                 &is_positive,
                 weights,
                 &beta_logit,
+                None,
                 options,
             )?),
-            Some(covariance_gamma_weighted(
+            Some(covariance_gamma(
                 &x_pos,
                 &y_pos,
                 &w_pos,
                 &beta_gamma,
+                None,
                 options,
             )?),
         )
@@ -714,20 +717,20 @@ pub(crate) fn fit_two_part_clustered_weighted(
     let w_pos = select_values(weights, &positive_indices);
     let clusters_pos = select_cluster_ids(clusters, &positive_indices);
 
-    let cov_logit = covariance_logit_cluster_weighted(
+    let cov_logit = covariance_logit(
         x,
         &is_positive,
         weights,
         &model.beta_logit,
-        clusters,
+        Some(clusters),
         options,
     )?;
-    let cov_gamma = covariance_gamma_cluster_weighted(
+    let cov_gamma = covariance_gamma(
         &x_pos,
         &y_pos,
         &w_pos,
         &model.beta_gamma,
-        &clusters_pos,
+        Some(&clusters_pos),
         options,
     )?;
 
@@ -1075,7 +1078,7 @@ fn fit_logit_weighted(
 const LOGIT_ETA_CLAMP: f64 = 40.0;
 
 fn logit_eta(x: &Mat<f64>, beta: &Mat<f64>) -> Mat<f64> {
-    let eta = x * beta;
+    let eta = linear_predictor(x, beta);
     map_mat(&eta, |value| value.clamp(-LOGIT_ETA_CLAMP, LOGIT_ETA_CLAMP))
 }
 
@@ -1366,14 +1369,17 @@ fn soft_threshold(value: f64, penalty: f64) -> f64 {
     }
 }
 
-fn covariance_logit_weighted(
+/// Logit-part covariance: model-based, or the sandwich when `robust_se` is set, with
+/// cluster-robust meat when `clusters` is given.
+fn covariance_logit(
     x: &Mat<f64>,
     y: &Mat<f64>,
     weights: &Mat<f64>,
     beta: &Mat<f64>,
+    clusters: Option<&[u64]>,
     options: FitOptions,
 ) -> Result<Mat<f64>, TwoPartError> {
-    let eta = x * beta;
+    let eta = linear_predictor(x, beta);
     let p = logistic(&eta);
     let weights = Mat::from_fn(p.nrows(), 1, |i, _| {
         let value = p[(i, 0)] * (1.0 - p[(i, 0)]);
@@ -1393,27 +1399,24 @@ fn covariance_logit_weighted(
     let residuals = Mat::from_fn(y.nrows(), 1, |i, _| {
         (y[(i, 0)] - p[(i, 0)]) * weights[(i, 0)]
     });
-    let mut meat = Mat::<f64>::zeros(x.ncols(), x.ncols());
-    for i in 0..x.nrows() {
-        let weight = residuals[(i, 0)] * residuals[(i, 0)];
-        add_row_outer_product_scaled(&mut meat, x, i, weight);
-    }
-
+    let (meat, _) = score_meat(x, |i| residuals[(i, 0)], clusters);
     sandwich_covariance(&xtwx, &meat)
 }
 
-fn covariance_gamma_weighted(
+/// Gamma-part covariance: model-based, or the sandwich when `robust_se` is set, with
+/// cluster-robust meat when `clusters` is given.
+fn covariance_gamma(
     x: &Mat<f64>,
     y: &Mat<f64>,
     weights: &Mat<f64>,
     beta: &Mat<f64>,
+    clusters: Option<&[u64]>,
     options: FitOptions,
 ) -> Result<Mat<f64>, TwoPartError> {
-    let eta = x * beta;
+    let eta = linear_predictor(x, beta);
     let mu = map_mat(&eta, f64::exp);
 
-    let w = Mat::from_fn(mu.nrows(), 1, |i, _| weights[(i, 0)]);
-    let mut xtx = weighted_xtx(x, &w);
+    let mut xtx = weighted_xtx(x, weights);
     if let Some((lambda, exclude_intercept)) = ridge_from_regularization(options.regularization)
         && lambda > 0.0
     {
@@ -1426,107 +1429,7 @@ fn covariance_gamma_weighted(
     let residuals = Mat::from_fn(y.nrows(), 1, |i, _| {
         ((y[(i, 0)] - mu[(i, 0)]) / mu[(i, 0)]) * weights[(i, 0)]
     });
-    let mut meat = Mat::<f64>::zeros(x.ncols(), x.ncols());
-    for i in 0..x.nrows() {
-        let weight = residuals[(i, 0)] * residuals[(i, 0)];
-        // Was an inline double loop, the only one of six meat accumulations in
-        // this crate not going through the helper -- and not an equivalent
-        // spelling of it: this multiplied `x_j * x_k` and then fused the
-        // weight, where the helper scales `x_j` first and fuses `x_k`. Same
-        // quantity, different association, so the gamma part's robust
-        // covariance disagreed with the logit part's in the last bits for
-        // identical inputs.
-        add_row_outer_product_scaled(&mut meat, x, i, weight);
-    }
-
-    sandwich_covariance(&xtx, &meat)
-}
-
-fn covariance_logit_cluster_weighted(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
-    weights: &Mat<f64>,
-    beta: &Mat<f64>,
-    clusters: &[u64],
-    options: FitOptions,
-) -> Result<Mat<f64>, TwoPartError> {
-    let eta = x * beta;
-    let p = logistic(&eta);
-    let weights = Mat::from_fn(p.nrows(), 1, |i, _| {
-        let value = p[(i, 0)] * (1.0 - p[(i, 0)]);
-        (value.max(options.min_weight)) * weights[(i, 0)]
-    });
-
-    let mut xtwx = weighted_xtx(x, &weights);
-    if let Some((lambda, exclude_intercept)) = ridge_from_regularization(options.regularization)
-        && lambda > 0.0
-    {
-        add_ridge_to_diagonal(&mut xtwx, lambda, exclude_intercept);
-    }
-    let residuals = Mat::from_fn(y.nrows(), 1, |i, _| {
-        (y[(i, 0)] - p[(i, 0)]) * weights[(i, 0)]
-    });
-    let mut cluster_sums: HashMap<u64, Mat<f64>> = HashMap::new();
-    for i in 0..x.nrows() {
-        let entry = cluster_sums
-            .entry(clusters[i])
-            .or_insert_with(|| Mat::zeros(x.ncols(), 1));
-        for col in 0..x.ncols() {
-            entry[(col, 0)] = x[(i, col)].mul_add(residuals[(i, 0)], entry[(col, 0)]);
-        }
-    }
-
-    let mut meat = Mat::<f64>::zeros(x.ncols(), x.ncols());
-    for (_, sum) in cluster_sums {
-        for i in 0..x.ncols() {
-            for j in 0..x.ncols() {
-                meat[(i, j)] = sum[(i, 0)].mul_add(sum[(j, 0)], meat[(i, j)]);
-            }
-        }
-    }
-
-    sandwich_covariance(&xtwx, &meat)
-}
-
-fn covariance_gamma_cluster_weighted(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
-    weights: &Mat<f64>,
-    beta: &Mat<f64>,
-    clusters: &[u64],
-    options: FitOptions,
-) -> Result<Mat<f64>, TwoPartError> {
-    let eta = x * beta;
-    let mu = map_mat(&eta, f64::exp);
-    let residuals = Mat::from_fn(y.nrows(), 1, |i, _| {
-        ((y[(i, 0)] - mu[(i, 0)]) / mu[(i, 0)]) * weights[(i, 0)]
-    });
-
-    let mut xtx = weighted_xtx(x, weights);
-    if let Some((lambda, exclude_intercept)) = ridge_from_regularization(options.regularization)
-        && lambda > 0.0
-    {
-        add_ridge_to_diagonal(&mut xtx, lambda, exclude_intercept);
-    }
-    let mut cluster_sums: HashMap<u64, Mat<f64>> = HashMap::new();
-    for i in 0..x.nrows() {
-        let entry = cluster_sums
-            .entry(clusters[i])
-            .or_insert_with(|| Mat::zeros(x.ncols(), 1));
-        for col in 0..x.ncols() {
-            entry[(col, 0)] = x[(i, col)].mul_add(residuals[(i, 0)], entry[(col, 0)]);
-        }
-    }
-
-    let mut meat = Mat::<f64>::zeros(x.ncols(), x.ncols());
-    for (_, sum) in cluster_sums {
-        for i in 0..x.ncols() {
-            for j in 0..x.ncols() {
-                meat[(i, j)] = sum[(i, 0)].mul_add(sum[(j, 0)], meat[(i, j)]);
-            }
-        }
-    }
-
+    let (meat, _) = score_meat(x, |i| residuals[(i, 0)], clusters);
     sandwich_covariance(&xtx, &meat)
 }
 

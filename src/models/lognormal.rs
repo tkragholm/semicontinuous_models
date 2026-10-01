@@ -11,11 +11,11 @@
 //! Fits a log-normal regression on positive outcomes and applies a smearing
 //! factor for unbiased retransformation to the original scale.
 
-use std::collections::HashMap;
 use std::time::Instant;
 
 use faer::Mat;
 
+use crate::models::covariance::score_meat;
 use crate::models::matrix_ops::{map_mat, select_rows, select_values};
 use crate::models::{
     AttemptDiagnostics, AttemptOutcome, FitMetadata, FitStrategy, Model, SolverKind,
@@ -24,8 +24,8 @@ use thiserror::Error;
 
 use crate::input::{InputError, ModelInput};
 use crate::utils::{
-    add_outer_product_scaled, add_ridge_to_diagonal, add_row_outer_product_scaled, max_abs_diff,
-    mean_column, solve_linear_system, solve_linear_system_ref,
+    add_ridge_to_diagonal, linear_predictor, max_abs_diff, mean_column, row_scaled_gram,
+    solve_linear_system, solve_linear_system_ref, xt_column,
 };
 
 /// Tuning parameters for log-normal fitting.
@@ -181,7 +181,7 @@ impl Model for LogNormalModel {
     }
 
     fn predict_into(&self, x: &Mat<f64>, out: &mut Self::Prediction) {
-        let eta = x * &self.beta;
+        let eta = linear_predictor(x, &self.beta);
         for i in 0..x.nrows() {
             out.mean[(i, 0)] = self.smearing_factor * eta[(i, 0)].exp();
         }
@@ -201,7 +201,7 @@ pub fn log_likelihood(x: &Mat<f64>, y: &Mat<f64>, model: &LogNormalModel) -> f64
     if y.ncols() != 1 || x.nrows() != y.nrows() {
         return f64::NAN;
     }
-    let eta = x * &model.beta;
+    let eta = linear_predictor(x, &model.beta);
     let mut sumsq = 0.0;
     let mut n_pos = 0.0;
     for i in 0..y.nrows() {
@@ -359,9 +359,9 @@ fn fit_lognormal_with_lambda(
 
     // `xtx` and `xty` do not depend on `beta`, so they are loop-invariant;
     // compute them once and reuse for every solve and for the robust covariance.
-    let mut xtx = x_pos.transpose() * &x_pos;
+    let mut xtx = row_scaled_gram(&x_pos, |_| 1.0);
     add_ridge_to_diagonal(&mut xtx, lambda, options.l2_penalty_exclude_intercept);
-    let xty = x_pos.transpose() * &y_log;
+    let xty = xt_column(&x_pos, y_log.col_as_slice(0));
 
     for iteration in 0..options.max_iter {
         iterations = iteration + 1;
@@ -374,7 +374,7 @@ fn fit_lognormal_with_lambda(
         beta = beta_next;
     }
 
-    let eta = &x_pos * &beta;
+    let eta = linear_predictor(&x_pos, &beta);
     let residuals = Mat::from_fn(y_log.nrows(), 1, |i, _| y_log[(i, 0)] - eta[(i, 0)]);
     let smearing = mean_column(&map_mat(&residuals, f64::exp));
 
@@ -439,32 +439,9 @@ fn robust_covariance(
     clusters: Option<&[u64]>,
     xtx: &Mat<f64>,
 ) -> Result<RobustCovarianceResult, LogNormalError> {
-    let p = x.ncols();
-    let mut meat = Mat::<f64>::zeros(p, p);
-    if let Some(clusters) = clusters {
-        let mut cluster_sums: HashMap<u64, Vec<f64>> = HashMap::new();
-        for i in 0..x.nrows() {
-            let resid = residuals[(i, 0)];
-            let entry = cluster_sums
-                .entry(clusters[i])
-                .or_insert_with(|| vec![0.0; p]);
-            for j in 0..p {
-                entry[j] = resid.mul_add(x[(i, j)], entry[j]);
-            }
-        }
-        for sum in cluster_sums.values() {
-            add_outer_product_scaled(&mut meat, sum, 1.0);
-        }
-        let cov = sandwich_covariance(xtx, &meat)?;
-        return Ok((Some(cov), true, Some(cluster_sums.len())));
-    }
-
-    for i in 0..x.nrows() {
-        let resid = residuals[(i, 0)];
-        add_row_outer_product_scaled(&mut meat, x, i, resid * resid);
-    }
+    let (meat, cluster_count) = score_meat(x, |i| residuals[(i, 0)], clusters);
     let cov = sandwich_covariance(xtx, &meat)?;
-    Ok((Some(cov), false, None))
+    Ok((Some(cov), cluster_count.is_some(), cluster_count))
 }
 
 fn sandwich_covariance(xtx: &Mat<f64>, meat: &Mat<f64>) -> Result<Mat<f64>, LogNormalError> {

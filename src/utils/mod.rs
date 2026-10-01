@@ -15,8 +15,10 @@ use faer::linalg::matmul::matmul;
 use faer::linalg::matmul::triangular::{self, BlockStructure};
 use faer::linalg::solvers::{Llt, PartialPivLu};
 use faer::prelude::*;
-use faer::{Accum, Mat, MatMut, MatRef, Side, get_global_parallelism};
+use faer::{Accum, Mat, MatMut, MatRef, Par, Side};
 use num_traits::ToPrimitive;
+use rayon::prelude::*;
+use std::ops::Range;
 
 use crate::input::LongitudinalModelInput;
 use crate::models::two_part::TwoPartError;
@@ -285,49 +287,142 @@ pub fn quadratic_form_vec(vector: &[f64], matrix: &Mat<f64>) -> f64 {
     quadratic
 }
 
-#[must_use]
-pub fn weighted_xtx(x: &Mat<f64>, weights: &Mat<f64>) -> Mat<f64> {
-    let n = x.nrows();
-    let p = x.ncols();
-    // `A = sqrt(W) X`, so `X'WX = AᵀA` is symmetric positive-semidefinite. Compute only
-    // the lower triangle via a symmetric-rank-k (syrk-style) triangular matmul — half the
-    // flops of a full GEMM — then mirror it into the upper triangle so the result is
-    // exactly symmetric (better-conditioned for the downstream Cholesky).
-    let weighted_x = Mat::from_fn(n, p, |row, col| {
-        x[(row, col)] * weights[(row, 0)].max(0.0).sqrt()
-    });
-    let mut xtx = Mat::<f64>::zeros(p, p);
-    triangular::matmul(
-        xtx.as_mut(),
-        BlockStructure::TriangularLower,
-        Accum::Replace,
-        weighted_x.transpose(),
-        BlockStructure::Rectangular,
-        weighted_x.as_ref(),
-        BlockStructure::Rectangular,
-        1.0,
-        get_global_parallelism(),
-    );
-    for col in 0..p {
-        for row in (col + 1)..p {
-            xtx[(col, row)] = xtx[(row, col)];
+/// Rows per block in every sum over the rows of a design matrix.
+///
+/// Each block is reduced on one thread with faer's sequential kernels, and the block
+/// partials are added in block order. The partition depends only on the number of rows,
+/// so the result is bit-identical for any thread count and any scheduling. faer's own
+/// parallel kernels are not used for these products: its parallel matrix-vector product
+/// splits the inner dimension across threads and adds the pieces, so its result depends
+/// on the thread count.
+const ROW_BLOCK: usize = 4096;
+
+/// Sum of the `rows × cols` partials `block_term` writes for each block of `n` rows,
+/// added in block order. Blocks are evaluated in parallel.
+fn sum_over_row_blocks<F>(n: usize, rows: usize, cols: usize, block_term: F) -> Mat<f64>
+where
+    F: Fn(Range<usize>, MatMut<'_, f64>) + Sync,
+{
+    let mut total = Mat::<f64>::zeros(rows, cols);
+    if n <= ROW_BLOCK {
+        block_term(0..n, total.as_mut());
+        return total;
+    }
+    let partials: Vec<Mat<f64>> = (0..n.div_ceil(ROW_BLOCK))
+        .into_par_iter()
+        .map(|block| {
+            let mut partial = Mat::<f64>::zeros(rows, cols);
+            block_term(
+                block * ROW_BLOCK..((block + 1) * ROW_BLOCK).min(n),
+                partial.as_mut(),
+            );
+            partial
+        })
+        .collect();
+    for partial in &partials {
+        for col in 0..cols {
+            for row in 0..rows {
+                total[(row, col)] += partial[(row, col)];
+            }
         }
     }
-    xtx
+    total
+}
+
+/// `Σ_i s_i² x_i x_iᵀ` for the row scales `s_i = scale(i)`, exactly symmetric.
+///
+/// Each block forms `S X` for its rows and adds `(S X)ᵀ (S X)` through a symmetric
+/// rank-k update of the lower triangle, which is then mirrored.
+pub(crate) fn row_scaled_gram(x: &Mat<f64>, scale: impl Fn(usize) -> f64 + Sync) -> Mat<f64> {
+    let p = x.ncols();
+    let mut gram = sum_over_row_blocks(x.nrows(), p, p, |rows, out| {
+        let start = rows.start;
+        let scaled = Mat::from_fn(rows.len(), p, |row, col| {
+            x[(start + row, col)] * scale(start + row)
+        });
+        triangular::matmul(
+            out,
+            BlockStructure::TriangularLower,
+            Accum::Replace,
+            scaled.transpose(),
+            BlockStructure::Rectangular,
+            scaled.as_ref(),
+            BlockStructure::Rectangular,
+            1.0,
+            Par::Seq,
+        );
+    });
+    for col in 0..p {
+        for row in (col + 1)..p {
+            gram[(col, row)] = gram[(row, col)];
+        }
+    }
+    gram
+}
+
+/// `Xᵀ v` for a column `v` of the same length as `X`.
+pub(crate) fn xt_column(x: &Mat<f64>, v: &[f64]) -> Mat<f64> {
+    sum_over_row_blocks(x.nrows(), x.ncols(), 1, |rows, out| {
+        let start = rows.start;
+        let len = rows.len();
+        let block = MatRef::from_column_major_slice(&v[rows], len, 1);
+        matmul(
+            out,
+            Accum::Replace,
+            x.as_ref().subrows(start, len).transpose(),
+            block,
+            1.0,
+            Par::Seq,
+        );
+    })
+}
+
+/// `X'WX` with the weights floored at zero, exactly symmetric.
+#[must_use]
+pub fn weighted_xtx(x: &Mat<f64>, weights: &Mat<f64>) -> Mat<f64> {
+    row_scaled_gram(x, |row| weights[(row, 0)].max(0.0).sqrt())
 }
 
 /// In-place matrix-vector product `dst <- x * beta`, reusing `dst`'s storage so an
 /// IRLS loop does not allocate a fresh linear-predictor column every iteration.
+///
+/// Rows are split into fixed blocks, so each element is the same sequential sum over
+/// the columns whatever the thread count.
 pub(crate) fn matvec_into(dst: &mut Mat<f64>, x: &Mat<f64>, beta: &Mat<f64>) {
-    let target: MatMut<'_, f64> = dst.as_mut();
-    matmul(
-        target,
-        Accum::Replace,
-        x.as_ref(),
-        beta.as_ref(),
-        1.0,
-        get_global_parallelism(),
-    );
+    let n = x.nrows();
+    if n <= ROW_BLOCK {
+        matmul(
+            dst.as_mut(),
+            Accum::Replace,
+            x.as_ref(),
+            beta.as_ref(),
+            1.0,
+            Par::Seq,
+        );
+        return;
+    }
+    dst.col_as_slice_mut(0)
+        .par_chunks_mut(ROW_BLOCK)
+        .enumerate()
+        .for_each(|(block, chunk)| {
+            let len = chunk.len();
+            matmul(
+                MatMut::from_column_major_slice_mut(chunk, len, 1),
+                Accum::Replace,
+                x.as_ref().subrows(block * ROW_BLOCK, len),
+                beta.as_ref(),
+                1.0,
+                Par::Seq,
+            );
+        });
+}
+
+/// The linear predictor `x * beta`, computed as in [`matvec_into`].
+#[must_use]
+pub(crate) fn linear_predictor(x: &Mat<f64>, beta: &Mat<f64>) -> Mat<f64> {
+    let mut eta = Mat::<f64>::zeros(x.nrows(), 1);
+    matvec_into(&mut eta, x, beta);
+    eta
 }
 
 #[must_use]
@@ -350,8 +445,7 @@ pub fn weighted_xtz_with_buffer(
     for row in 0..n {
         weighted_buffer[row] = weights[(row, 0)] * response[(row, 0)];
     }
-    let weighted_response = MatRef::from_column_major_slice(&weighted_buffer[..n], n, 1);
-    x.transpose() * weighted_response
+    xt_column(x, &weighted_buffer[..n])
 }
 
 /// Add a scaled outer-product row contribution to a sandwich "meat" matrix.

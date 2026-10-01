@@ -12,12 +12,12 @@
 //! The Tweedie power (p) should be in [1, 2] to allow exact zeros with
 //! continuous positive outcomes.
 
-use std::collections::HashMap;
 use std::time::Instant;
 
 use faer::{Mat, MatRef};
 
 use crate::input::{InputError, ModelInput};
+use crate::models::covariance::score_meat;
 use crate::models::matrix_ops::{
     center_beta, center_columns, map_mat, max_abs_linear_predictor, uncenter_beta,
     weighted_column_means,
@@ -26,9 +26,9 @@ use crate::models::{
     AttemptDiagnostics, AttemptOutcome, FitMetadata, FitStrategy, Model, SolverKind,
 };
 use crate::utils::{
-    CachedFactor, add_outer_product_scaled, add_ridge_to_diagonal, add_row_outer_product_scaled,
-    constant_irls_weights, matvec_into, max_abs_diff, solve_linear_system, solve_linear_system_ref,
-    weighted_xtx, weighted_xtz_with_buffer,
+    CachedFactor, add_ridge_to_diagonal, constant_irls_weights, linear_predictor, matvec_into,
+    max_abs_diff, solve_linear_system, solve_linear_system_ref, weighted_xtx,
+    weighted_xtz_with_buffer,
 };
 
 const LINEAR_PREDICTOR_CLIP: f64 = 30.0;
@@ -179,7 +179,7 @@ impl Model for TweedieModel {
     }
 
     fn predict_into(&self, x: &Mat<f64>, out: &mut Self::Prediction) {
-        let eta = x * &self.beta;
+        let eta = linear_predictor(x, &self.beta);
         for i in 0..x.nrows() {
             out.mean[(i, 0)] = exp_clamped(eta[(i, 0)]);
         }
@@ -571,7 +571,7 @@ fn finalize_fit(
     if max_abs_linear_predictor(x, &beta_final) >= LINEAR_PREDICTOR_CLIP {
         return Err(TweedieError::NonConvergence);
     }
-    let eta = x * &beta_final;
+    let eta = linear_predictor(x, &beta_final);
     let mu = map_mat(&eta, exp_clamped);
     let weights = Mat::from_fn(mu.nrows(), 1, |i, _| {
         let base_weight = sample_weight_at(sample_weights, i);
@@ -744,8 +744,6 @@ fn robust_covariance(
     clusters: Option<&[u64]>,
     xtwx: &Mat<f64>,
 ) -> Result<RobustCovarianceResult, TweedieError> {
-    let p = x.ncols();
-    let mut meat = Mat::<f64>::zeros(p, p);
     // Sandwich score per observation is the GLM estimating-equation contribution
     //   u_i = x_i * (dμ/dη)/V(μ) * (y_i - μ_i) * base_weight.
     // `weights` carries the FISHER weight W_i = base * (dμ/dη)²/V(μ) (= base*μ^(2-power)
@@ -753,30 +751,16 @@ fn robust_covariance(
     // Using the raw response residual (y-μ)*W_i instead would inflate the meat by a
     // factor of μ (≈ mean cost, 1e4–1e5 DKK), blowing up the robust SE — so divide by μ
     // to use the WORKING residual. μ is exp-clamped strictly positive.
-    if let Some(clusters) = clusters {
-        let mut cluster_sums: HashMap<u64, Vec<f64>> = HashMap::new();
-        for i in 0..x.nrows() {
-            let resid = (y[(i, 0)] - mu[(i, 0)]) * weights[(i, 0)] / mu[(i, 0)];
-            let entry = cluster_sums
-                .entry(clusters[i])
-                .or_insert_with(|| vec![0.0; p]);
-            for j in 0..p {
-                entry[j] = resid.mul_add(x[(i, j)], entry[j]);
-            }
-        }
-        for sum in cluster_sums.values() {
-            add_outer_product_scaled(&mut meat, sum, 1.0);
-        }
-        let cov = sandwich_covariance(xtwx, &meat)?;
-        return Ok((Some(cov), true, Some(cluster_sums.len())));
-    }
-
-    for i in 0..x.nrows() {
-        let resid = (y[(i, 0)] - mu[(i, 0)]) * weights[(i, 0)];
-        add_row_outer_product_scaled(&mut meat, x, i, resid * resid);
-    }
+    let (meat, cluster_count) = match clusters {
+        Some(clusters) => score_meat(
+            x,
+            |i| (y[(i, 0)] - mu[(i, 0)]) * weights[(i, 0)] / mu[(i, 0)],
+            Some(clusters),
+        ),
+        None => score_meat(x, |i| (y[(i, 0)] - mu[(i, 0)]) * weights[(i, 0)], None),
+    };
     let cov = sandwich_covariance(xtwx, &meat)?;
-    Ok((Some(cov), false, None))
+    Ok((Some(cov), cluster_count.is_some(), cluster_count))
 }
 
 fn sandwich_covariance(xtwx: &Mat<f64>, meat: &Mat<f64>) -> Result<Mat<f64>, TweedieError> {

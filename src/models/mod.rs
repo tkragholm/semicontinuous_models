@@ -2,6 +2,7 @@ use faer::Mat;
 use std::time::Duration;
 
 pub mod comparison;
+pub(crate) mod covariance;
 pub mod lognormal;
 pub mod matrix_ops;
 pub mod mtp;
