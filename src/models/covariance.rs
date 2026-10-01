@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use faer::Mat;
+use faer::{Mat, MatRef};
 
 use crate::utils::row_scaled_gram;
 
@@ -38,4 +38,19 @@ pub(crate) fn score_meat(
     let n_clusters = index_of.len();
     let sums = Mat::from_fn(n_clusters, p, |group, col| sums[group * p + col]);
     (row_scaled_gram(&sums, |_| 1.0), Some(n_clusters))
+}
+/// `A⁻¹ M A⁻ᵀ` for the information matrix `A` and meat `M`, through two solves.
+pub(crate) fn sandwich<E>(
+    information: &Mat<f64>,
+    meat: &Mat<f64>,
+    solve: impl Fn(MatRef<'_, f64>, MatRef<'_, f64>) -> Result<Mat<f64>, E>,
+) -> Result<Mat<f64>, E> {
+    let left = solve(information.as_ref(), meat.as_ref())?;
+    let cov_t = solve(information.transpose(), left.transpose())?;
+    Ok(cov_t.transpose().to_owned())
+}
+
+/// Standard errors from a covariance matrix, with negative variances read as zero.
+pub(crate) fn diag_sqrt(cov: &Mat<f64>) -> Mat<f64> {
+    Mat::from_fn(cov.nrows(), 1, |i, _| cov[(i, i)].max(0.0).sqrt())
 }

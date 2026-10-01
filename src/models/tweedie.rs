@@ -17,7 +17,7 @@ use std::time::Instant;
 use faer::{Mat, MatRef};
 
 use crate::input::{InputError, ModelInput};
-use crate::models::covariance::score_meat;
+use crate::models::covariance::{diag_sqrt, sandwich, score_meat};
 use crate::models::matrix_ops::{
     center_beta, center_columns, map_mat, max_abs_linear_predictor, uncenter_beta,
     weighted_column_means,
@@ -585,7 +585,7 @@ fn finalize_fit(
     let (cov, se, clustered, cluster_count) = if options.robust_se {
         let (cov, clustered, cluster_count) =
             robust_covariance(x, y, &mu, &weights, clusters, &xtwx)?;
-        let se = cov.as_ref().map(diagonal_sqrt);
+        let se = cov.as_ref().map(diag_sqrt);
         (cov, se, clustered, cluster_count)
     } else {
         (None, None, false, None)
@@ -732,10 +732,6 @@ pub fn quasi_log_likelihood(y: &Mat<f64>, mu: &Mat<f64>, power: f64) -> f64 {
     if dev.is_finite() { -0.5 * dev } else { dev }
 }
 
-fn diagonal_sqrt(cov: &Mat<f64>) -> Mat<f64> {
-    Mat::from_fn(cov.nrows(), 1, |i, _| cov[(i, i)].max(0.0).sqrt())
-}
-
 fn robust_covariance(
     x: &Mat<f64>,
     y: &Mat<f64>,
@@ -759,14 +755,8 @@ fn robust_covariance(
         ),
         None => score_meat(x, |i| (y[(i, 0)] - mu[(i, 0)]) * weights[(i, 0)], None),
     };
-    let cov = sandwich_covariance(xtwx, &meat)?;
+    let cov = sandwich(xtwx, &meat, solve_with_stabilization_view)?;
     Ok((Some(cov), cluster_count.is_some(), cluster_count))
-}
-
-fn sandwich_covariance(xtwx: &Mat<f64>, meat: &Mat<f64>) -> Result<Mat<f64>, TweedieError> {
-    let left = solve_with_stabilization(xtwx, meat)?;
-    let cov_t = solve_with_stabilization_view(xtwx.transpose(), left.transpose())?;
-    Ok(cov_t.transpose().to_owned())
 }
 
 /// Returns the accepted step's `(beta, deviance)`. The deviance is the one already

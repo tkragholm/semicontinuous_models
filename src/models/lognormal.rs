@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use faer::Mat;
 
-use crate::models::covariance::score_meat;
+use crate::models::covariance::{diag_sqrt, sandwich, score_meat};
 use crate::models::matrix_ops::{map_mat, select_rows, select_values};
 use crate::models::{
     AttemptDiagnostics, AttemptOutcome, FitMetadata, FitStrategy, Model, SolverKind,
@@ -381,7 +381,7 @@ fn fit_lognormal_with_lambda(
     let (cov, se, clustered, cluster_count) = if options.robust_se {
         let (cov, clustered, cluster_count) =
             robust_covariance(&x_pos, &residuals, cluster_ids_pos.as_deref(), &xtx)?;
-        let se = cov.as_ref().map(diagonal_sqrt);
+        let se = cov.as_ref().map(diag_sqrt);
         (cov, se, clustered, cluster_count)
     } else {
         (None, None, false, None)
@@ -429,10 +429,6 @@ pub fn fit_lognormal_smearing_input(
     )
 }
 
-fn diagonal_sqrt(cov: &Mat<f64>) -> Mat<f64> {
-    Mat::from_fn(cov.nrows(), 1, |i, _| cov[(i, i)].max(0.0).sqrt())
-}
-
 fn robust_covariance(
     x: &Mat<f64>,
     residuals: &Mat<f64>,
@@ -440,15 +436,10 @@ fn robust_covariance(
     xtx: &Mat<f64>,
 ) -> Result<RobustCovarianceResult, LogNormalError> {
     let (meat, cluster_count) = score_meat(x, |i| residuals[(i, 0)], clusters);
-    let cov = sandwich_covariance(xtx, &meat)?;
+    let cov = sandwich(xtx, &meat, |lhs, rhs| {
+        solve_linear_system_ref(lhs, rhs).map_err(|_| LogNormalError::SolveFailed)
+    })?;
     Ok((Some(cov), cluster_count.is_some(), cluster_count))
-}
-
-fn sandwich_covariance(xtx: &Mat<f64>, meat: &Mat<f64>) -> Result<Mat<f64>, LogNormalError> {
-    let left = solve_linear_system(xtx, meat).map_err(|_| LogNormalError::SolveFailed)?;
-    let cov_t = solve_linear_system_ref(xtx.transpose(), left.transpose())
-        .map_err(|_| LogNormalError::SolveFailed)?;
-    Ok(cov_t.transpose().to_owned())
 }
 
 /// High-level interface for fitting log-normal models.

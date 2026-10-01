@@ -16,7 +16,7 @@
 //! standard errors, and bootstrap utilities for inference.
 
 use crate::input::{InputError, ModelInput};
-use crate::models::covariance::score_meat;
+use crate::models::covariance::{diag_sqrt, sandwich, score_meat};
 use crate::models::matrix_ops::{
     center_beta, center_columns, map_mat, max_abs_linear_predictor, select_rows, select_values,
     uncenter_beta, weighted_column_means,
@@ -1400,7 +1400,7 @@ fn covariance_logit(
         (y[(i, 0)] - p[(i, 0)]) * weights[(i, 0)]
     });
     let (meat, _) = score_meat(x, |i| residuals[(i, 0)], clusters);
-    sandwich_covariance(&xtwx, &meat)
+    sandwich(&xtwx, &meat, solve_linear_system_ref)
 }
 
 /// Gamma-part covariance: model-based, or the sandwich when `robust_se` is set, with
@@ -1430,13 +1430,7 @@ fn covariance_gamma(
         ((y[(i, 0)] - mu[(i, 0)]) / mu[(i, 0)]) * weights[(i, 0)]
     });
     let (meat, _) = score_meat(x, |i| residuals[(i, 0)], clusters);
-    sandwich_covariance(&xtx, &meat)
-}
-
-fn diag_sqrt(covariance: &Mat<f64>) -> Mat<f64> {
-    Mat::from_fn(covariance.nrows(), 1, |i, _| {
-        covariance[(i, i)].max(0.0).sqrt()
-    })
+    sandwich(&xtx, &meat, solve_linear_system_ref)
 }
 
 #[cfg(feature = "bench-internals")]
@@ -1460,13 +1454,6 @@ fn cluster_count(clusters: &[u64]) -> usize {
 fn covariance_from_information(information: &Mat<f64>) -> Result<Mat<f64>, TwoPartError> {
     let identity = Mat::<f64>::identity(information.nrows(), information.ncols());
     solve_linear_system(information, &identity).map_err(|_| TwoPartError::SolveFailed)
-}
-
-fn sandwich_covariance(information: &Mat<f64>, meat: &Mat<f64>) -> Result<Mat<f64>, TwoPartError> {
-    let left = solve_linear_system(information, meat).map_err(|_| TwoPartError::SolveFailed)?;
-    let cov_t = solve_linear_system_ref(information.transpose(), left.transpose())
-        .map_err(|_| TwoPartError::SolveFailed)?;
-    Ok(cov_t.transpose().to_owned())
 }
 
 /// High-level interface for fitting two-part models.
