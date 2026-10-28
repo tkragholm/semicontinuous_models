@@ -27,9 +27,9 @@ pub use trainer::TwoPartTrainer;
 use covariance::{covariance_gamma, covariance_logit};
 use irls::{GAMMA_LOG_LINK_ETA_CLAMP, fit_gamma_log_link_weighted, fit_logit_weighted};
 
-use crate::input::{InputError, ModelInput};
+use crate::input::{InputError, ModelInput, ModelInputRef};
 use crate::models::covariance::diag_sqrt;
-use crate::models::matrix_ops::{select_rows, select_values};
+use crate::models::matrix_ops::{select_rows_ref, select_values_ref};
 use crate::models::{
     AttemptDiagnostics, FitMetadata, FitStrategy, Model, RetryableError, SolverKind,
     run_with_retries,
@@ -37,7 +37,7 @@ use crate::models::{
 use crate::utils::linear_predictor;
 #[cfg(feature = "bench-internals")]
 use crate::utils::weighted_xtz;
-use faer::Mat;
+use faer::{Mat, MatRef};
 use statrs::distribution::{ContinuousCDF, Normal};
 use statrs::function::gamma::ln_gamma;
 use std::collections::HashSet;
@@ -285,6 +285,35 @@ pub struct TwoPartReport {
     pub attempts: Vec<AttemptDiagnostics>,
 }
 
+impl TwoPartModel {
+    /// The mean of the predicted outcome over the rows of `x`, without forming the
+    /// predictions.
+    ///
+    /// With `weights` this is `Σ w_i m_i / Σ w_i` over the rows with `w_i != 0`, with
+    /// `None` it is the plain mean. It is bit-identical to averaging the column that
+    /// [`Model::predict`] returns in row order. Only blocks of the linear predictors
+    /// are held in memory.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `weights` is given and is not as long as `x` has rows.
+    #[must_use]
+    pub fn predict_mean(&self, x: &Mat<f64>, weights: Option<&[f64]>) -> f64 {
+        crate::utils::mean_of_row_values(
+            x.as_ref(),
+            [&self.beta_logit, &self.beta_gamma],
+            weights,
+            |[eta_logit, eta_gamma]| {
+                let prob = 1.0 / (1.0 + (-eta_logit).exp());
+                let mean = eta_gamma
+                    .clamp(-GAMMA_LOG_LINK_ETA_CLAMP, GAMMA_LOG_LINK_ETA_CLAMP)
+                    .exp();
+                prob * mean
+            },
+        )
+    }
+}
+
 impl Model for TwoPartModel {
     type Prediction = TwoPartPrediction;
     type Report = TwoPartReport;
@@ -296,8 +325,8 @@ impl Model for TwoPartModel {
     }
 
     fn predict_into(&self, x: &Mat<f64>, out: &mut Self::Prediction) {
-        let eta_logit = linear_predictor(x, &self.beta_logit);
-        let eta_gamma = linear_predictor(x, &self.beta_gamma);
+        let eta_logit = linear_predictor(x.as_ref(), &self.beta_logit);
+        let eta_gamma = linear_predictor(x.as_ref(), &self.beta_gamma);
         for i in 0..x.nrows() {
             let prob = 1.0 / (1.0 + (-eta_logit[(i, 0)]).exp());
             let mean = eta_gamma[(i, 0)]
@@ -377,12 +406,12 @@ pub struct BootstrapSummary {
 ///
 /// Returns `TwoPartError` if inputs are malformed or the solver fails to converge.
 pub(crate) fn fit_two_part(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
+    x: MatRef<'_, f64>,
+    y: MatRef<'_, f64>,
     options: FitOptions,
 ) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
     let weights = Mat::from_fn(y.nrows(), 1, |_, _| 1.0);
-    fit_two_part_weighted(x, y, &weights, options, None)
+    fit_two_part_weighted(x, y, weights.as_ref(), options, None)
 }
 
 /// Full-sample coefficients used to warm-start a bootstrap replicate's two-part IRLS.
@@ -424,8 +453,56 @@ pub fn fit_two_part_input_warm(
     options: FitOptions,
     warm: Option<&TwoPartWarmStart>,
 ) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
-    input.validate()?;
+    fit_two_part_ref_warm(input.as_ref(), options, warm)
+}
 
+/// Fit a two-part model from a [`ModelInputRef`], warm-starting the IRLS from `warm`.
+///
+/// This is the fit that [`fit_two_part_input_warm`] runs on [`ModelInput::as_ref`], so
+/// the two give bit-identical results for the same data. The design matrix and the
+/// outcome are only read, so a caller that fits many replicates of one sample can hold
+/// them once and vary the sample weights.
+///
+/// # Errors
+///
+/// Returns `TwoPartError` if inputs are malformed or the solver fails to converge.
+pub fn fit_two_part_ref_warm(
+    input: ModelInputRef<'_>,
+    options: FitOptions,
+    warm: Option<&TwoPartWarmStart>,
+) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
+    input.validate()?;
+    fit_two_part_ref_validated(input, options, warm)
+}
+
+/// [`fit_two_part_ref_warm`] for a caller that has already validated the design matrix
+/// and the outcome.
+///
+/// It checks the sample weights and the cluster labels, which a caller that varies
+/// them has to, and skips the scans of the design matrix and the outcome for
+/// non-finite and negative values. The result is the same as that of
+/// [`fit_two_part_ref_warm`] whenever [`ModelInputRef::validate_core`] holds for
+/// `input`. When it does not, the result is unspecified: the fit may return an error
+/// or a non-finite model, or panic on a mismatched shape.
+///
+/// # Errors
+///
+/// Returns `TwoPartError` if the weights or the cluster labels are malformed or the
+/// solver fails to converge.
+pub fn fit_two_part_ref_warm_prevalidated(
+    input: ModelInputRef<'_>,
+    options: FitOptions,
+    warm: Option<&TwoPartWarmStart>,
+) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
+    input.validate_weights_and_clusters()?;
+    fit_two_part_ref_validated(input, options, warm)
+}
+
+fn fit_two_part_ref_validated(
+    input: ModelInputRef<'_>,
+    options: FitOptions,
+    warm: Option<&TwoPartWarmStart>,
+) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
     let start_time = Instant::now();
     let retried = run_with_retries(
         options,
@@ -446,29 +523,29 @@ pub fn fit_two_part_input_warm(
             Regularization::BayesianRidge { prior_scale, .. } => 1.0 / (prior_scale * prior_scale),
             Regularization::None => 0.0,
         },
-        |current_options| match (&input.sample_weights, &input.cluster_ids) {
+        |current_options| match (input.sample_weights, input.cluster_ids) {
             (Some(weights), Some(clusters)) => fit_two_part_clustered_weighted(
-                &input.design_matrix,
-                &input.outcome,
+                input.design_matrix,
+                input.outcome,
                 weights,
                 clusters,
                 current_options,
                 warm,
             ),
             (Some(weights), None) => fit_two_part_weighted(
-                &input.design_matrix,
-                &input.outcome,
+                input.design_matrix,
+                input.outcome,
                 weights,
                 current_options,
                 warm,
             ),
             (None, Some(clusters)) => fit_two_part_clustered(
-                &input.design_matrix,
-                &input.outcome,
+                input.design_matrix,
+                input.outcome,
                 clusters,
                 current_options,
             ),
-            (None, None) => fit_two_part(&input.design_matrix, &input.outcome, current_options),
+            (None, None) => fit_two_part(input.design_matrix, input.outcome, current_options),
         },
     )?;
 
@@ -525,9 +602,9 @@ pub fn fit_two_part_clustered_input(
 ///
 /// Returns `TwoPartError` if inputs are malformed or the solver fails to converge.
 pub(crate) fn fit_two_part_weighted(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
-    weights: &Mat<f64>,
+    x: MatRef<'_, f64>,
+    y: MatRef<'_, f64>,
+    weights: MatRef<'_, f64>,
     options: FitOptions,
     warm: Option<&TwoPartWarmStart>,
 ) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
@@ -536,7 +613,7 @@ pub(crate) fn fit_two_part_weighted(
     let is_positive = Mat::from_fn(y.nrows(), 1, |i, _| if y[(i, 0)] > 0.0 { 1.0 } else { 0.0 });
     let (beta_logit, iterations_logit) = fit_logit_weighted(
         x,
-        &is_positive,
+        is_positive.as_ref(),
         weights,
         options,
         warm.map(|w| &w.beta_logit),
@@ -548,16 +625,21 @@ pub(crate) fn fit_two_part_weighted(
         return Err(TwoPartError::NonPositiveOutcome);
     }
 
-    let x_pos = select_rows(x, &positive_indices);
-    let y_pos = select_values(y, &positive_indices);
-    let w_pos = select_values(weights, &positive_indices);
+    let x_pos = select_rows_ref(x, &positive_indices);
+    let y_pos = select_values_ref(y, &positive_indices);
+    let w_pos = select_values_ref(weights, &positive_indices);
 
     if (0..y_pos.nrows()).any(|i| y_pos[(i, 0)] <= 0.0) {
         return Err(TwoPartError::NonPositiveOutcome);
     }
 
-    let (beta_gamma, iterations_gamma) =
-        fit_gamma_log_link_weighted(&x_pos, &y_pos, &w_pos, options, warm.map(|w| &w.beta_gamma))?;
+    let (beta_gamma, iterations_gamma) = fit_gamma_log_link_weighted(
+        x_pos.as_ref(),
+        y_pos.as_ref(),
+        w_pos.as_ref(),
+        options,
+        warm.map(|w| &w.beta_gamma),
+    )?;
 
     // The model-based covariance is computed only when requested. The clustered
     // bootstrap disables it (it reads only the coefficients), and the cluster-robust
@@ -568,16 +650,16 @@ pub(crate) fn fit_two_part_weighted(
         (
             Some(covariance_logit(
                 x,
-                &is_positive,
+                is_positive.as_ref(),
                 weights,
                 &beta_logit,
                 None,
                 options,
             )?),
             Some(covariance_gamma(
-                &x_pos,
-                &y_pos,
-                &w_pos,
+                x_pos.as_ref(),
+                y_pos.as_ref(),
+                w_pos.as_ref(),
                 &beta_gamma,
                 None,
                 options,
@@ -644,13 +726,13 @@ pub(crate) fn fit_two_part_weighted(
 ///
 /// Returns `TwoPartError` if inputs are malformed or the solver fails to converge.
 pub(crate) fn fit_two_part_clustered(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
+    x: MatRef<'_, f64>,
+    y: MatRef<'_, f64>,
     clusters: &[u64],
     options: FitOptions,
 ) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
     let weights = Mat::from_fn(y.nrows(), 1, |_, _| 1.0);
-    fit_two_part_clustered_weighted(x, y, &weights, clusters, options, None)
+    fit_two_part_clustered_weighted(x, y, weights.as_ref(), clusters, options, None)
 }
 
 /// Fit a weighted two-part model with cluster-robust covariance.
@@ -659,9 +741,9 @@ pub(crate) fn fit_two_part_clustered(
 ///
 /// Returns `TwoPartError` if inputs are malformed or the solver fails to converge.
 pub(crate) fn fit_two_part_clustered_weighted(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
-    weights: &Mat<f64>,
+    x: MatRef<'_, f64>,
+    y: MatRef<'_, f64>,
+    weights: MatRef<'_, f64>,
     clusters: &[u64],
     options: FitOptions,
     warm: Option<&TwoPartWarmStart>,
@@ -673,23 +755,23 @@ pub(crate) fn fit_two_part_clustered_weighted(
 
     let is_positive = Mat::from_fn(y.nrows(), 1, |i, _| if y[(i, 0)] > 0.0 { 1.0 } else { 0.0 });
     let positive_indices: Vec<usize> = (0..y.nrows()).filter(|&idx| y[(idx, 0)] > 0.0).collect();
-    let x_pos = select_rows(x, &positive_indices);
-    let y_pos = select_values(y, &positive_indices);
-    let w_pos = select_values(weights, &positive_indices);
+    let x_pos = select_rows_ref(x, &positive_indices);
+    let y_pos = select_values_ref(y, &positive_indices);
+    let w_pos = select_values_ref(weights, &positive_indices);
     let clusters_pos = select_cluster_ids(clusters, &positive_indices);
 
     let cov_logit = covariance_logit(
         x,
-        &is_positive,
+        is_positive.as_ref(),
         weights,
         &model.beta_logit,
         Some(clusters),
         options,
     )?;
     let cov_gamma = covariance_gamma(
-        &x_pos,
-        &y_pos,
-        &w_pos,
+        x_pos.as_ref(),
+        y_pos.as_ref(),
+        w_pos.as_ref(),
         &model.beta_gamma,
         Some(&clusters_pos),
         options,
@@ -821,7 +903,8 @@ mod tests {
             }
         }
 
-        let (model, report) = fit_two_part(&x, &y, FitOptions::default()).expect("fit");
+        let (model, report) =
+            fit_two_part(x.as_ref(), y.as_ref(), FitOptions::default()).expect("fit");
         assert!(report.iterations_logit > 0);
         assert!(report.iterations_gamma > 0);
         assert!(report.se_logit.is_some());
@@ -862,7 +945,7 @@ mod tests {
             ..FitOptions::default()
         };
 
-        let (_model, report) = fit_two_part(&x, &y, options).expect("fit");
+        let (_model, report) = fit_two_part(x.as_ref(), y.as_ref(), options).expect("fit");
         assert!(report.iterations_logit > 0 || report.iterations_gamma > 0);
         if robust_se {
             assert!(report.se_logit.is_some());
@@ -880,7 +963,7 @@ mod tests {
         );
         let y = Mat::from_fn(n, 1, |i, _| 1.0 + usize_to_f64(i) / 100.0);
 
-        let (_model, report) = fit_two_part(&x, &y, FitOptions::default())
+        let (_model, report) = fit_two_part(x.as_ref(), y.as_ref(), FitOptions::default())
             .expect("all-positive outcomes should still fit");
         assert_eq!(report.iterations_logit, 0);
         assert!(report.iterations_gamma > 0);
@@ -908,9 +991,14 @@ mod tests {
         });
         let w = Mat::from_fn(n, 1, |_, _| 1.0);
 
-        let (beta, iterations) =
-            fit_gamma_log_link_weighted(&x, &y, &w, FitOptions::stable_defaults(), None)
-                .expect("heavy-tailed gamma fit should converge");
+        let (beta, iterations) = fit_gamma_log_link_weighted(
+            x.as_ref(),
+            y.as_ref(),
+            w.as_ref(),
+            FitOptions::stable_defaults(),
+            None,
+        )
+        .expect("heavy-tailed gamma fit should converge");
         assert!(iterations >= 1);
         assert!(
             crate::utils::matrix_is_finite(&beta),
@@ -932,8 +1020,8 @@ mod tests {
             },
         );
         let y = Mat::from_fn(n, 1, |i, _| 10.0 + usize_to_f64(i));
-        let (model, _report) =
-            fit_two_part(&x, &y, FitOptions::stable_defaults()).expect("benign fit");
+        let (model, _report) = fit_two_part(x.as_ref(), y.as_ref(), FitOptions::stable_defaults())
+            .expect("benign fit");
 
         let x_extreme = Mat::from_fn(1, 2, |_, j| if j == 0 { 1.0 } else { 1.0e6 });
         let prediction = model.predict(&x_extreme);
@@ -1111,7 +1199,8 @@ mod tests {
             regularization: Regularization::None,
             ..FitOptions::default()
         };
-        let (_model, report) = fit_two_part_clustered(&x, &y, &clusters, options).expect("fit");
+        let (_model, report) =
+            fit_two_part_clustered(x.as_ref(), y.as_ref(), &clusters, options).expect("fit");
         assert!(report.clustered);
         assert!(report.cluster_count.unwrap_or(0) > 1);
         assert!(report.se_logit.is_some());
@@ -1154,9 +1243,10 @@ mod tests {
             ..FitOptions::default()
         };
 
-        let (model_a, report_a) = fit_two_part(&x, &y, with_cov).expect("fit with covariance");
+        let (model_a, report_a) =
+            fit_two_part(x.as_ref(), y.as_ref(), with_cov).expect("fit with covariance");
         let (model_b, report_b) =
-            fit_two_part(&x, &y, without_cov).expect("fit without covariance");
+            fit_two_part(x.as_ref(), y.as_ref(), without_cov).expect("fit without covariance");
 
         // Coefficients are identical — the optimization only removes discarded work.
         for j in 0..model_a.beta_logit.nrows() {

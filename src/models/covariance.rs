@@ -13,7 +13,7 @@ use crate::utils::row_scaled_gram;
 /// returned alongside. Score sums are accumulated in row order and clusters are
 /// kept in order of first appearance, so the meat does not depend on hashing.
 pub(crate) fn score_meat(
-    x: &Mat<f64>,
+    x: MatRef<'_, f64>,
     residual: impl Fn(usize) -> f64 + Sync,
     clusters: Option<&[u64]>,
 ) -> (Mat<f64>, Option<usize>) {
@@ -37,7 +37,7 @@ pub(crate) fn score_meat(
     }
     let n_clusters = index_of.len();
     let sums = Mat::from_fn(n_clusters, p, |group, col| sums[group * p + col]);
-    (row_scaled_gram(&sums, |_| 1.0), Some(n_clusters))
+    (row_scaled_gram(sums.as_ref(), |_| 1.0), Some(n_clusters))
 }
 /// `A⁻¹ M A⁻ᵀ` for the information matrix `A` and meat `M`, through two solves.
 pub(crate) fn sandwich<E>(

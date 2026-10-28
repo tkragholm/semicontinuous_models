@@ -171,6 +171,26 @@ impl LogNormalPrediction {
 
 type RobustCovarianceResult = (Option<Mat<f64>>, bool, Option<usize>);
 
+impl LogNormalModel {
+    /// The mean of the predicted outcome over the rows of `x`, without forming the
+    /// predictions.
+    ///
+    /// With `weights` this is `Σ w_i m_i / Σ w_i` over the rows with `w_i != 0`, with
+    /// `None` it is the plain mean. It is bit-identical to averaging the column that
+    /// [`Model::predict`] returns in row order. Only blocks of the linear predictors
+    /// are held in memory.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `weights` is given and is not as long as `x` has rows.
+    #[must_use]
+    pub fn predict_mean(&self, x: &Mat<f64>, weights: Option<&[f64]>) -> f64 {
+        crate::utils::mean_of_row_values(x.as_ref(), [&self.beta], weights, |[eta]| {
+            self.smearing_factor * eta.exp()
+        })
+    }
+}
+
 impl Model for LogNormalModel {
     type Prediction = LogNormalPrediction;
     type Report = LogNormalReport;
@@ -182,7 +202,7 @@ impl Model for LogNormalModel {
     }
 
     fn predict_into(&self, x: &Mat<f64>, out: &mut Self::Prediction) {
-        let eta = linear_predictor(x, &self.beta);
+        let eta = linear_predictor(x.as_ref(), &self.beta);
         for i in 0..x.nrows() {
             out.mean[(i, 0)] = self.smearing_factor * eta[(i, 0)].exp();
         }
@@ -202,7 +222,7 @@ pub fn log_likelihood(x: &Mat<f64>, y: &Mat<f64>, model: &LogNormalModel) -> f64
     if y.ncols() != 1 || x.nrows() != y.nrows() {
         return f64::NAN;
     }
-    let eta = linear_predictor(x, &model.beta);
+    let eta = linear_predictor(x.as_ref(), &model.beta);
     let mut sumsq = 0.0;
     let mut n_pos = 0.0;
     for i in 0..y.nrows() {
@@ -323,9 +343,9 @@ fn fit_lognormal_with_lambda(
 
     // `xtx` and `xty` do not depend on `beta`, so they are loop-invariant;
     // compute them once and reuse for every solve and for the robust covariance.
-    let mut xtx = row_scaled_gram(&x_pos, |_| 1.0);
+    let mut xtx = row_scaled_gram(x_pos.as_ref(), |_| 1.0);
     add_ridge_to_diagonal(&mut xtx, lambda, options.l2_penalty_exclude_intercept);
-    let xty = xt_column(&x_pos, y_log.col_as_slice(0));
+    let xty = xt_column(x_pos.as_ref(), y_log.col_as_slice(0));
 
     for iteration in 0..options.max_iter {
         iterations = iteration + 1;
@@ -338,7 +358,7 @@ fn fit_lognormal_with_lambda(
         beta = beta_next;
     }
 
-    let eta = linear_predictor(&x_pos, &beta);
+    let eta = linear_predictor(x_pos.as_ref(), &beta);
     let residuals = Mat::from_fn(y_log.nrows(), 1, |i, _| y_log[(i, 0)] - eta[(i, 0)]);
     let smearing = mean_column(&map_mat(&residuals, f64::exp));
 
@@ -399,7 +419,7 @@ fn robust_covariance(
     clusters: Option<&[u64]>,
     xtx: &Mat<f64>,
 ) -> Result<RobustCovarianceResult, LogNormalError> {
-    let (meat, cluster_count) = score_meat(x, |i| residuals[(i, 0)], clusters);
+    let (meat, cluster_count) = score_meat(x.as_ref(), |i| residuals[(i, 0)], clusters);
     let cov = sandwich(xtx, &meat, |lhs, rhs| {
         solve_linear_system_ref(lhs, rhs).map_err(|_| LogNormalError::SolveFailed)
     })?;

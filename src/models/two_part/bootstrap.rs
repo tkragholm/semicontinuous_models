@@ -45,7 +45,7 @@ pub fn bootstrap(
             .collect::<Vec<_>>();
         let x_sample = select_rows(x, &indices);
         let y_sample = select_values(y, &indices);
-        match fit_two_part(&x_sample, &y_sample, options) {
+        match fit_two_part(x_sample.as_ref(), y_sample.as_ref(), options) {
             Ok((model, _)) => {
                 betas_logit.push(model.beta_logit);
                 betas_gamma.push(model.beta_gamma);

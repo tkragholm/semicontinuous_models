@@ -35,11 +35,11 @@
 //! assert!(input.validate().is_err());
 //! ```
 
-use faer::Mat;
+use faer::{Mat, MatRef};
 use std::collections::HashSet;
 use thiserror::Error;
 
-use crate::utils::matrix_is_finite;
+use crate::utils::{col_slice, matrix_ref_is_finite};
 
 pub mod counterfactual;
 pub mod longitudinal;
@@ -187,6 +187,97 @@ impl ModelInput {
         self.column_labels.as_ref()
     }
 
+    /// A borrowed view of this input.
+    #[must_use]
+    pub fn as_ref(&self) -> ModelInputRef<'_> {
+        ModelInputRef {
+            design_matrix: self.design_matrix.as_ref(),
+            outcome: self.outcome.as_ref(),
+            sample_weights: self.sample_weights.as_ref().map(Mat::as_ref),
+            cluster_ids: self.cluster_ids.as_deref(),
+            column_labels: self.column_labels.as_deref(),
+        }
+    }
+
+    /// Validate design matrix and outcome only.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InputError` if core inputs are malformed.
+    pub fn validate_core(&self) -> Result<(), InputError> {
+        self.as_ref().validate_core()
+    }
+
+    /// Validate shapes and values for design matrix, outcome, weights, and clusters.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InputError` if inputs are malformed.
+    pub fn validate(&self) -> Result<(), InputError> {
+        self.as_ref().validate()
+    }
+}
+
+/// A model input that borrows its matrices.
+///
+/// It holds the same fields as [`ModelInput`] as views, so the design matrix and the
+/// outcome of a full sample can be shared by many fits while the weights, or the
+/// cluster labels, change from one fit to the next. The `*_ref` fit functions
+/// ([`fit_two_part_ref_warm`](crate::fit_two_part_ref_warm),
+/// [`fit_tweedie_ref_warm`](crate::fit_tweedie_ref_warm)) take it, and the fit
+/// functions that take a [`ModelInput`] call them on [`ModelInput::as_ref`], so both
+/// give the same result for the same data.
+///
+/// ```
+/// use faer::Mat;
+/// use semicontinuous_models::{ModelInput, ModelInputRef};
+///
+/// let design = Mat::from_fn(3, 1, |_, _| 1.0);
+/// let outcome = Mat::from_fn(3, 1, |i, _| i as f64);
+/// let weights = Mat::from_fn(3, 1, |_, _| 2.0);
+/// let input = ModelInputRef::new(design.as_ref(), outcome.as_ref())
+///     .with_sample_weights(weights.as_ref());
+/// assert!(input.validate().is_ok());
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct ModelInputRef<'a> {
+    pub design_matrix: MatRef<'a, f64>,
+    pub outcome: MatRef<'a, f64>,
+    pub sample_weights: Option<MatRef<'a, f64>>,
+    pub cluster_ids: Option<&'a [u64]>,
+    pub column_labels: Option<&'a [String]>,
+}
+
+impl<'a> ModelInputRef<'a> {
+    #[must_use]
+    pub const fn new(design_matrix: MatRef<'a, f64>, outcome: MatRef<'a, f64>) -> Self {
+        Self {
+            design_matrix,
+            outcome,
+            sample_weights: None,
+            cluster_ids: None,
+            column_labels: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_sample_weights(mut self, sample_weights: MatRef<'a, f64>) -> Self {
+        self.sample_weights = Some(sample_weights);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_cluster_ids(mut self, cluster_ids: &'a [u64]) -> Self {
+        self.cluster_ids = Some(cluster_ids);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_column_labels(mut self, labels: &'a [String]) -> Self {
+        self.column_labels = Some(labels);
+        self
+    }
+
     /// Validate design matrix and outcome only.
     ///
     /// # Errors
@@ -205,17 +296,17 @@ impl ModelInput {
                 len: self.outcome.nrows(),
             });
         }
-        if !matrix_is_finite(&self.design_matrix) {
+        if !matrix_ref_is_finite(self.design_matrix) {
             return Err(InputError::NonFiniteDesign);
         }
-        if !matrix_is_finite(&self.outcome) {
+        if !matrix_ref_is_finite(self.outcome) {
             return Err(InputError::NonFiniteOutcome);
         }
-        if (0..self.outcome.nrows()).any(|i| self.outcome[(i, 0)] < 0.0) {
+        if col_slice(self.outcome, 0).iter().any(|&value| value < 0.0) {
             return Err(InputError::NegativeOutcome);
         }
 
-        if let Some(labels) = &self.column_labels {
+        if let Some(labels) = self.column_labels {
             if labels.len() != self.design_matrix.ncols() {
                 return Err(InputError::InvalidLabelLength {
                     labels: labels.len(),
@@ -233,25 +324,28 @@ impl ModelInput {
         Ok(())
     }
 
-    /// Validate shapes and values for design matrix, outcome, weights, and clusters.
+    /// Validate the sample weights and cluster labels only.
+    ///
+    /// This is the part of [`validate`](Self::validate) that depends on the weights, so
+    /// a caller that has run [`validate_core`](Self::validate_core) on a design and
+    /// outcome and then varies the weights checks just these.
     ///
     /// # Errors
     ///
-    /// Returns `InputError` if inputs are malformed.
-    pub fn validate(&self) -> Result<(), InputError> {
-        self.validate_core()?;
-        if let Some(weights) = &self.sample_weights {
+    /// Returns `InputError` if the weights or the cluster labels are malformed.
+    pub fn validate_weights_and_clusters(&self) -> Result<(), InputError> {
+        if let Some(weights) = self.sample_weights {
             if weights.ncols() != 1 || weights.nrows() != self.outcome.nrows() {
                 return Err(InputError::InvalidWeightShape);
             }
-            if !matrix_is_finite(weights) {
+            if !matrix_ref_is_finite(weights) {
                 return Err(InputError::NonFiniteWeights);
             }
-            if (0..weights.nrows()).any(|i| weights[(i, 0)] <= 0.0) {
+            if col_slice(weights, 0).iter().any(|&value| value <= 0.0) {
                 return Err(InputError::NonPositiveWeights);
             }
         }
-        if let Some(clusters) = &self.cluster_ids
+        if let Some(clusters) = self.cluster_ids
             && clusters.len() != self.outcome.nrows()
         {
             return Err(InputError::InvalidClusterLength {
@@ -260,6 +354,16 @@ impl ModelInput {
             });
         }
         Ok(())
+    }
+
+    /// Validate shapes and values for design matrix, outcome, weights, and clusters.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InputError` if inputs are malformed.
+    pub fn validate(&self) -> Result<(), InputError> {
+        self.validate_core()?;
+        self.validate_weights_and_clusters()
     }
 }
 

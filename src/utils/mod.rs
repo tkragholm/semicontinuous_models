@@ -169,12 +169,21 @@ impl CachedFactor {
 /// is `1.0` (above `min_weight`), so the weight is precisely `base_weight` with no
 /// flooring of the prior weight itself — matched here.
 #[must_use]
-pub(crate) fn constant_irls_weights(sample_weights: Option<&Mat<f64>>, n_rows: usize) -> Mat<f64> {
+pub(crate) fn constant_irls_weights(
+    sample_weights: Option<MatRef<'_, f64>>,
+    n_rows: usize,
+) -> Mat<f64> {
     Mat::from_fn(n_rows, 1, |i, _| sample_weights.map_or(1.0, |w| w[(i, 0)]))
 }
 
 #[must_use]
 pub fn mean_column(vector: &Mat<f64>) -> f64 {
+    mean_column_ref(vector.as_ref())
+}
+
+/// [`mean_column`] on a borrowed column.
+#[must_use]
+pub fn mean_column_ref(vector: MatRef<'_, f64>) -> f64 {
     let mut sum = 0.0;
     for i in 0..vector.nrows() {
         sum += vector[(i, 0)];
@@ -224,9 +233,29 @@ pub fn std_vector(betas: &[Mat<f64>], mean: &Mat<f64>) -> Mat<f64> {
     variance
 }
 
+/// The contiguous slice behind column `j` of a column-major view.
+///
+/// # Panics
+///
+/// Panics if the view's rows are not contiguous.
+#[must_use]
+pub(crate) fn col_slice<'a>(matrix: MatRef<'a, f64>, j: usize) -> &'a [f64] {
+    matrix
+        .col(j)
+        .try_as_col_major()
+        .expect("column-major view")
+        .as_slice()
+}
+
 #[must_use]
 pub fn matrix_is_finite(matrix: &Mat<f64>) -> bool {
-    (0..matrix.ncols()).all(|j| matrix.col_as_slice(j).iter().all(|value| value.is_finite()))
+    matrix_ref_is_finite(matrix.as_ref())
+}
+
+/// [`matrix_is_finite`] on a borrowed matrix.
+#[must_use]
+pub fn matrix_ref_is_finite(matrix: MatRef<'_, f64>) -> bool {
+    (0..matrix.ncols()).all(|j| col_slice(matrix, j).iter().all(|value| value.is_finite()))
 }
 
 #[must_use]
@@ -326,7 +355,7 @@ where
 ///
 /// Each block forms `S X` for its rows and adds `(S X)ᵀ (S X)` through a symmetric
 /// rank-k update of the lower triangle, which is then mirrored.
-pub(crate) fn row_scaled_gram(x: &Mat<f64>, scale: impl Fn(usize) -> f64 + Sync) -> Mat<f64> {
+pub(crate) fn row_scaled_gram(x: MatRef<'_, f64>, scale: impl Fn(usize) -> f64 + Sync) -> Mat<f64> {
     let p = x.ncols();
     let mut gram = sum_over_row_blocks(x.nrows(), p, p, |rows, out| {
         let start = rows.start;
@@ -356,7 +385,7 @@ pub(crate) fn row_scaled_gram(x: &Mat<f64>, scale: impl Fn(usize) -> f64 + Sync)
 }
 
 /// `Xᵀ v` for a column `v` of the same length as `X`.
-pub(crate) fn xt_column(x: &Mat<f64>, v: &[f64]) -> Mat<f64> {
+pub(crate) fn xt_column(x: MatRef<'_, f64>, v: &[f64]) -> Mat<f64> {
     sum_over_row_blocks(x.nrows(), x.ncols(), 1, |rows, out| {
         let start = rows.start;
         let len = rows.len();
@@ -375,6 +404,12 @@ pub(crate) fn xt_column(x: &Mat<f64>, v: &[f64]) -> Mat<f64> {
 /// `X'WX` with the weights floored at zero, exactly symmetric.
 #[must_use]
 pub fn weighted_xtx(x: &Mat<f64>, weights: &Mat<f64>) -> Mat<f64> {
+    weighted_xtx_ref(x.as_ref(), weights.as_ref())
+}
+
+/// [`weighted_xtx`] on borrowed matrices.
+#[must_use]
+pub fn weighted_xtx_ref(x: MatRef<'_, f64>, weights: MatRef<'_, f64>) -> Mat<f64> {
     row_scaled_gram(x, |row| weights[(row, 0)].max(0.0).sqrt())
 }
 
@@ -383,7 +418,7 @@ pub fn weighted_xtx(x: &Mat<f64>, weights: &Mat<f64>) -> Mat<f64> {
 ///
 /// Rows are split into fixed blocks, so each element is the same sequential sum over
 /// the columns whatever the thread count.
-pub(crate) fn matvec_into(dst: &mut Mat<f64>, x: &Mat<f64>, beta: &Mat<f64>) {
+pub(crate) fn matvec_into(dst: &mut Mat<f64>, x: MatRef<'_, f64>, beta: &Mat<f64>) {
     let n = x.nrows();
     if n <= ROW_BLOCK {
         matmul(
@@ -412,9 +447,69 @@ pub(crate) fn matvec_into(dst: &mut Mat<f64>, x: &Mat<f64>, beta: &Mat<f64>) {
         });
 }
 
+/// The mean over the rows of `x` of `row_mean(eta_1, .., eta_K)`, where `eta_k` is the
+/// row's linear predictor under `betas[k]`, without forming a column of length `n`.
+///
+/// The linear predictors are formed block by block with the products and the block
+/// partition of [`matvec_into`], so each is bit-identical to the one [`linear_predictor`]
+/// gives. The row values are then added in row order, which is the order of
+/// [`Iterator::sum`] over the rows. With `weights` the mean is `Σ w_i m_i / Σ w_i` over
+/// the rows with `w_i != 0`, accumulated in row order, and without it `Σ m_i / n`.
+///
+/// # Panics
+///
+/// Panics if `weights` is given and is not as long as `x` has rows.
+pub(crate) fn mean_of_row_values<const K: usize>(
+    x: MatRef<'_, f64>,
+    betas: [&Mat<f64>; K],
+    weights: Option<&[f64]>,
+    row_mean: impl Fn([f64; K]) -> f64,
+) -> f64 {
+    let n = x.nrows();
+    if let Some(weights) = weights {
+        assert_eq!(weights.len(), n, "one weight per row");
+    }
+    let mut buffers = [(); K].map(|()| vec![0.0_f64; n.min(ROW_BLOCK)]);
+    // `Iterator::sum` starts a float sum at -0.0, the weighted fold at 0.0.
+    let mut sum = if weights.is_some() { 0.0 } else { -0.0_f64 };
+    let mut total = 0.0_f64;
+    let mut start = 0;
+    while start < n {
+        let len = ROW_BLOCK.min(n - start);
+        for (buffer, beta) in buffers.iter_mut().zip(betas) {
+            matmul(
+                MatMut::from_column_major_slice_mut(&mut buffer[..len], len, 1),
+                Accum::Replace,
+                x.subrows(start, len),
+                beta.as_ref(),
+                1.0,
+                Par::Seq,
+            );
+        }
+        for offset in 0..len {
+            let value = row_mean(std::array::from_fn(|k| buffers[k][offset]));
+            match weights {
+                None => sum += value,
+                Some(weights) => {
+                    let weight = weights[start + offset];
+                    if weight != 0.0 {
+                        sum += weight * value;
+                        total += weight;
+                    }
+                }
+            }
+        }
+        start += len;
+    }
+    match weights {
+        None => sum / n as f64,
+        Some(_) => sum / total,
+    }
+}
+
 /// The linear predictor `x * beta`, computed as in [`matvec_into`].
 #[must_use]
-pub(crate) fn linear_predictor(x: &Mat<f64>, beta: &Mat<f64>) -> Mat<f64> {
+pub(crate) fn linear_predictor(x: MatRef<'_, f64>, beta: &Mat<f64>) -> Mat<f64> {
     let mut eta = Mat::<f64>::zeros(x.nrows(), 1);
     matvec_into(&mut eta, x, beta);
     eta
@@ -431,6 +526,22 @@ pub fn weighted_xtz_with_buffer(
     x: &Mat<f64>,
     weights: &Mat<f64>,
     response: &Mat<f64>,
+    weighted_buffer: &mut Vec<f64>,
+) -> Mat<f64> {
+    weighted_xtz_ref_with_buffer(
+        x.as_ref(),
+        weights.as_ref(),
+        response.as_ref(),
+        weighted_buffer,
+    )
+}
+
+/// [`weighted_xtz_with_buffer`] on borrowed matrices.
+#[must_use]
+pub fn weighted_xtz_ref_with_buffer(
+    x: MatRef<'_, f64>,
+    weights: MatRef<'_, f64>,
+    response: MatRef<'_, f64>,
     weighted_buffer: &mut Vec<f64>,
 ) -> Mat<f64> {
     let n = x.nrows();

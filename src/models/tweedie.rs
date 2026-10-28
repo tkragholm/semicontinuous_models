@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use faer::{Mat, MatRef};
 
-use crate::input::{InputError, ModelInput};
+use crate::input::{InputError, ModelInput, ModelInputRef};
 use crate::models::covariance::{diag_sqrt, sandwich, score_meat};
 use crate::models::matrix_ops::{
     center_beta, center_columns, map_mat, max_abs_linear_predictor, uncenter_beta,
@@ -28,7 +28,7 @@ use crate::models::{
 };
 use crate::utils::{
     CachedFactor, add_ridge_to_diagonal, constant_irls_weights, linear_predictor, matvec_into,
-    max_abs_diff, solve_linear_system_ref, weighted_xtx, weighted_xtz_with_buffer,
+    max_abs_diff, solve_linear_system_ref, weighted_xtx_ref, weighted_xtz_ref_with_buffer,
 };
 
 const LINEAR_PREDICTOR_CLIP: f64 = 30.0;
@@ -168,6 +168,26 @@ impl TweediePrediction {
 
 type RobustCovarianceResult = (Option<Mat<f64>>, bool, Option<usize>);
 
+impl TweedieModel {
+    /// The mean of the predicted outcome over the rows of `x`, without forming the
+    /// predictions.
+    ///
+    /// With `weights` this is `Σ w_i m_i / Σ w_i` over the rows with `w_i != 0`, with
+    /// `None` it is the plain mean. It is bit-identical to averaging the column that
+    /// [`Model::predict`] returns in row order. Only blocks of the linear predictors
+    /// are held in memory.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `weights` is given and is not as long as `x` has rows.
+    #[must_use]
+    pub fn predict_mean(&self, x: &Mat<f64>, weights: Option<&[f64]>) -> f64 {
+        crate::utils::mean_of_row_values(x.as_ref(), [&self.beta], weights, |[eta]| {
+            exp_clamped(eta)
+        })
+    }
+}
+
 impl Model for TweedieModel {
     type Prediction = TweediePrediction;
     type Report = TweedieReport;
@@ -179,7 +199,7 @@ impl Model for TweedieModel {
     }
 
     fn predict_into(&self, x: &Mat<f64>, out: &mut Self::Prediction) {
-        let eta = linear_predictor(x, &self.beta);
+        let eta = linear_predictor(x.as_ref(), &self.beta);
         for i in 0..x.nrows() {
             out.mean[(i, 0)] = exp_clamped(eta[(i, 0)]);
         }
@@ -197,8 +217,8 @@ impl Model for TweedieModel {
 /// Returns `TweedieError` if inputs are malformed or the solver fails.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn fit_tweedie(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
+    x: MatRef<'_, f64>,
+    y: MatRef<'_, f64>,
     clusters: Option<&[u64]>,
     power: f64,
     options: TweedieOptions,
@@ -209,9 +229,9 @@ pub(crate) fn fit_tweedie(
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn fit_tweedie_weighted(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
-    sample_weights: Option<&Mat<f64>>,
+    x: MatRef<'_, f64>,
+    y: MatRef<'_, f64>,
+    sample_weights: Option<MatRef<'_, f64>>,
     clusters: Option<&[u64]>,
     power: f64,
     options: TweedieOptions,
@@ -250,7 +270,7 @@ fn fit_tweedie_weighted(
         });
     }
     if !assume_validated
-        && (!crate::utils::matrix_is_finite(x) || !crate::utils::matrix_is_finite(y))
+        && (!crate::utils::matrix_ref_is_finite(x) || !crate::utils::matrix_ref_is_finite(y))
     {
         return Err(TweedieError::NonFiniteInput);
     }
@@ -297,9 +317,9 @@ impl RetryableError for TweedieError {
 
 #[derive(Clone, Copy)]
 struct TweedieFitRequest<'a> {
-    x: &'a Mat<f64>,
-    y: &'a Mat<f64>,
-    sample_weights: Option<&'a Mat<f64>>,
+    x: MatRef<'a, f64>,
+    y: MatRef<'a, f64>,
+    sample_weights: Option<MatRef<'a, f64>>,
     clusters: Option<&'a [u64]>,
     power: f64,
     options: TweedieOptions,
@@ -331,10 +351,10 @@ fn fit_tweedie_with_lambda(
     // marginal standardisation) on the original design exactly as before.
     let col_means = weighted_column_means(x, sample_weights);
     let centered_storage;
-    let cx: &Mat<f64> = match &col_means {
+    let cx: MatRef<'_, f64> = match &col_means {
         Some(means) => {
             centered_storage = center_columns(x, means);
-            &centered_storage
+            centered_storage.as_ref()
         }
         None => x,
     };
@@ -356,7 +376,7 @@ fn fit_tweedie_with_lambda(
     // so the β-path is identical to rebuilding it each iteration.
     let constant_weight = if (2.0 - power).abs() < 1e-12 {
         let weights = constant_irls_weights(sample_weights, cx.nrows());
-        let mut xtwx = weighted_xtx(cx, &weights);
+        let mut xtwx = weighted_xtx_ref(cx, weights.as_ref());
         if lambda > 0.0 {
             add_ridge_to_diagonal(&mut xtwx, lambda, options.l2_penalty_exclude_intercept);
         }
@@ -402,12 +422,13 @@ fn fit_tweedie_with_lambda(
 
         let beta_candidate = if let Some((weights, factor)) = &constant_weight {
             // Constant-weight path: reuse the cached factor; only the RHS changes.
-            let xtw_rhs = weighted_xtz_with_buffer(cx, weights, &z, &mut xtz_buffer);
+            let xtw_rhs =
+                weighted_xtz_ref_with_buffer(cx, weights.as_ref(), z.as_ref(), &mut xtz_buffer);
             match factor.solve(xtw_rhs.as_ref()) {
                 Ok(candidate) => candidate,
                 Err(_) => {
                     // Pathological RHS: stabilized solve on the (constant) matrix.
-                    let mut xtwx = weighted_xtx(cx, weights);
+                    let mut xtwx = weighted_xtx_ref(cx, weights.as_ref());
                     if lambda > 0.0 {
                         add_ridge_to_diagonal(
                             &mut xtwx,
@@ -426,11 +447,16 @@ fn fit_tweedie_with_lambda(
                 let w = mu[(i, 0)].powf(2.0 - power).max(options.min_weight);
                 weight_buffer[(i, 0)] = base_weight * w;
             }
-            let mut xtwx = weighted_xtx(cx, &weight_buffer);
+            let mut xtwx = weighted_xtx_ref(cx, weight_buffer.as_ref());
             if lambda > 0.0 {
                 add_ridge_to_diagonal(&mut xtwx, lambda, options.l2_penalty_exclude_intercept);
             }
-            let xtw_rhs = weighted_xtz_with_buffer(cx, &weight_buffer, &z, &mut xtz_buffer);
+            let xtw_rhs = weighted_xtz_ref_with_buffer(
+                cx,
+                weight_buffer.as_ref(),
+                z.as_ref(),
+                &mut xtz_buffer,
+            );
             solve_with_stabilization(xtwx.as_ref(), xtw_rhs.as_ref())?
         };
 
@@ -477,9 +503,9 @@ fn fit_tweedie_with_lambda(
 }
 
 fn initial_beta(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
-    sample_weights: Option<&Mat<f64>>,
+    x: MatRef<'_, f64>,
+    y: MatRef<'_, f64>,
+    sample_weights: Option<MatRef<'_, f64>>,
     min_weight: f64,
 ) -> Mat<f64> {
     let mut beta = Mat::<f64>::zeros(x.ncols(), 1);
@@ -499,8 +525,8 @@ fn initial_beta(
 }
 
 fn validate_sample_weights(
-    y: &Mat<f64>,
-    sample_weights: Option<&Mat<f64>>,
+    y: MatRef<'_, f64>,
+    sample_weights: Option<MatRef<'_, f64>>,
 ) -> Result<(), TweedieError> {
     let Some(weights) = sample_weights else {
         return Ok(());
@@ -508,7 +534,7 @@ fn validate_sample_weights(
     if weights.ncols() != 1 || weights.nrows() != y.nrows() {
         return Err(TweedieError::InvalidWeightShape);
     }
-    if !crate::utils::matrix_is_finite(weights) {
+    if !crate::utils::matrix_ref_is_finite(weights) {
         return Err(TweedieError::NonFiniteWeights);
     }
     if (0..weights.nrows()).any(|i| weights[(i, 0)] <= 0.0) {
@@ -517,15 +543,15 @@ fn validate_sample_weights(
     Ok(())
 }
 
-fn sample_weight_at(sample_weights: Option<&Mat<f64>>, row: usize) -> f64 {
+fn sample_weight_at(sample_weights: Option<MatRef<'_, f64>>, row: usize) -> f64 {
     sample_weights.map_or(1.0, |weights| weights[(row, 0)])
 }
 
 #[allow(clippy::too_many_arguments)]
 fn finalize_fit(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
-    sample_weights: Option<&Mat<f64>>,
+    x: MatRef<'_, f64>,
+    y: MatRef<'_, f64>,
+    sample_weights: Option<MatRef<'_, f64>>,
     clusters: Option<&[u64]>,
     power: f64,
     options: TweedieOptions,
@@ -553,7 +579,7 @@ fn finalize_fit(
             let w = mu[(i, 0)].powf(2.0 - power).max(options.min_weight);
             base_weight * w
         });
-        let mut xtwx = weighted_xtx(x, &weights);
+        let mut xtwx = weighted_xtx_ref(x, weights.as_ref());
         if lambda > 0.0 {
             add_ridge_to_diagonal(&mut xtwx, lambda, options.l2_penalty_exclude_intercept);
         }
@@ -614,15 +640,69 @@ pub fn fit_tweedie_input_warm(
     options: TweedieOptions,
     initial_beta: Option<&Mat<f64>>,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
+    fit_tweedie_ref_warm(input.as_ref(), power, options, initial_beta)
+}
+
+/// Fit a Tweedie GLM from a [`ModelInputRef`], warm-starting the IRLS from `initial_beta`.
+///
+/// This is the fit that [`fit_tweedie_input_warm`] runs on [`ModelInput::as_ref`], so
+/// the two give bit-identical results for the same data. The design matrix and the
+/// outcome are only read, so a caller that fits many replicates of one sample can hold
+/// them once and vary the sample weights.
+///
+/// # Errors
+///
+/// Returns `TweedieError` if inputs are malformed or the solver fails.
+pub fn fit_tweedie_ref_warm(
+    input: ModelInputRef<'_>,
+    power: f64,
+    options: TweedieOptions,
+    initial_beta: Option<&Mat<f64>>,
+) -> Result<(TweedieModel, TweedieReport), TweedieError> {
     input.validate().map_err(TweedieError::from)?;
+    fit_tweedie_ref_validated(input, power, options, initial_beta)
+}
+
+/// [`fit_tweedie_ref_warm`] for a caller that has already validated the design matrix
+/// and the outcome.
+///
+/// It checks the sample weights and the cluster labels, which a caller that varies
+/// them has to, and skips the scans of the design matrix and the outcome for
+/// non-finite and negative values. The result is the same as that of
+/// [`fit_tweedie_ref_warm`] whenever [`ModelInputRef::validate_core`] holds for
+/// `input`. When it does not, the result is unspecified: the fit may return an error
+/// or a non-finite model, or panic on a mismatched shape.
+///
+/// # Errors
+///
+/// Returns `TweedieError` if the weights or the cluster labels are malformed or the
+/// solver fails.
+pub fn fit_tweedie_ref_warm_prevalidated(
+    input: ModelInputRef<'_>,
+    power: f64,
+    options: TweedieOptions,
+    initial_beta: Option<&Mat<f64>>,
+) -> Result<(TweedieModel, TweedieReport), TweedieError> {
+    input
+        .validate_weights_and_clusters()
+        .map_err(TweedieError::from)?;
+    fit_tweedie_ref_validated(input, power, options, initial_beta)
+}
+
+fn fit_tweedie_ref_validated(
+    input: ModelInputRef<'_>,
+    power: f64,
+    options: TweedieOptions,
+    initial_beta: Option<&Mat<f64>>,
+) -> Result<(TweedieModel, TweedieReport), TweedieError> {
     fit_tweedie_weighted(
-        &input.design_matrix,
-        &input.outcome,
-        input.sample_weights.as_ref(),
-        input.cluster_ids.as_deref(),
+        input.design_matrix,
+        input.outcome,
+        input.sample_weights,
+        input.cluster_ids,
         power,
         options,
-        // input.validate() above already scanned finiteness + negativity.
+        // The caller has scanned finiteness and negativity of the design and outcome.
         true,
         initial_beta,
     )
@@ -638,14 +718,14 @@ pub fn deviance(y: &Mat<f64>, mu: &Mat<f64>, power: f64) -> f64 {
         return f64::NAN;
     }
 
-    weighted_deviance(y, mu, power, None)
+    weighted_deviance(y.as_ref(), mu, power, None)
 }
 
 fn weighted_deviance(
-    y: &Mat<f64>,
+    y: MatRef<'_, f64>,
     mu: &Mat<f64>,
     power: f64,
-    sample_weights: Option<&Mat<f64>>,
+    sample_weights: Option<MatRef<'_, f64>>,
 ) -> f64 {
     // Closed-form endpoint for p = 1 (Poisson deviance limit).
     if (power - 1.0).abs() < 1e-12 {
@@ -713,10 +793,10 @@ pub fn quasi_log_likelihood(y: &Mat<f64>, mu: &Mat<f64>, power: f64) -> f64 {
 /// is `w_i * (y_i - mu_i) * mu_i^(1 - power)`. The clustered and unclustered meat
 /// are built from this one residual.
 fn robust_covariance(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
+    x: MatRef<'_, f64>,
+    y: MatRef<'_, f64>,
     mu: &Mat<f64>,
-    sample_weights: Option<&Mat<f64>>,
+    sample_weights: Option<MatRef<'_, f64>>,
     power: f64,
     clusters: Option<&[u64]>,
     xtwx: &Mat<f64>,
@@ -739,9 +819,9 @@ fn robust_covariance(
 /// iteration (the value is identical — same beta, same deviance function).
 #[allow(clippy::too_many_arguments)]
 fn backtracking_update(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
-    sample_weights: Option<&Mat<f64>>,
+    x: MatRef<'_, f64>,
+    y: MatRef<'_, f64>,
+    sample_weights: Option<MatRef<'_, f64>>,
     beta_current: &Mat<f64>,
     beta_candidate: &Mat<f64>,
     current_deviance: f64,
@@ -799,9 +879,9 @@ fn backtracking_update(
 /// Deviance at `beta`, reusing the caller's `scratch_eta`/`scratch_mu` columns so the
 /// line search allocates nothing per trial step.
 fn trial_deviance(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
-    sample_weights: Option<&Mat<f64>>,
+    x: MatRef<'_, f64>,
+    y: MatRef<'_, f64>,
+    sample_weights: Option<MatRef<'_, f64>>,
     beta: &Mat<f64>,
     power: f64,
     scratch_eta: &mut Mat<f64>,
@@ -994,7 +1074,7 @@ mod tests {
             }
         });
         let (model, _report) =
-            fit_tweedie(&x, &y, None, 1.5, TweedieOptions::default()).expect("fit");
+            fit_tweedie(x.as_ref(), y.as_ref(), None, 1.5, TweedieOptions::default()).expect("fit");
         let pred = model.predict(&x);
         assert_eq!(pred.mean.nrows(), n);
         let dev = deviance(&y, &pred.mean, 1.5);
@@ -1041,7 +1121,7 @@ mod tests {
         });
 
         let (model, _report) =
-            fit_tweedie(&x, &y, None, 2.0, TweedieOptions::default()).expect("fit");
+            fit_tweedie(x.as_ref(), y.as_ref(), None, 2.0, TweedieOptions::default()).expect("fit");
 
         let mean_exposed = mean_of(&model.predict(&set_exposure(&x, 1.0)).mean);
         let mean_unexposed = mean_of(&model.predict(&set_exposure(&x, 0.0)).mean);
@@ -1079,9 +1159,9 @@ mod tests {
         });
 
         let (model, _report) =
-            fit_tweedie(&x, &y, None, 2.0, TweedieOptions::default()).expect("fit");
+            fit_tweedie(x.as_ref(), y.as_ref(), None, 2.0, TweedieOptions::default()).expect("fit");
 
-        let max_abs_eta = max_abs_linear_predictor(&x, &model.beta);
+        let max_abs_eta = max_abs_linear_predictor(x.as_ref(), &model.beta);
         assert!(
             max_abs_eta < LINEAR_PREDICTOR_CLIP,
             "linear predictor reached the clamp: max|eta| = {max_abs_eta}"
@@ -1104,7 +1184,7 @@ mod tests {
         let n = 50;
         let x = Mat::from_fn(n, 1, |_, _| 1.0); // intercept-only
         let y = Mat::from_fn(n, 1, |_, _| 34.0_f64.exp());
-        let result = fit_tweedie(&x, &y, None, 2.0, TweedieOptions::default());
+        let result = fit_tweedie(x.as_ref(), y.as_ref(), None, 2.0, TweedieOptions::default());
         assert!(
             result.is_err(),
             "a fit that can only converge at a saturated linear predictor must fail loudly"
@@ -1128,7 +1208,8 @@ mod tests {
         });
         let clusters: Vec<u64> = (0..n).map(|i| (i / 4) as u64).collect();
         let options = TweedieOptions::builder().robust_se(true).build();
-        let (model, report) = fit_tweedie(&x, &y, Some(&clusters), 1.5, options).expect("fit");
+        let (model, report) =
+            fit_tweedie(x.as_ref(), y.as_ref(), Some(&clusters), 1.5, options).expect("fit");
         let pred = model.predict(&x);
         assert_eq!(pred.mean.nrows(), n);
         assert!(report.robust);
@@ -1157,8 +1238,14 @@ mod tests {
         let clusters: Vec<u64> = (0..n).map(|i| (i / 4) as u64).collect();
         let slope_se = |scale: f64| {
             let options = TweedieOptions::builder().robust_se(true).build();
-            let (_m, report) =
-                fit_tweedie(&x, &make_y(scale), Some(&clusters), 2.0, options).expect("fit");
+            let (_m, report) = fit_tweedie(
+                x.as_ref(),
+                make_y(scale).as_ref(),
+                Some(&clusters),
+                2.0,
+                options,
+            )
+            .expect("fit");
             report.se.expect("se")[(1, 0)]
         };
         let se_base = slope_se(1.0);
@@ -1218,7 +1305,8 @@ mod tests {
         let y = Mat::from_fn(n, 1, |i, _| if i % 2 == 0 { 10.0 } else { 30.0 });
 
         let (model, report) =
-            fit_tweedie(&x, &y, None, 2.0, TweedieOptions::default()).expect("power-2 fit");
+            fit_tweedie(x.as_ref(), y.as_ref(), None, 2.0, TweedieOptions::default())
+                .expect("power-2 fit");
 
         // Intercept -> ln(10); slope -> ln(30) - ln(10) = ln(3).
         assert!(

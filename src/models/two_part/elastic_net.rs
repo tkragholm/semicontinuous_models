@@ -1,13 +1,13 @@
 //! Coordinate-descent weighted least squares for the elastic-net penalty.
 
-use faer::Mat;
+use faer::{Mat, MatRef};
 
 use super::{Regularization, TwoPartError};
 
 pub(super) fn elastic_net_wls(
-    x: &Mat<f64>,
-    weights: &Mat<f64>,
-    z: &Mat<f64>,
+    x: MatRef<'_, f64>,
+    weights: MatRef<'_, f64>,
+    z: MatRef<'_, f64>,
     regularization: Regularization,
 ) -> Result<Mat<f64>, TwoPartError> {
     let (lambda, alpha, exclude_intercept) = match regularization {

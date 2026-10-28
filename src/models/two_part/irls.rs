@@ -1,6 +1,6 @@
 //! The IRLS fits of the logit and gamma log-link parts.
 
-use faer::Mat;
+use faer::{Mat, MatRef};
 
 use super::elastic_net::elastic_net_wls;
 use super::{FitOptions, Regularization, TwoPartError};
@@ -9,14 +9,14 @@ use crate::models::matrix_ops::{
     weighted_column_means,
 };
 use crate::utils::{
-    CachedFactor, add_ridge_to_diagonal, linear_predictor, matvec_into, max_abs_diff, mean_column,
-    weighted_xtx, weighted_xtz_with_buffer,
+    CachedFactor, add_ridge_to_diagonal, linear_predictor, matvec_into, max_abs_diff,
+    mean_column_ref, weighted_xtx_ref, weighted_xtz_ref_with_buffer,
 };
 
 pub(super) fn fit_logit_weighted(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
-    weights: &Mat<f64>,
+    x: MatRef<'_, f64>,
+    y: MatRef<'_, f64>,
+    weights: MatRef<'_, f64>,
     options: FitOptions,
     initial_beta: Option<&Mat<f64>>,
 ) -> Result<(Mat<f64>, usize), TwoPartError> {
@@ -106,8 +106,8 @@ pub(super) fn fit_logit_weighted(
 
         let proposal = weighted_least_squares(
             x,
-            &irls_weights,
-            &z,
+            irls_weights.as_ref(),
+            z.as_ref(),
             regularization,
             &mut weighted_xtz_buffer,
         )?;
@@ -165,7 +165,7 @@ pub(super) fn fit_logit_weighted(
 /// this data -- had none.
 const LOGIT_ETA_CLAMP: f64 = 40.0;
 
-fn logit_eta(x: &Mat<f64>, beta: &Mat<f64>) -> Mat<f64> {
+fn logit_eta(x: MatRef<'_, f64>, beta: &Mat<f64>) -> Mat<f64> {
     let eta = linear_predictor(x, beta);
     map_mat(&eta, |value| value.clamp(-LOGIT_ETA_CLAMP, LOGIT_ETA_CLAMP))
 }
@@ -174,7 +174,7 @@ fn logit_eta(x: &Mat<f64>, beta: &Mat<f64>) -> Mat<f64> {
 ///
 /// `p` is clamped off 0 and 1 so a saturated fit gives a large finite deviance
 /// rather than an infinity that no comparison can order.
-fn logit_deviance(y: &Mat<f64>, p: &Mat<f64>, weights: &Mat<f64>) -> f64 {
+fn logit_deviance(y: MatRef<'_, f64>, p: &Mat<f64>, weights: MatRef<'_, f64>) -> f64 {
     const EPS: f64 = 1e-12;
     let mut deviance = 0.0;
     for i in 0..y.nrows() {
@@ -197,9 +197,9 @@ fn logit_deviance(y: &Mat<f64>, p: &Mat<f64>, weights: &Mat<f64>) -> f64 {
 pub(super) const GAMMA_LOG_LINK_ETA_CLAMP: f64 = 30.0;
 
 pub(super) fn fit_gamma_log_link_weighted(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
-    weights: &Mat<f64>,
+    x: MatRef<'_, f64>,
+    y: MatRef<'_, f64>,
+    weights: MatRef<'_, f64>,
     options: FitOptions,
     initial_beta: Option<&Mat<f64>>,
 ) -> Result<(Mat<f64>, usize), TwoPartError> {
@@ -213,10 +213,10 @@ pub(super) fn fit_gamma_log_link_weighted(
     // so the stored `beta_gamma` and every prediction operate on the original design.
     let col_means = weighted_column_means(x, Some(weights));
     let centered_storage;
-    let cx: &Mat<f64> = match &col_means {
+    let cx: MatRef<'_, f64> = match &col_means {
         Some(means) => {
             centered_storage = center_columns(x, means);
-            &centered_storage
+            centered_storage.as_ref()
         }
         None => x,
     };
@@ -233,7 +233,7 @@ pub(super) fn fit_gamma_log_link_weighted(
         _ => {
             let mut beta = Mat::<f64>::zeros(cx.ncols(), 1);
             if cx.ncols() > 0 {
-                let mean = mean_column(y);
+                let mean = mean_column_ref(y);
                 if mean > 0.0 {
                     beta[(0, 0)] = mean.ln();
                 }
@@ -251,7 +251,7 @@ pub(super) fn fit_gamma_log_link_weighted(
     let cached = if matches!(regularization, Regularization::ElasticNet { .. }) {
         None
     } else {
-        let mut xtwx = weighted_xtx(cx, weights);
+        let mut xtwx = weighted_xtx_ref(cx, weights);
         if let Some((lambda, exclude_intercept)) = ridge_from_regularization(regularization)
             && lambda > 0.0
         {
@@ -279,20 +279,27 @@ pub(super) fn fit_gamma_log_link_weighted(
         }
 
         let beta_next = if let Some(factor) = &cached {
-            let rhs = weighted_xtz_with_buffer(cx, weights, &z, &mut weighted_xtz_buffer);
+            let rhs =
+                weighted_xtz_ref_with_buffer(cx, weights, z.as_ref(), &mut weighted_xtz_buffer);
             match factor.solve(rhs.as_ref()) {
                 Ok(candidate) => candidate,
                 // Pathological RHS: fall back to the stabilized per-iteration solve.
                 Err(_) => weighted_least_squares(
                     cx,
                     weights,
-                    &z,
+                    z.as_ref(),
                     regularization,
                     &mut weighted_xtz_buffer,
                 )?,
             }
         } else {
-            weighted_least_squares(cx, weights, &z, regularization, &mut weighted_xtz_buffer)?
+            weighted_least_squares(
+                cx,
+                weights,
+                z.as_ref(),
+                regularization,
+                &mut weighted_xtz_buffer,
+            )?
         };
 
         // A non-finite step means this resample is pathological at the current
@@ -324,9 +331,9 @@ pub(super) fn fit_gamma_log_link_weighted(
 }
 
 fn weighted_least_squares(
-    x: &Mat<f64>,
-    weights: &Mat<f64>,
-    z: &Mat<f64>,
+    x: MatRef<'_, f64>,
+    weights: MatRef<'_, f64>,
+    z: MatRef<'_, f64>,
     regularization: Regularization,
     weighted_buffer: &mut Vec<f64>,
 ) -> Result<Mat<f64>, TwoPartError> {
@@ -334,13 +341,13 @@ fn weighted_least_squares(
         return elastic_net_wls(x, weights, z, regularization);
     }
 
-    let mut xtwx = weighted_xtx(x, weights);
+    let mut xtwx = weighted_xtx_ref(x, weights);
     if let Some((lambda, exclude_intercept)) = ridge_from_regularization(regularization)
         && lambda > 0.0
     {
         add_ridge_to_diagonal(&mut xtwx, lambda, exclude_intercept);
     }
-    let xtw_rhs = weighted_xtz_with_buffer(x, weights, z, weighted_buffer);
+    let xtw_rhs = weighted_xtz_ref_with_buffer(x, weights, z, weighted_buffer);
     crate::utils::solve_linear_system(&xtwx, &xtw_rhs).map_err(|_| TwoPartError::SolveFailed)
 }
 

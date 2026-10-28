@@ -1,6 +1,6 @@
 //! Model-based and sandwich covariance of the two parts.
 
-use faer::Mat;
+use faer::{Mat, MatRef};
 
 use super::irls::{logistic, ridge_from_regularization};
 use super::{FitOptions, TwoPartError};
@@ -8,15 +8,15 @@ use crate::models::covariance::{sandwich, score_meat};
 use crate::models::matrix_ops::map_mat;
 use crate::utils::{
     add_ridge_to_diagonal, linear_predictor, solve_linear_system, solve_linear_system_ref,
-    weighted_xtx,
+    weighted_xtx_ref,
 };
 
 /// Logit-part covariance: model-based, or the sandwich when `robust_se` is set, with
 /// cluster-robust meat when `clusters` is given.
 pub(super) fn covariance_logit(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
-    weights: &Mat<f64>,
+    x: MatRef<'_, f64>,
+    y: MatRef<'_, f64>,
+    weights: MatRef<'_, f64>,
     beta: &Mat<f64>,
     clusters: Option<&[u64]>,
     options: FitOptions,
@@ -28,7 +28,7 @@ pub(super) fn covariance_logit(
         (value.max(options.min_weight)) * weights[(i, 0)]
     });
 
-    let mut xtwx = weighted_xtx(x, &irls_weights);
+    let mut xtwx = weighted_xtx_ref(x, irls_weights.as_ref());
     if let Some((lambda, exclude_intercept)) = ridge_from_regularization(options.regularization)
         && lambda > 0.0
     {
@@ -50,9 +50,9 @@ pub(super) fn covariance_logit(
 /// Gamma-part covariance: model-based, or the sandwich when `robust_se` is set, with
 /// cluster-robust meat when `clusters` is given.
 pub(super) fn covariance_gamma(
-    x: &Mat<f64>,
-    y: &Mat<f64>,
-    weights: &Mat<f64>,
+    x: MatRef<'_, f64>,
+    y: MatRef<'_, f64>,
+    weights: MatRef<'_, f64>,
     beta: &Mat<f64>,
     clusters: Option<&[u64]>,
     options: FitOptions,
@@ -60,7 +60,7 @@ pub(super) fn covariance_gamma(
     let eta = linear_predictor(x, beta);
     let mu = map_mat(&eta, f64::exp);
 
-    let mut xtx = weighted_xtx(x, weights);
+    let mut xtx = weighted_xtx_ref(x, weights);
     if let Some((lambda, exclude_intercept)) = ridge_from_regularization(options.regularization)
         && lambda > 0.0
     {

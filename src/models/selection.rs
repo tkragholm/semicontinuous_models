@@ -168,8 +168,14 @@ pub fn park_test(x: &Mat<f64>, y: &Mat<f64>) -> Option<ParkTestResult> {
     let x_pos = select_rows(x, &positive_indices);
     let y_pos = select_values(y, &positive_indices);
 
-    let (gamma, _report) =
-        fit_tweedie(&x_pos, &y_pos, None, 2.0, TweedieOptions::default()).ok()?;
+    let (gamma, _report) = fit_tweedie(
+        x_pos.as_ref(),
+        y_pos.as_ref(),
+        None,
+        2.0,
+        TweedieOptions::default(),
+    )
+    .ok()?;
     let mu = gamma.predict(&x_pos).mean;
     let residuals = Mat::from_fn(y_pos.nrows(), 1, |i, _| y_pos[(i, 0)] - mu[(i, 0)]);
     let log_resid = Mat::from_fn(residuals.nrows(), 1, |i, _| {
@@ -182,8 +188,8 @@ pub fn park_test(x: &Mat<f64>, y: &Mat<f64>) -> Option<ParkTestResult> {
         2,
         |i, j| if j == 0 { 1.0 } else { log_mu[(i, 0)] },
     );
-    let xtx = row_scaled_gram(&design, |_| 1.0);
-    let xty = xt_column(&design, log_resid.col_as_slice(0));
+    let xtx = row_scaled_gram(design.as_ref(), |_| 1.0);
+    let xty = xt_column(design.as_ref(), log_resid.col_as_slice(0));
     let beta = solve_linear_system(&xtx, &xty).ok()?;
 
     Some(ParkTestResult {
@@ -202,7 +208,13 @@ pub(crate) fn select_models(x: &Mat<f64>, y: &Mat<f64>, powers: &[f64]) -> Selec
 
     let mut tweedie_candidates = Vec::new();
     for &power in powers {
-        if let Ok((model, _report)) = fit_tweedie(x, y, None, power, TweedieOptions::default()) {
+        if let Ok((model, _report)) = fit_tweedie(
+            x.as_ref(),
+            y.as_ref(),
+            None,
+            power,
+            TweedieOptions::default(),
+        ) {
             let pred = model.predict(x);
             let metrics = compute_model_fit_metrics(y, &pred.mean, Some(power));
             let ll = tweedie_quasi_log_likelihood(y, &pred.mean, power);

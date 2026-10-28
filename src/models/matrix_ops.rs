@@ -1,7 +1,13 @@
-use faer::Mat;
+use faer::{Mat, MatRef};
 
 #[must_use]
 pub fn select_rows(matrix: &Mat<f64>, indices: &[usize]) -> Mat<f64> {
+    select_rows_ref(matrix.as_ref(), indices)
+}
+
+/// [`select_rows`] on a borrowed matrix.
+#[must_use]
+pub fn select_rows_ref(matrix: MatRef<'_, f64>, indices: &[usize]) -> Mat<f64> {
     Mat::from_fn(indices.len(), matrix.ncols(), |i, j| {
         matrix[(indices[i], j)]
     })
@@ -9,6 +15,12 @@ pub fn select_rows(matrix: &Mat<f64>, indices: &[usize]) -> Mat<f64> {
 
 #[must_use]
 pub fn select_values(vector: &Mat<f64>, indices: &[usize]) -> Mat<f64> {
+    select_values_ref(vector.as_ref(), indices)
+}
+
+/// [`select_values`] on a borrowed column.
+#[must_use]
+pub fn select_values_ref(vector: MatRef<'_, f64>, indices: &[usize]) -> Mat<f64> {
     Mat::from_fn(indices.len(), 1, |i, _| vector[(indices[i], 0)])
 }
 
@@ -35,7 +47,7 @@ pub fn map_mat(values: &Mat<f64>, f: impl Fn(f64) -> f64) -> Mat<f64> {
 
 const CONSTANT_COLUMN_TOL: f64 = 1e-12;
 
-fn column_is_constant(x: &Mat<f64>, column: usize) -> bool {
+fn column_is_constant(x: MatRef<'_, f64>, column: usize) -> bool {
     let n = x.nrows();
     if n == 0 {
         return true;
@@ -52,7 +64,10 @@ fn column_is_constant(x: &Mat<f64>, column: usize) -> bool {
 /// gets `0.0` so centering leaves it intact (centering a constant column would zero it and
 /// make `XᵀWX` singular). Every remaining column gets its weighted mean.
 #[must_use]
-pub(crate) fn weighted_column_means(x: &Mat<f64>, weights: Option<&Mat<f64>>) -> Option<Vec<f64>> {
+pub(crate) fn weighted_column_means(
+    x: MatRef<'_, f64>,
+    weights: Option<MatRef<'_, f64>>,
+) -> Option<Vec<f64>> {
     let (n, p) = (x.nrows(), x.ncols());
     if n == 0 || p == 0 || !column_is_constant(x, 0) {
         return None;
@@ -65,7 +80,7 @@ pub(crate) fn weighted_column_means(x: &Mat<f64>, weights: Option<&Mat<f64>>) ->
     let varying: Vec<usize> = (1..p).filter(|&j| !column_is_constant(x, j)).collect();
     let unit_weights;
     let weight_column: &[f64] = match weights {
-        Some(weights) => weights.col_as_slice(0),
+        Some(weights) => crate::utils::col_slice(weights, 0),
         None => {
             unit_weights = vec![1.0_f64; n];
             &unit_weights
@@ -75,7 +90,10 @@ pub(crate) fn weighted_column_means(x: &Mat<f64>, weights: Option<&Mat<f64>>) ->
     // of columns shares a pass over the weights, so the independent chains overlap.
     const GROUP: usize = 8;
     for group in varying.chunks(GROUP) {
-        let columns: Vec<&[f64]> = group.iter().map(|&j| x.col_as_slice(j)).collect();
+        let columns: Vec<&[f64]> = group
+            .iter()
+            .map(|&j| crate::utils::col_slice(x, j))
+            .collect();
         let mut acc = [0.0_f64; GROUP];
         for (i, &w) in weight_column.iter().enumerate() {
             for (slot, column) in acc.iter_mut().zip(&columns) {
@@ -92,7 +110,7 @@ pub(crate) fn weighted_column_means(x: &Mat<f64>, weights: Option<&Mat<f64>>) ->
 /// Return `x` with each column shifted by `-means[j]` (the intercept and any constant
 /// column carry `means[j] == 0.0`, so they pass through unchanged).
 #[must_use]
-pub(crate) fn center_columns(x: &Mat<f64>, means: &[f64]) -> Mat<f64> {
+pub(crate) fn center_columns(x: MatRef<'_, f64>, means: &[f64]) -> Mat<f64> {
     Mat::from_fn(x.nrows(), x.ncols(), |i, j| x[(i, j)] - means[j])
 }
 
@@ -124,7 +142,7 @@ pub(crate) fn center_beta(beta_raw: &Mat<f64>, means: &[f64]) -> Mat<f64> {
 /// produces distorted, non-multiplicative predictions, so callers treat it as
 /// non-convergence rather than silently reporting a degenerate "ok" fit.
 #[must_use]
-pub(crate) fn max_abs_linear_predictor(x: &Mat<f64>, beta: &Mat<f64>) -> f64 {
+pub(crate) fn max_abs_linear_predictor(x: MatRef<'_, f64>, beta: &Mat<f64>) -> f64 {
     let eta = crate::utils::linear_predictor(x, beta);
     (0..eta.nrows()).fold(0.0_f64, |acc, i| acc.max(eta[(i, 0)].abs()))
 }
@@ -149,8 +167,8 @@ mod tests {
         // the coefficients back reproduces X·β EXACTLY row-for-row. `beta_centered` stands
         // in for whatever the IRLS converges to on the centered scale.
         let x = sample_design();
-        let means = weighted_column_means(&x, None).expect("intercept present");
-        let cx = center_columns(&x, &means);
+        let means = weighted_column_means(x.as_ref(), None).expect("intercept present");
+        let cx = center_columns(x.as_ref(), &means);
         let beta_centered = Mat::from_fn(3, 1, |i, _| [9.5, 0.7, -0.03][i]);
         let beta_raw = uncenter_beta(&beta_centered, &means);
 
@@ -169,7 +187,7 @@ mod tests {
     #[test]
     fn center_beta_is_the_inverse_of_uncenter_beta() {
         let x = sample_design();
-        let means = weighted_column_means(&x, None).expect("intercept present");
+        let means = weighted_column_means(x.as_ref(), None).expect("intercept present");
         let beta_raw = Mat::from_fn(3, 1, |i, _| [30.5, 0.7, -0.03][i]);
         let round_trip = uncenter_beta(&center_beta(&beta_raw, &means), &means);
         for i in 0..beta_raw.nrows() {
@@ -185,7 +203,7 @@ mod tests {
             1 => 5.0,
             _ => f64::from(u32::try_from(i).unwrap()), // 0,1,2,3 -> mean 1.5
         });
-        let means = weighted_column_means(&x, None).expect("intercept present");
+        let means = weighted_column_means(x.as_ref(), None).expect("intercept present");
         assert!(
             (means[0] - 0.0).abs() < 1e-12,
             "intercept must not be centered"
@@ -201,14 +219,14 @@ mod tests {
     fn weighted_column_means_skips_when_no_intercept() {
         // Column 0 is not constant -> no usable intercept -> centering must be skipped.
         let x = Mat::from_fn(4, 2, |i, j| f64::from(u32::try_from(i + j).unwrap()));
-        assert!(weighted_column_means(&x, None).is_none());
+        assert!(weighted_column_means(x.as_ref(), None).is_none());
     }
 
     #[test]
     fn weighted_column_means_uses_weights() {
         let x = Mat::from_fn(3, 2, |i, j| if j == 0 { 1.0 } else { [0.0, 10.0, 20.0][i] });
         let w = Mat::from_fn(3, 1, |i, _| [1.0, 1.0, 2.0][i]); // weighted mean = (0+10+40)/4 = 12.5
-        let means = weighted_column_means(&x, Some(&w)).expect("intercept present");
+        let means = weighted_column_means(x.as_ref(), Some(w.as_ref())).expect("intercept present");
         assert!((means[1] - 12.5).abs() < 1e-12);
     }
 }

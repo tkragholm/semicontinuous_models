@@ -17,7 +17,7 @@ pub mod utils;
 pub use inference::{InferenceError, McmcConfig, ProposalStats};
 pub use input::{
     CounterfactualInputBuildError, InputError, LongitudinalInputError, LongitudinalModelInput,
-    ModelInput, PreparedCounterfactualInput, TWO_PART_NOT_APPLICABLE_POSITIVE_SHARE,
+    ModelInput, ModelInputRef, PreparedCounterfactualInput, TWO_PART_NOT_APPLICABLE_POSITIVE_SHARE,
     build_counterfactual_input, sanitize_model_outcome, two_part_applicability,
 };
 pub use preprocess::{
@@ -37,14 +37,14 @@ pub use models::two_part::{
     Regularization, TwoPartError, TwoPartModel, TwoPartPrediction, TwoPartReport, TwoPartTrainer,
     TwoPartWarmStart, bootstrap as bootstrap_two_part, bootstrap_percentile_ci, bootstrap_summary,
     coefficient_confidence_intervals, fit_two_part_clustered_input, fit_two_part_input,
-    fit_two_part_input_warm, fit_two_part_weighted_input,
-    log_likelihood as two_part_log_likelihood,
+    fit_two_part_input_warm, fit_two_part_ref_warm, fit_two_part_ref_warm_prevalidated,
+    fit_two_part_weighted_input, log_likelihood as two_part_log_likelihood,
 };
 
 pub use models::tweedie::{
     TweedieError, TweedieModel, TweedieOptions, TweediePrediction, TweedieReport, TweedieTrainer,
-    deviance as tweedie_deviance, fit_tweedie_input, fit_tweedie_input_warm,
-    quasi_log_likelihood as tweedie_quasi_log_likelihood,
+    deviance as tweedie_deviance, fit_tweedie_input, fit_tweedie_input_warm, fit_tweedie_ref_warm,
+    fit_tweedie_ref_warm_prevalidated, quasi_log_likelihood as tweedie_quasi_log_likelihood,
 };
 
 pub use models::lognormal::{
