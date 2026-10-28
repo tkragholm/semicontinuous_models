@@ -62,16 +62,29 @@ pub(crate) fn weighted_column_means(x: &Mat<f64>, weights: Option<&Mat<f64>>) ->
         return None;
     }
     let mut means = vec![0.0_f64; p];
-    for j in 1..p {
-        if column_is_constant(x, j) {
-            continue;
+    let varying: Vec<usize> = (1..p).filter(|&j| !column_is_constant(x, j)).collect();
+    let unit_weights;
+    let weight_column: &[f64] = match weights {
+        Some(weights) => weights.col_as_slice(0),
+        None => {
+            unit_weights = vec![1.0_f64; n];
+            &unit_weights
         }
-        let mut acc = 0.0_f64;
-        for i in 0..n {
-            let w = weights.map_or(1.0, |weights| weights[(i, 0)]);
-            acc = w.mul_add(x[(i, j)], acc);
+    };
+    // Each column is still one sequential fused-multiply-add chain over the rows. A group
+    // of columns shares a pass over the weights, so the independent chains overlap.
+    const GROUP: usize = 8;
+    for group in varying.chunks(GROUP) {
+        let columns: Vec<&[f64]> = group.iter().map(|&j| x.col_as_slice(j)).collect();
+        let mut acc = [0.0_f64; GROUP];
+        for (i, &w) in weight_column.iter().enumerate() {
+            for (slot, column) in acc.iter_mut().zip(&columns) {
+                *slot = w.mul_add(column[i], *slot);
+            }
         }
-        means[j] = acc / weight_sum;
+        for (&j, &sum) in group.iter().zip(&acc) {
+            means[j] = sum / weight_sum;
+        }
     }
     Some(means)
 }

@@ -378,12 +378,22 @@ fn fit_tweedie_with_lambda(
     let mut search_mu = Mat::<f64>::zeros(n, 1);
     let mut weight_buffer = Mat::<f64>::zeros(n, 1);
 
+    // Deviance of `beta` when the line search of the previous iteration already left
+    // that beta's linear predictor and mean in `search_eta`/`search_mu`.
+    let mut carried_deviance: Option<f64> = None;
+
     for iteration in 0..options.max_iter {
-        matvec_into(&mut eta, cx, &beta);
-        for i in 0..n {
-            mu[(i, 0)] = exp_clamped(eta[(i, 0)]);
-        }
-        let current_deviance = weighted_deviance(y, &mu, power, sample_weights);
+        let current_deviance = if let Some(deviance) = carried_deviance.take() {
+            std::mem::swap(&mut eta, &mut search_eta);
+            std::mem::swap(&mut mu, &mut search_mu);
+            deviance
+        } else {
+            matvec_into(&mut eta, cx, &beta);
+            for i in 0..n {
+                mu[(i, 0)] = exp_clamped(eta[(i, 0)]);
+            }
+            weighted_deviance(y, &mu, power, sample_weights)
+        };
 
         // Working response `z = η + (y - μ)/μ`; independent of the IRLS weights.
         for i in 0..n {
@@ -424,7 +434,7 @@ fn fit_tweedie_with_lambda(
             solve_with_stabilization(xtwx.as_ref(), xtw_rhs.as_ref())?
         };
 
-        let (beta_next, dev_next) = backtracking_update(
+        let (beta_next, dev_next, scratch_holds_beta_next) = backtracking_update(
             cx,
             y,
             sample_weights,
@@ -456,6 +466,9 @@ fn fit_tweedie_with_lambda(
                 beta_raw,
                 iteration + 1,
             );
+        }
+        if scratch_holds_beta_next {
+            carried_deviance = Some(dev_next);
         }
         beta = beta_next;
     }
@@ -530,18 +543,20 @@ fn finalize_fit(
     if max_abs_linear_predictor(x, &beta_final) >= LINEAR_PREDICTOR_CLIP {
         return Err(TweedieError::NonConvergence);
     }
-    let eta = linear_predictor(x, &beta_final);
-    let mu = map_mat(&eta, exp_clamped);
-    let weights = Mat::from_fn(mu.nrows(), 1, |i, _| {
-        let base_weight = sample_weight_at(sample_weights, i);
-        let w = mu[(i, 0)].powf(2.0 - power).max(options.min_weight);
-        base_weight * w
-    });
-    let mut xtwx = weighted_xtx(x, &weights);
-    if lambda > 0.0 {
-        add_ridge_to_diagonal(&mut xtwx, lambda, options.l2_penalty_exclude_intercept);
-    }
+    // The information matrix and fitted means feed only the sandwich covariance, so a
+    // fit that does not ask for standard errors skips both.
     let (cov, se, clustered, cluster_count) = if options.robust_se {
+        let eta = linear_predictor(x, &beta_final);
+        let mu = map_mat(&eta, exp_clamped);
+        let weights = Mat::from_fn(mu.nrows(), 1, |i, _| {
+            let base_weight = sample_weight_at(sample_weights, i);
+            let w = mu[(i, 0)].powf(2.0 - power).max(options.min_weight);
+            base_weight * w
+        });
+        let mut xtwx = weighted_xtx(x, &weights);
+        if lambda > 0.0 {
+            add_ridge_to_diagonal(&mut xtwx, lambda, options.l2_penalty_exclude_intercept);
+        }
         let (cov, clustered, cluster_count) =
             robust_covariance(x, y, &mu, sample_weights, power, clusters, &xtwx)?;
         let se = cov.as_ref().map(diag_sqrt);
@@ -716,7 +731,9 @@ fn robust_covariance(
     Ok((Some(cov), cluster_count.is_some(), cluster_count))
 }
 
-/// Returns the accepted step's `(beta, deviance)`. The deviance is the one already
+/// Returns the accepted step's `(beta, deviance, scratch_holds_beta)`. The last is true
+/// when `scratch_eta` and `scratch_mu` hold that beta's linear predictor and mean, so the
+/// caller can carry them into its next iteration. The deviance is the one already
 /// computed for the returned beta inside the line search, so the caller reuses it
 /// instead of recomputing `x*beta`, `exp`, and the deviance a second time per IRLS
 /// iteration (the value is identical — same beta, same deviance function).
@@ -731,7 +748,7 @@ fn backtracking_update(
     power: f64,
     scratch_eta: &mut Mat<f64>,
     scratch_mu: &mut Mat<f64>,
-) -> (Mat<f64>, f64) {
+) -> (Mat<f64>, f64, bool) {
     let mut step = 1.0_f64;
     let mut proposal = beta_candidate.clone();
     let mut best_beta = beta_candidate.clone();
@@ -752,7 +769,7 @@ fn backtracking_update(
             scratch_mu,
         );
         if dev.is_finite() && dev <= current_deviance {
-            return (proposal, dev);
+            return (proposal, dev, true);
         }
         if dev.is_finite() && dev < best_deviance {
             best_deviance = dev;
@@ -776,7 +793,7 @@ fn backtracking_update(
             scratch_mu,
         )
     };
-    (best_beta, dev)
+    (best_beta, dev, false)
 }
 
 /// Deviance at `beta`, reusing the caller's `scratch_eta`/`scratch_mu` columns so the

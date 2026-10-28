@@ -226,14 +226,7 @@ pub fn std_vector(betas: &[Mat<f64>], mean: &Mat<f64>) -> Mat<f64> {
 
 #[must_use]
 pub fn matrix_is_finite(matrix: &Mat<f64>) -> bool {
-    for i in 0..matrix.nrows() {
-        for j in 0..matrix.ncols() {
-            if !matrix[(i, j)].is_finite() {
-                return false;
-            }
-        }
-    }
-    true
+    (0..matrix.ncols()).all(|j| matrix.col_as_slice(j).iter().all(|value| value.is_finite()))
 }
 
 #[must_use]
@@ -337,8 +330,10 @@ pub(crate) fn row_scaled_gram(x: &Mat<f64>, scale: impl Fn(usize) -> f64 + Sync)
     let p = x.ncols();
     let mut gram = sum_over_row_blocks(x.nrows(), p, p, |rows, out| {
         let start = rows.start;
+        // One scale per row rather than one per element: the same values, p times fewer calls.
+        let scales: Vec<f64> = rows.clone().map(&scale).collect();
         let scaled = Mat::from_fn(rows.len(), p, |row, col| {
-            x[(start + row, col)] * scale(start + row)
+            x[(start + row, col)] * scales[row]
         });
         triangular::matmul(
             out,
