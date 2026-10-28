@@ -34,9 +34,9 @@ use crate::models::{
     AttemptDiagnostics, FitMetadata, FitStrategy, Model, RetryableError, SolverKind,
     run_with_retries,
 };
-use crate::utils::linear_predictor;
 #[cfg(feature = "bench-internals")]
 use crate::utils::weighted_xtz;
+use crate::utils::{SerialInnerScope, linear_predictor};
 use faer::{Mat, MatRef};
 use statrs::distribution::{ContinuousCDF, Normal};
 use statrs::function::gamma::ln_gamma;
@@ -117,6 +117,17 @@ pub struct FitOptions {
     /// Strategy for handling non-convergence.
     #[builder(default = FitStrategy::Strict)]
     pub strategy: FitStrategy,
+    /// If true (the default), the passes inside one fit use rayon: the row blocks of
+    /// `X'WX`, `X'z` and the linear predictor, and faer's own parallel kernels in the
+    /// dense solves. If false, every one of those runs on the calling thread in a fixed
+    /// order, which suits a caller that already fits many replicates in parallel.
+    ///
+    /// The row-block sums keep their block partition and their block order, so they
+    /// are bit-identical in both modes. The dense solves use faer's sequential kernels,
+    /// which can move the last bits of a coefficient. A serial fit does not depend on
+    /// the rayon thread count.
+    #[builder(default = true)]
+    pub inner_parallel: bool,
 }
 
 impl Default for FitOptions {
@@ -131,6 +142,7 @@ impl Default for FitOptions {
             robust_se: false,
             compute_covariance: true,
             strategy: FitStrategy::Strict,
+            inner_parallel: true,
         }
     }
 }
@@ -608,6 +620,7 @@ pub(crate) fn fit_two_part_weighted(
     options: FitOptions,
     warm: Option<&TwoPartWarmStart>,
 ) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
+    let _serial = SerialInnerScope::enter(!options.inner_parallel);
     let start_time = Instant::now();
 
     let is_positive = Mat::from_fn(y.nrows(), 1, |i, _| if y[(i, 0)] > 0.0 { 1.0 } else { 0.0 });
@@ -748,6 +761,7 @@ pub(crate) fn fit_two_part_clustered_weighted(
     options: FitOptions,
     warm: Option<&TwoPartWarmStart>,
 ) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
+    let _serial = SerialInnerScope::enter(!options.inner_parallel);
     let (model, base_report) = fit_two_part_weighted(x, y, weights, options, warm)?;
     if !options.robust_se {
         return Ok((model, base_report));

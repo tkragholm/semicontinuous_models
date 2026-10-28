@@ -256,6 +256,110 @@ fn mean(values: &Mat<f64>, weights: Option<&[f64]>) -> f64 {
     sum / total
 }
 
+/// Largest absolute and relative differences between two coefficient columns.
+fn differences(a: &Mat<f64>, b: &Mat<f64>) -> (f64, f64) {
+    (0..a.nrows()).fold((0.0, 0.0), |(abs, rel), i| {
+        let d = (a[(i, 0)] - b[(i, 0)]).abs();
+        let scale = a[(i, 0)].abs().max(b[(i, 0)].abs()).max(f64::MIN_POSITIVE);
+        (f64::max(abs, d), f64::max(rel, d / scale))
+    })
+}
+
+/// A bootstrap of `reps` replicate fits in parallel, with parallel and with serial
+/// inner passes: wall time per bootstrap and the differences in the coefficients.
+///
+/// `SERIAL_COMPARE=1 cargo run --release --example fit_profile -- [n] [p] [replicates]`
+fn serial_compare(n: usize, p: usize, reps: usize, runs: usize) {
+    let full = make_data(n, p, 0.4, 12345);
+    let opts = FitOptions::stable_defaults();
+    let (point, _) = fit_two_part_input_warm(&full, opts, None).expect("point fit");
+    let warm = TwoPartWarmStart {
+        beta_logit: point.beta_logit,
+        beta_gamma: point.beta_gamma,
+    };
+    let boots: Vec<ModelInput> = (0..reps)
+        .map(|r| resample(&full, 1000 + r as u64))
+        .collect();
+    let two_part = |inner_parallel: bool| -> Vec<(Mat<f64>, Mat<f64>)> {
+        let ropts = FitOptions {
+            compute_covariance: false,
+            inner_parallel,
+            ..opts
+        };
+        boots
+            .par_iter()
+            .map(|b| {
+                let (m, _) = fit_two_part_input_warm(b, ropts, Some(&warm)).expect("fit");
+                (m.beta_logit, m.beta_gamma)
+            })
+            .collect()
+    };
+    let mut positive = make_data(n, p, 0.4, 12345);
+    for i in 0..n {
+        if positive.outcome[(i, 0)] <= 0.0 {
+            positive.outcome[(i, 0)] = 1.0;
+        }
+    }
+    let tboots: Vec<ModelInput> = (0..reps)
+        .map(|r| resample(&positive, 1000 + r as u64))
+        .collect();
+    let (tpoint, _) =
+        fit_tweedie_input_warm(&positive, 2.0, TweedieOptions::default(), None).expect("point");
+    let tweedie = |inner_parallel: bool| -> Vec<Mat<f64>> {
+        let options = TweedieOptions {
+            inner_parallel,
+            ..TweedieOptions::default()
+        };
+        tboots
+            .par_iter()
+            .map(|b| {
+                fit_tweedie_input_warm(b, 2.0, options, Some(&tpoint.beta))
+                    .expect("fit")
+                    .0
+                    .beta
+            })
+            .collect()
+    };
+    eprintln!(
+        "serial_compare n={n} p={p} replicates={reps} threads={}",
+        rayon::current_num_threads()
+    );
+    for (label, inner_parallel) in [("parallel", true), ("serial", false)] {
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        for _ in 0..runs {
+            let s = Instant::now();
+            two_part(inner_parallel);
+            a.push(s.elapsed().as_secs_f64());
+            let s = Instant::now();
+            tweedie(inner_parallel);
+            b.push(s.elapsed().as_secs_f64());
+        }
+        println!(
+            "{label}: two-part bootstrap {:.2} s, tweedie2 bootstrap {:.2} s",
+            median(a) / 1e0,
+            median(b) / 1e0
+        );
+    }
+    let (pa, sa) = (two_part(true), two_part(false));
+    let (abs, rel) = pa.iter().zip(&sa).fold((0.0_f64, 0.0_f64), |acc, (x, y)| {
+        let (a1, r1) = differences(&x.0, &y.0);
+        let (a2, r2) = differences(&x.1, &y.1);
+        (acc.0.max(a1).max(a2), acc.1.max(r1).max(r2))
+    });
+    println!(
+        "two-part replicate coefficients, serial vs parallel: max abs {abs:.3e}, max rel {rel:.3e}"
+    );
+    let (pa, sa) = (tweedie(true), tweedie(false));
+    let (abs, rel) = pa.iter().zip(&sa).fold((0.0_f64, 0.0_f64), |acc, (x, y)| {
+        let (a1, r1) = differences(x, y);
+        (acc.0.max(a1), acc.1.max(r1))
+    });
+    println!(
+        "tweedie2 replicate coefficients, serial vs parallel: max abs {abs:.3e}, max rel {rel:.3e}"
+    );
+}
+
 fn main() {
     let args: Vec<usize> = std::env::args()
         .skip(1)
@@ -269,6 +373,10 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
     eprintln!("n={n} p={p} threads={}", rayon::current_num_threads());
+    if std::env::var_os("SERIAL_COMPARE").is_some() {
+        serial_compare(n, p, reps, runs);
+        return;
+    }
     if let Ok(mode) = std::env::var("FWB") {
         fwb(&mode, n, p, reps, runs);
         return;

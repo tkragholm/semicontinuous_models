@@ -27,8 +27,9 @@ use crate::models::{
     run_with_retries,
 };
 use crate::utils::{
-    CachedFactor, add_ridge_to_diagonal, constant_irls_weights, linear_predictor, matvec_into,
-    max_abs_diff, solve_linear_system_ref, weighted_xtx_ref, weighted_xtz_ref_with_buffer,
+    CachedFactor, SerialInnerScope, add_ridge_to_diagonal, constant_irls_weights, linear_predictor,
+    matvec_into, max_abs_diff, solve_linear_system_ref, weighted_xtx_ref,
+    weighted_xtz_ref_with_buffer,
 };
 
 const LINEAR_PREDICTOR_CLIP: f64 = 30.0;
@@ -58,6 +59,11 @@ pub struct TweedieOptions {
     /// Strategy for handling non-convergence.
     #[builder(default = FitStrategy::Strict)]
     pub strategy: FitStrategy,
+    /// If true (the default), the passes inside one fit use rayon, as for
+    /// [`FitOptions::inner_parallel`](crate::FitOptions::inner_parallel). If false,
+    /// every pass runs on the calling thread in a fixed order.
+    #[builder(default = true)]
+    pub inner_parallel: bool,
 }
 
 impl Default for TweedieOptions {
@@ -70,6 +76,7 @@ impl Default for TweedieOptions {
             l2_penalty_exclude_intercept: true,
             robust_se: false,
             strategy: FitStrategy::Strict,
+            inner_parallel: true,
         }
     }
 }
@@ -245,6 +252,7 @@ fn fit_tweedie_weighted(
     // iterations to the SAME optimum. `None` cold-starts from the intercept-only model.
     initial_beta: Option<&Mat<f64>>,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
+    let _serial = SerialInnerScope::enter(!options.inner_parallel);
     let start_time = Instant::now();
     if !(1.0..=2.0).contains(&power) {
         return Err(TweedieError::InvalidPower);

@@ -18,7 +18,9 @@ use faer::prelude::*;
 use faer::{Accum, Mat, MatMut, MatRef, Par, Side};
 use num_traits::ToPrimitive;
 use rayon::prelude::*;
+use std::cell::Cell;
 use std::ops::Range;
+use std::sync::OnceLock;
 
 use crate::input::LongitudinalModelInput;
 use crate::models::two_part::TwoPartError;
@@ -41,6 +43,95 @@ pub struct EffectIntervalSummary {
     pub q025: f64,
     pub q50: f64,
     pub q975: f64,
+}
+
+thread_local! {
+    static SERIAL_INNER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks the current thread's fit as serial for the lifetime of the guard: every
+/// row-block pass, matrix-vector product and dense solve run by the fit stays on this
+/// thread. Guards nest, and a serial scope is never widened by an inner one.
+pub(crate) struct SerialInnerScope {
+    previous: bool,
+}
+
+impl SerialInnerScope {
+    /// Enter a serial scope when `serial` is true, and leave the current mode alone
+    /// otherwise.
+    pub(crate) fn enter(serial: bool) -> Self {
+        let previous = SERIAL_INNER.with(Cell::get);
+        if serial {
+            SERIAL_INNER.with(|flag| flag.set(true));
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for SerialInnerScope {
+    fn drop(&mut self) {
+        SERIAL_INNER.with(|flag| flag.set(self.previous));
+    }
+}
+
+fn serial_inner() -> bool {
+    SERIAL_INNER.with(Cell::get)
+}
+
+/// Run `f` where faer's global parallelism resolves to one thread: on a rayon pool of
+/// one worker, `Par::rayon(0)` is the size of that pool.
+fn on_single_thread<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|_| "semicontinuous-serial".to_owned())
+            .build()
+            .expect("single-thread pool")
+    })
+    .install(f)
+}
+
+/// Cholesky factor of the lower triangle of `a`, computed with `Par::Seq`.
+fn llt_factor_seq(a: MatRef<'_, f64>) -> Option<Mat<f64>> {
+    let n = a.nrows();
+    let mut lower = Mat::<f64>::zeros(n, n);
+    lower.copy_from_triangular_lower(a);
+    let mut memory = dyn_stack::MemBuffer::new(
+        faer::linalg::cholesky::llt::factor::cholesky_in_place_scratch::<f64>(
+            n,
+            Par::Seq,
+            faer::Spec::default(),
+        ),
+    );
+    faer::linalg::cholesky::llt::factor::cholesky_in_place(
+        lower.as_mut(),
+        Default::default(),
+        Par::Seq,
+        dyn_stack::MemStack::new(&mut memory),
+        faer::Spec::default(),
+    )
+    .ok()?;
+    for col in 1..n {
+        for row in 0..col {
+            lower[(row, col)] = 0.0;
+        }
+    }
+    Some(lower)
+}
+
+/// Solve `L Lᵀ x = rhs` for a factor from [`llt_factor_seq`], with `Par::Seq`.
+fn llt_solve_seq(lower: MatRef<'_, f64>, rhs: MatRef<'_, f64>) -> Mat<f64> {
+    let mut solution = rhs.to_owned();
+    let stack = dyn_stack::MemStack::new(&mut []);
+    faer::linalg::cholesky::llt::solve::solve_in_place_with_conj(
+        lower,
+        faer::Conj::No,
+        solution.as_mut(),
+        Par::Seq,
+        stack,
+    );
+    solution
 }
 
 pub fn add_ridge_to_diagonal(matrix: &mut Mat<f64>, lambda: f64, exclude_intercept: bool) {
@@ -73,6 +164,9 @@ pub(crate) fn solve_linear_system_ref(
     a_ref: MatRef<'_, f64>,
     b_ref: MatRef<'_, f64>,
 ) -> Result<Mat<f64>, TwoPartError> {
+    if serial_inner() {
+        return solve_linear_system_serial(a_ref, b_ref);
+    }
     if let Ok(cholesky) = a_ref.llt(Side::Lower) {
         let solution = cholesky.solve(b_ref);
         if matrix_is_finite(&solution) {
@@ -97,6 +191,38 @@ pub(crate) fn solve_linear_system_ref(
     Ok(robust_solution)
 }
 
+/// [`solve_linear_system_ref`] with every factorisation and solve on one thread.
+fn solve_linear_system_serial(
+    a_ref: MatRef<'_, f64>,
+    b_ref: MatRef<'_, f64>,
+) -> Result<Mat<f64>, TwoPartError> {
+    if let Some(lower) = llt_factor_seq(a_ref) {
+        let solution = llt_solve_seq(lower.as_ref(), b_ref);
+        if matrix_is_finite(&solution) {
+            return Ok(solution);
+        }
+    }
+    // The pivoted fallbacks are rare and p-by-p. They run on a one-worker pool, so
+    // faer's global parallelism resolves to one thread there.
+    let (a, b) = (a_ref.to_owned(), b_ref.to_owned());
+    on_single_thread(|| {
+        let lblt_solution = a.as_ref().lblt(Side::Lower).solve(b.as_ref());
+        if matrix_is_finite(&lblt_solution) {
+            return Ok(lblt_solution);
+        }
+        let partial_solution = a.as_ref().partial_piv_lu().solve(b.as_ref());
+        if matrix_is_finite(&partial_solution) {
+            return Ok(partial_solution);
+        }
+        let robust_solution = a.as_ref().full_piv_lu().solve(b.as_ref());
+        if matrix_is_finite(&robust_solution) {
+            Ok(robust_solution)
+        } else {
+            Err(TwoPartError::SolveFailed)
+        }
+    })
+}
+
 /// # Errors
 ///
 /// Returns `TwoPartError::SolveFailed` if the solve produces non-finite values.
@@ -116,12 +242,17 @@ pub fn solve_linear_system(a: &Mat<f64>, b: &Mat<f64>) -> Result<Mat<f64>, TwoPa
 /// on the rare failure, falling back to a pivoted LU.
 pub(crate) enum CachedFactor {
     Llt(Llt<f64>),
+    /// The lower Cholesky factor, built and applied with `Par::Seq`.
+    LltSeq(Mat<f64>),
     Lu(PartialPivLu<f64>),
 }
 
 impl CachedFactor {
     /// Factor a (ridged) Gram matrix `X'WX` once for reuse across IRLS iterations.
     pub(crate) fn factor(matrix: &Mat<f64>) -> Self {
+        if serial_inner() {
+            return Self::factor_serial(matrix);
+        }
         if let Ok(llt) = matrix.as_ref().llt(Side::Lower) {
             return Self::Llt(llt);
         }
@@ -145,11 +276,40 @@ impl CachedFactor {
         Self::Lu(matrix.as_ref().partial_piv_lu())
     }
 
+    /// [`CachedFactor::factor`] with every factorisation on one thread.
+    fn factor_serial(matrix: &Mat<f64>) -> Self {
+        if let Some(lower) = llt_factor_seq(matrix.as_ref()) {
+            return Self::LltSeq(lower);
+        }
+        let dim = matrix.nrows().min(matrix.ncols());
+        let mut jitter = 1e-10;
+        for _ in 0..8 {
+            let stabilized = Mat::from_fn(matrix.nrows(), matrix.ncols(), |r, c| {
+                if r == c && r < dim {
+                    matrix[(r, c)] + jitter
+                } else {
+                    matrix[(r, c)]
+                }
+            });
+            if let Some(lower) = llt_factor_seq(stabilized.as_ref()) {
+                return Self::LltSeq(lower);
+            }
+            jitter *= 10.0;
+        }
+        let owned = matrix.clone();
+        Self::Lu(on_single_thread(|| owned.as_ref().partial_piv_lu()))
+    }
+
     /// Back-substitute the cached factor against `rhs`. Returns `SolveFailed` if the
     /// solution is non-finite (a pathological RHS), so the caller can fall back.
     pub(crate) fn solve(&self, rhs: MatRef<'_, f64>) -> Result<Mat<f64>, TwoPartError> {
         let solution = match self {
             Self::Llt(factor) => factor.solve(rhs),
+            Self::LltSeq(lower) => llt_solve_seq(lower.as_ref(), rhs),
+            Self::Lu(factor) if serial_inner() => {
+                let rhs = rhs.to_owned();
+                on_single_thread(|| factor.solve(rhs.as_ref()))
+            }
             Self::Lu(factor) => factor.solve(rhs),
         };
         if matrix_is_finite(&solution) {
@@ -330,7 +490,20 @@ where
         block_term(0..n, total.as_mut());
         return total;
     }
-    let partials: Vec<Mat<f64>> = (0..n.div_ceil(ROW_BLOCK))
+    let blocks = n.div_ceil(ROW_BLOCK);
+    if serial_inner() {
+        // The same partials added in the same block order, on this thread.
+        for block in 0..blocks {
+            let mut partial = Mat::<f64>::zeros(rows, cols);
+            block_term(
+                block * ROW_BLOCK..((block + 1) * ROW_BLOCK).min(n),
+                partial.as_mut(),
+            );
+            add_in_place(&mut total, &partial);
+        }
+        return total;
+    }
+    let partials: Vec<Mat<f64>> = (0..blocks)
         .into_par_iter()
         .map(|block| {
             let mut partial = Mat::<f64>::zeros(rows, cols);
@@ -342,13 +515,17 @@ where
         })
         .collect();
     for partial in &partials {
-        for col in 0..cols {
-            for row in 0..rows {
-                total[(row, col)] += partial[(row, col)];
-            }
-        }
+        add_in_place(&mut total, partial);
     }
     total
+}
+
+fn add_in_place(total: &mut Mat<f64>, partial: &Mat<f64>) {
+    for col in 0..total.ncols() {
+        for row in 0..total.nrows() {
+            total[(row, col)] += partial[(row, col)];
+        }
+    }
 }
 
 /// `Σ_i s_i² x_i x_iᵀ` for the row scales `s_i = scale(i)`, exactly symmetric.
@@ -431,20 +608,30 @@ pub(crate) fn matvec_into(dst: &mut Mat<f64>, x: MatRef<'_, f64>, beta: &Mat<f64
         );
         return;
     }
-    dst.col_as_slice_mut(0)
-        .par_chunks_mut(ROW_BLOCK)
-        .enumerate()
-        .for_each(|(block, chunk)| {
-            let len = chunk.len();
-            matmul(
-                MatMut::from_column_major_slice_mut(chunk, len, 1),
-                Accum::Replace,
-                x.as_ref().subrows(block * ROW_BLOCK, len),
-                beta.as_ref(),
-                1.0,
-                Par::Seq,
-            );
-        });
+    let column = dst.col_as_slice_mut(0);
+    if serial_inner() {
+        for (block, chunk) in column.chunks_mut(ROW_BLOCK).enumerate() {
+            matvec_block(chunk, x, beta, block);
+        }
+    } else {
+        column
+            .par_chunks_mut(ROW_BLOCK)
+            .enumerate()
+            .for_each(|(block, chunk)| matvec_block(chunk, x, beta, block));
+    }
+}
+
+/// `chunk <- x[block rows] * beta` for the rows of block number `block`.
+fn matvec_block(chunk: &mut [f64], x: MatRef<'_, f64>, beta: &Mat<f64>, block: usize) {
+    let len = chunk.len();
+    matmul(
+        MatMut::from_column_major_slice_mut(chunk, len, 1),
+        Accum::Replace,
+        x.subrows(block * ROW_BLOCK, len),
+        beta.as_ref(),
+        1.0,
+        Par::Seq,
+    );
 }
 
 /// The mean over the rows of `x` of `row_mean(eta_1, .., eta_K)`, where `eta_k` is the
@@ -691,6 +878,35 @@ pub fn summarize_draws_in_place(values: &mut [f64]) -> EffectIntervalSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    #[test]
+    fn serial_scope_keeps_row_blocks_on_the_calling_thread() {
+        let n = 5 * ROW_BLOCK + 17;
+        let x = Mat::from_fn(n, 3, |i, j| ((i * 7 + j * 3) % 11) as f64);
+        let threads_used = |serial: bool| {
+            let seen = Mutex::new(HashSet::new());
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .expect("pool");
+            let gram = pool.install(|| {
+                let _scope = SerialInnerScope::enter(serial);
+                row_scaled_gram(x.as_ref(), |row| {
+                    seen.lock()
+                        .expect("lock")
+                        .insert(std::thread::current().id());
+                    1.0 + (row % 3) as f64
+                })
+            });
+            (gram, seen.into_inner().expect("lock").len())
+        };
+        let (serial_gram, serial_threads) = threads_used(true);
+        let (parallel_gram, _) = threads_used(false);
+        assert_eq!(serial_threads, 1);
+        assert_eq!(serial_gram, parallel_gram);
+    }
     use approx::assert_relative_eq;
 
     #[test]
