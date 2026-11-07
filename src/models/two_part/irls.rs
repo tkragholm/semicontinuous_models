@@ -163,7 +163,7 @@ pub(super) fn fit_logit_weighted(
 /// loop has had such a clamp since heavy-tailed outcomes were found to drive
 /// `exp(eta)` to infinity; the logit loop -- the one that actually diverges on
 /// this data -- had none.
-const LOGIT_ETA_CLAMP: f64 = 40.0;
+pub(crate) const LOGIT_ETA_CLAMP: f64 = 40.0;
 
 fn logit_eta(x: MatRef<'_, f64>, beta: &Mat<f64>) -> Mat<f64> {
     let eta = linear_predictor(x, beta);
@@ -194,7 +194,7 @@ fn logit_deviance(y: MatRef<'_, f64>, p: &Mat<f64>, weights: MatRef<'_, f64>) ->
 /// `mu` overflows to +inf, making the IRLS working response non-finite and the
 /// solve diverge — a failure that most often surfaces as non-convergence inside
 /// a resampling bootstrap.
-pub(super) const GAMMA_LOG_LINK_ETA_CLAMP: f64 = 30.0;
+pub(crate) const GAMMA_LOG_LINK_ETA_CLAMP: f64 = 30.0;
 
 pub(super) fn fit_gamma_log_link_weighted(
     x: MatRef<'_, f64>,
@@ -355,7 +355,7 @@ pub(super) fn logistic(values: &Mat<f64>) -> Mat<f64> {
     map_mat(values, |value| 1.0 / (1.0 + (-value).exp()))
 }
 
-pub(super) fn ridge_from_regularization(regularization: Regularization) -> Option<(f64, bool)> {
+pub(crate) fn ridge_from_regularization(regularization: Regularization) -> Option<(f64, bool)> {
     match regularization {
         Regularization::None => None,
         Regularization::Ridge {

@@ -93,7 +93,7 @@ fn on_single_thread<R: Send>(f: impl FnOnce() -> R + Send) -> R {
 }
 
 /// Cholesky factor of the lower triangle of `a`, computed with `Par::Seq`.
-fn llt_factor_seq(a: MatRef<'_, f64>) -> Option<Mat<f64>> {
+pub(crate) fn llt_factor_seq(a: MatRef<'_, f64>) -> Option<Mat<f64>> {
     let n = a.nrows();
     let mut lower = Mat::<f64>::zeros(n, n);
     lower.copy_from_triangular_lower(a);
@@ -121,7 +121,7 @@ fn llt_factor_seq(a: MatRef<'_, f64>) -> Option<Mat<f64>> {
 }
 
 /// Solve `L Lᵀ x = rhs` for a factor from [`llt_factor_seq`], with `Par::Seq`.
-fn llt_solve_seq(lower: MatRef<'_, f64>, rhs: MatRef<'_, f64>) -> Mat<f64> {
+pub(crate) fn llt_solve_seq(lower: MatRef<'_, f64>, rhs: MatRef<'_, f64>) -> Mat<f64> {
     let mut solution = rhs.to_owned();
     let stack = dyn_stack::MemStack::new(&mut []);
     faer::linalg::cholesky::llt::solve::solve_in_place_with_conj(
@@ -328,12 +328,16 @@ impl CachedFactor {
 /// `base_weight * (μ^(2-power)).max(min_weight)`; at power 2 the variance factor
 /// is `1.0` (above `min_weight`), so the weight is precisely `base_weight` with no
 /// flooring of the prior weight itself — matched here.
-#[must_use]
-pub(crate) fn constant_irls_weights(
+pub(crate) fn fill_constant_irls_weights(
+    out: &mut Mat<f64>,
     sample_weights: Option<MatRef<'_, f64>>,
-    n_rows: usize,
-) -> Mat<f64> {
-    Mat::from_fn(n_rows, 1, |i, _| sample_weights.map_or(1.0, |w| w[(i, 0)]))
+) {
+    match sample_weights {
+        Some(weights) => out
+            .col_as_slice_mut(0)
+            .copy_from_slice(col_slice(weights, 0)),
+        None => out.col_as_slice_mut(0).fill(1.0),
+    }
 }
 
 #[must_use]
@@ -538,9 +542,18 @@ pub(crate) fn row_scaled_gram(x: MatRef<'_, f64>, scale: impl Fn(usize) -> f64 +
         let start = rows.start;
         // One scale per row rather than one per element: the same values, p times fewer calls.
         let scales: Vec<f64> = rows.clone().map(&scale).collect();
-        let scaled = Mat::from_fn(rows.len(), p, |row, col| {
-            x[(start + row, col)] * scales[row]
-        });
+        let mut scaled = Mat::<f64>::zeros(rows.len(), p);
+        for col in 0..p {
+            let from = &col_slice(x, col)[start..start + rows.len()];
+            for ((to, &value), &row_scale) in scaled
+                .col_as_slice_mut(col)
+                .iter_mut()
+                .zip(from)
+                .zip(&scales)
+            {
+                *to = value * row_scale;
+            }
+        }
         triangular::matmul(
             out,
             BlockStructure::TriangularLower,
@@ -735,8 +748,12 @@ pub fn weighted_xtz_ref_with_buffer(
     if weighted_buffer.len() < n {
         weighted_buffer.resize(n, 0.0);
     }
-    for row in 0..n {
-        weighted_buffer[row] = weights[(row, 0)] * response[(row, 0)];
+    for ((slot, &weight), &value) in weighted_buffer[..n]
+        .iter_mut()
+        .zip(col_slice(weights, 0))
+        .zip(col_slice(response, 0))
+    {
+        *slot = weight * value;
     }
     xt_column(x, &weighted_buffer[..n])
 }

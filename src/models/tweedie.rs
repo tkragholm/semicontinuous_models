@@ -19,7 +19,7 @@ use faer::{Mat, MatRef};
 use crate::input::{InputError, ModelInput, ModelInputRef};
 use crate::models::covariance::{diag_sqrt, sandwich, score_meat};
 use crate::models::matrix_ops::{
-    center_beta, center_columns, map_mat, max_abs_linear_predictor, uncenter_beta,
+    center_beta, center_columns_into, map_mat, max_abs_linear_predictor, uncenter_beta,
     weighted_column_means,
 };
 use crate::models::{
@@ -27,13 +27,13 @@ use crate::models::{
     run_with_retries,
 };
 use crate::utils::{
-    CachedFactor, SerialInnerScope, add_ridge_to_diagonal, constant_irls_weights, linear_predictor,
-    matvec_into, max_abs_diff, solve_linear_system_ref, weighted_xtx_ref,
+    CachedFactor, SerialInnerScope, add_ridge_to_diagonal, col_slice, fill_constant_irls_weights,
+    linear_predictor, matvec_into, max_abs_diff, solve_linear_system_ref, weighted_xtx_ref,
     weighted_xtz_ref_with_buffer,
 };
 
-const LINEAR_PREDICTOR_CLIP: f64 = 30.0;
-const BACKTRACKING_STEPS: usize = 12;
+pub(crate) const LINEAR_PREDICTOR_CLIP: f64 = 30.0;
+pub(crate) const BACKTRACKING_STEPS: usize = 12;
 
 /// Tuning parameters for Tweedie fitting.
 #[derive(bon::Builder, Debug, Clone, Copy)]
@@ -77,6 +77,66 @@ impl Default for TweedieOptions {
             robust_se: false,
             strategy: FitStrategy::Strict,
             inner_parallel: true,
+        }
+    }
+}
+
+/// Column buffers of a Tweedie fit, reusable from one fit to the next.
+///
+/// A caller that runs many fits on one thread keeps one scratch and passes it to
+/// [`fit_tweedie_ref_warm_prevalidated_with_scratch`], so the fits share one centred
+/// design and one set of working columns. The buffers carry nothing from one fit to the
+/// next: a result does not depend on what the scratch held before. A fit of another
+/// shape reallocates them.
+#[derive(Debug)]
+pub struct TweedieScratch {
+    centered: Mat<f64>,
+    weights: Mat<f64>,
+    eta: Mat<f64>,
+    mu: Mat<f64>,
+    z: Mat<f64>,
+    search_eta: Mat<f64>,
+    search_mu: Mat<f64>,
+    weight_buffer: Mat<f64>,
+    xtz_buffer: Vec<f64>,
+}
+
+impl Default for TweedieScratch {
+    fn default() -> Self {
+        Self {
+            centered: Mat::zeros(0, 0),
+            weights: Mat::zeros(0, 0),
+            eta: Mat::zeros(0, 0),
+            mu: Mat::zeros(0, 0),
+            z: Mat::zeros(0, 0),
+            search_eta: Mat::zeros(0, 0),
+            search_mu: Mat::zeros(0, 0),
+            weight_buffer: Mat::zeros(0, 0),
+            xtz_buffer: Vec::new(),
+        }
+    }
+}
+
+impl TweedieScratch {
+    fn fit_shape(&mut self, n: usize) {
+        for column in [
+            &mut self.weights,
+            &mut self.eta,
+            &mut self.mu,
+            &mut self.z,
+            &mut self.search_eta,
+            &mut self.search_mu,
+            &mut self.weight_buffer,
+        ] {
+            if column.nrows() != n || column.ncols() != 1 {
+                *column = Mat::zeros(n, 1);
+            }
+        }
+    }
+
+    fn centred_shape(&mut self, n: usize, p: usize) {
+        if self.centered.nrows() != n || self.centered.ncols() != p {
+            self.centered = Mat::zeros(n, p);
         }
     }
 }
@@ -231,7 +291,18 @@ pub(crate) fn fit_tweedie(
     options: TweedieOptions,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
     // Raw entry point: validate the data (finiteness / negativity) inside the fit.
-    fit_tweedie_weighted(x, y, None, clusters, power, options, false, None)
+    let mut scratch = TweedieScratch::default();
+    fit_tweedie_weighted(
+        x,
+        y,
+        None,
+        clusters,
+        power,
+        options,
+        false,
+        None,
+        &mut scratch,
+    )
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -251,6 +322,7 @@ fn fit_tweedie_weighted(
     // the full sample, so seeding from the full-sample fit converges in far fewer
     // iterations to the SAME optimum. `None` cold-starts from the intercept-only model.
     initial_beta: Option<&Mat<f64>>,
+    scratch: &mut TweedieScratch,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
     let _serial = SerialInnerScope::enter(!options.inner_parallel);
     let start_time = Instant::now();
@@ -298,16 +370,19 @@ fn fit_tweedie_weighted(
         },
         |current| current.l2_penalty,
         |current_options| {
-            fit_tweedie_with_lambda(TweedieFitRequest {
-                x,
-                y,
-                sample_weights,
-                clusters,
-                power,
-                options: current_options,
-                lambda: current_options.l2_penalty,
-                initial_beta_override: initial_beta,
-            })
+            fit_tweedie_with_lambda(
+                TweedieFitRequest {
+                    x,
+                    y,
+                    sample_weights,
+                    clusters,
+                    power,
+                    options: current_options,
+                    lambda: current_options.l2_penalty,
+                    initial_beta_override: initial_beta,
+                },
+                scratch,
+            )
         },
     )?;
 
@@ -337,6 +412,7 @@ struct TweedieFitRequest<'a> {
 
 fn fit_tweedie_with_lambda(
     request: TweedieFitRequest<'_>,
+    scratch: &mut TweedieScratch,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
     let TweedieFitRequest {
         x,
@@ -358,12 +434,29 @@ fn fit_tweedie_with_lambda(
     // `finalize_fit`, which then computes SE/cov (and everything downstream — predict, the
     // marginal standardisation) on the original design exactly as before.
     let col_means = weighted_column_means(x, sample_weights);
-    let centered_storage;
+    scratch.fit_shape(x.nrows());
+    if let Some(means) = &col_means {
+        scratch.centred_shape(x.nrows(), x.ncols());
+        center_columns_into(&mut scratch.centered, x, means);
+    }
+    // Column buffers reused across iterations and fits, so a bootstrap's thousands of
+    // parallel fits do not churn the allocator. `eta`/`mu`/`z` are the linear predictor,
+    // mean and working response; `search_*` are line-search scratch; `weight_buffer`
+    // holds the per-iteration weight on the variable-weight path; `constant_weights` the
+    // weight of the constant-weight path.
+    let TweedieScratch {
+        centered,
+        weights: constant_weights,
+        eta,
+        mu,
+        z,
+        search_eta,
+        search_mu,
+        weight_buffer,
+        xtz_buffer,
+    } = scratch;
     let cx: MatRef<'_, f64> = match &col_means {
-        Some(means) => {
-            centered_storage = center_columns(x, means);
-            centered_storage.as_ref()
-        }
+        Some(_) => centered.as_ref(),
         None => x,
     };
 
@@ -383,28 +476,17 @@ fn fit_tweedie_with_lambda(
     // approximation: the cached factor is the true information matrix at every iterate,
     // so the β-path is identical to rebuilding it each iteration.
     let constant_weight = if (2.0 - power).abs() < 1e-12 {
-        let weights = constant_irls_weights(sample_weights, cx.nrows());
-        let mut xtwx = weighted_xtx_ref(cx, weights.as_ref());
+        fill_constant_irls_weights(constant_weights, sample_weights);
+        let mut xtwx = weighted_xtx_ref(cx, constant_weights.as_ref());
         if lambda > 0.0 {
             add_ridge_to_diagonal(&mut xtwx, lambda, options.l2_penalty_exclude_intercept);
         }
-        Some((weights, CachedFactor::factor(&xtwx)))
+        Some(CachedFactor::factor(&xtwx))
     } else {
         None
     };
 
-    // Column buffers reused across iterations so the per-replicate IRLS does not churn
-    // the allocator (the bootstrap runs thousands of these fits in parallel). `eta`/`mu`/
-    // `z` are the linear predictor, mean and working response; `search_*` are line-search
-    // scratch; `weight_buffer` holds the per-iteration weight on the variable-weight path.
     let n = cx.nrows();
-    let mut eta = Mat::<f64>::zeros(n, 1);
-    let mut mu = Mat::<f64>::zeros(n, 1);
-    let mut z = Mat::<f64>::zeros(n, 1);
-    let mut xtz_buffer: Vec<f64> = Vec::new();
-    let mut search_eta = Mat::<f64>::zeros(n, 1);
-    let mut search_mu = Mat::<f64>::zeros(n, 1);
-    let mut weight_buffer = Mat::<f64>::zeros(n, 1);
 
     // Deviance of `beta` when the line search of the previous iteration already left
     // that beta's linear predictor and mean in `search_eta`/`search_mu`.
@@ -412,31 +494,37 @@ fn fit_tweedie_with_lambda(
 
     for iteration in 0..options.max_iter {
         let current_deviance = if let Some(deviance) = carried_deviance.take() {
-            std::mem::swap(&mut eta, &mut search_eta);
-            std::mem::swap(&mut mu, &mut search_mu);
+            std::mem::swap(eta, search_eta);
+            std::mem::swap(mu, search_mu);
             deviance
         } else {
-            matvec_into(&mut eta, cx, &beta);
-            for i in 0..n {
-                mu[(i, 0)] = exp_clamped(eta[(i, 0)]);
+            matvec_into(eta, cx, &beta);
+            for (m, &e) in mu.col_as_slice_mut(0).iter_mut().zip(eta.col_as_slice(0)) {
+                *m = exp_clamped(e);
             }
-            weighted_deviance(y, &mu, power, sample_weights)
+            weighted_deviance(y, mu, power, sample_weights)
         };
 
         // Working response `z = η + (y - μ)/μ`; independent of the IRLS weights.
-        for i in 0..n {
-            z[(i, 0)] = eta[(i, 0)] + (y[(i, 0)] - mu[(i, 0)]) / mu[(i, 0)];
+        for (((slot, &e), &m), &yi) in z
+            .col_as_slice_mut(0)
+            .iter_mut()
+            .zip(eta.col_as_slice(0))
+            .zip(mu.col_as_slice(0))
+            .zip(col_slice(y, 0))
+        {
+            *slot = e + (yi - m) / m;
         }
 
-        let beta_candidate = if let Some((weights, factor)) = &constant_weight {
+        let beta_candidate = if let Some(factor) = &constant_weight {
             // Constant-weight path: reuse the cached factor; only the RHS changes.
             let xtw_rhs =
-                weighted_xtz_ref_with_buffer(cx, weights.as_ref(), z.as_ref(), &mut xtz_buffer);
+                weighted_xtz_ref_with_buffer(cx, constant_weights.as_ref(), z.as_ref(), xtz_buffer);
             match factor.solve(xtw_rhs.as_ref()) {
                 Ok(candidate) => candidate,
                 Err(_) => {
                     // Pathological RHS: stabilized solve on the (constant) matrix.
-                    let mut xtwx = weighted_xtx_ref(cx, weights.as_ref());
+                    let mut xtwx = weighted_xtx_ref(cx, constant_weights.as_ref());
                     if lambda > 0.0 {
                         add_ridge_to_diagonal(
                             &mut xtwx,
@@ -459,12 +547,8 @@ fn fit_tweedie_with_lambda(
             if lambda > 0.0 {
                 add_ridge_to_diagonal(&mut xtwx, lambda, options.l2_penalty_exclude_intercept);
             }
-            let xtw_rhs = weighted_xtz_ref_with_buffer(
-                cx,
-                weight_buffer.as_ref(),
-                z.as_ref(),
-                &mut xtz_buffer,
-            );
+            let xtw_rhs =
+                weighted_xtz_ref_with_buffer(cx, weight_buffer.as_ref(), z.as_ref(), xtz_buffer);
             solve_with_stabilization(xtwx.as_ref(), xtw_rhs.as_ref())?
         };
 
@@ -476,8 +560,8 @@ fn fit_tweedie_with_lambda(
             &beta_candidate,
             current_deviance,
             power,
-            &mut search_eta,
-            &mut search_mu,
+            search_eta,
+            search_mu,
         );
 
         let beta_converged = max_abs_diff(&beta_next, &beta) < options.tolerance;
@@ -489,6 +573,14 @@ fn fit_tweedie_with_lambda(
                 Some(means) => uncenter_beta(&beta_next, means),
                 None => beta_next,
             };
+            // The line search left this beta's linear predictor in `search_eta`, so the
+            // saturation check needs no product with the raw design.
+            let known_max_eta = scratch_holds_beta_next.then(|| {
+                search_eta
+                    .col_as_slice(0)
+                    .iter()
+                    .fold(0.0_f64, |acc, value| acc.max(value.abs()))
+            });
             return finalize_fit(
                 x,
                 y,
@@ -499,6 +591,7 @@ fn fit_tweedie_with_lambda(
                 lambda,
                 beta_raw,
                 iteration + 1,
+                known_max_eta,
             );
         }
         if scratch_holds_beta_next {
@@ -566,6 +659,7 @@ fn finalize_fit(
     lambda: f64,
     beta_final: Mat<f64>,
     iterations: usize,
+    known_max_eta: Option<f64>,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
     // Saturation guard: a converged fit whose linear predictor still reaches the
     // `exp_clamped` ceiling has distorted, non-multiplicative predictions (the marginal
@@ -574,7 +668,8 @@ fn finalize_fit(
     // retries with stronger ridge (which shrinks η back into range); if it still saturates
     // the fit fails loudly rather than exporting a meaningless estimate. Centering keeps η
     // well inside the range for well-posed data, so this only fires on genuine divergence.
-    if max_abs_linear_predictor(x, &beta_final) >= LINEAR_PREDICTOR_CLIP {
+    let max_eta = known_max_eta.unwrap_or_else(|| max_abs_linear_predictor(x, &beta_final));
+    if max_eta >= LINEAR_PREDICTOR_CLIP {
         return Err(TweedieError::NonConvergence);
     }
     // The information matrix and fitted means feed only the sandwich covariance, so a
@@ -697,11 +792,45 @@ pub fn fit_tweedie_ref_warm_prevalidated(
     fit_tweedie_ref_validated(input, power, options, initial_beta)
 }
 
+/// [`fit_tweedie_ref_warm_prevalidated`] with its column buffers held by the caller.
+///
+/// The result is bit-identical to that of [`fit_tweedie_ref_warm_prevalidated`]. Only
+/// the allocations differ, so a thread that fits many replicates of one sample keeps
+/// one centred design and one set of columns rather than allocating them per fit.
+///
+/// # Errors
+///
+/// Returns `TweedieError` if the weights or the cluster labels are malformed or the
+/// solver fails.
+pub fn fit_tweedie_ref_warm_prevalidated_with_scratch(
+    input: ModelInputRef<'_>,
+    power: f64,
+    options: TweedieOptions,
+    initial_beta: Option<&Mat<f64>>,
+    scratch: &mut TweedieScratch,
+) -> Result<(TweedieModel, TweedieReport), TweedieError> {
+    input
+        .validate_weights_and_clusters()
+        .map_err(TweedieError::from)?;
+    fit_tweedie_ref_validated_with_scratch(input, power, options, initial_beta, scratch)
+}
+
 fn fit_tweedie_ref_validated(
     input: ModelInputRef<'_>,
     power: f64,
     options: TweedieOptions,
     initial_beta: Option<&Mat<f64>>,
+) -> Result<(TweedieModel, TweedieReport), TweedieError> {
+    let mut scratch = TweedieScratch::default();
+    fit_tweedie_ref_validated_with_scratch(input, power, options, initial_beta, &mut scratch)
+}
+
+fn fit_tweedie_ref_validated_with_scratch(
+    input: ModelInputRef<'_>,
+    power: f64,
+    options: TweedieOptions,
+    initial_beta: Option<&Mat<f64>>,
+    scratch: &mut TweedieScratch,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
     fit_tweedie_weighted(
         input.design_matrix,
@@ -713,6 +842,7 @@ fn fit_tweedie_ref_validated(
         // The caller has scanned finiteness and negativity of the design and outcome.
         true,
         initial_beta,
+        scratch,
     )
 }
 
@@ -753,11 +883,11 @@ fn weighted_deviance(
 
     // Closed-form endpoint for p = 2 (Gamma deviance limit).
     if (power - 2.0).abs() < 1e-12 {
+        let weight_column = sample_weights.map(|weights| col_slice(weights, 0));
         let mut result = 0.0;
-        for i in 0..y.nrows() {
-            let yi = y[(i, 0)];
-            let mui = mu[(i, 0)].max(1e-12);
-            let weight = sample_weight_at(sample_weights, i);
+        for (i, (&yi, &mu_i)) in col_slice(y, 0).iter().zip(mu.col_as_slice(0)).enumerate() {
+            let mui = mu_i.max(1e-12);
+            let weight = weight_column.map_or(1.0, |weights| weights[i]);
             if yi <= 0.0 {
                 return f64::INFINITY;
             }
@@ -896,8 +1026,12 @@ fn trial_deviance(
     scratch_mu: &mut Mat<f64>,
 ) -> f64 {
     matvec_into(scratch_eta, x, beta);
-    for i in 0..scratch_eta.nrows() {
-        scratch_mu[(i, 0)] = exp_clamped(scratch_eta[(i, 0)]);
+    for (m, &e) in scratch_mu
+        .col_as_slice_mut(0)
+        .iter_mut()
+        .zip(scratch_eta.col_as_slice(0))
+    {
+        *m = exp_clamped(e);
     }
     weighted_deviance(y, scratch_mu, power, sample_weights)
 }
@@ -914,14 +1048,24 @@ fn blend_betas_into(
     }
 }
 
-fn relative_change(previous: f64, next: f64) -> f64 {
+pub(crate) fn relative_change(previous: f64, next: f64) -> f64 {
     if !previous.is_finite() || !next.is_finite() {
         return f64::INFINITY;
     }
     (next - previous).abs() / previous.abs().max(1.0)
 }
 
-fn exp_clamped(value: f64) -> f64 {
+/// The gamma deviance of [`weighted_deviance`] on slices of positive outcomes.
+pub(crate) fn gamma_deviance(y: &[f64], mu: &[f64], weights: &[f64]) -> f64 {
+    let mut result = 0.0;
+    for ((&yi, &mu_i), &weight) in y.iter().zip(mu).zip(weights) {
+        let mui = mu_i.max(1e-12);
+        result = (weight * 2.0).mul_add(((yi - mui) / mui) - (yi / mui).ln(), result);
+    }
+    result
+}
+
+pub(crate) fn exp_clamped(value: f64) -> f64 {
     value
         .clamp(-LINEAR_PREDICTOR_CLIP, LINEAR_PREDICTOR_CLIP)
         .exp()

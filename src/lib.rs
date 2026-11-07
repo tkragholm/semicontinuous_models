@@ -42,9 +42,16 @@ pub use models::two_part::{
 };
 
 pub use models::tweedie::{
-    TweedieError, TweedieModel, TweedieOptions, TweediePrediction, TweedieReport, TweedieTrainer,
-    deviance as tweedie_deviance, fit_tweedie_input, fit_tweedie_input_warm, fit_tweedie_ref_warm,
-    fit_tweedie_ref_warm_prevalidated, quasi_log_likelihood as tweedie_quasi_log_likelihood,
+    TweedieError, TweedieModel, TweedieOptions, TweediePrediction, TweedieReport, TweedieScratch,
+    TweedieTrainer, deviance as tweedie_deviance, fit_tweedie_input, fit_tweedie_input_warm,
+    fit_tweedie_ref_warm, fit_tweedie_ref_warm_prevalidated,
+    fit_tweedie_ref_warm_prevalidated_with_scratch,
+    quasi_log_likelihood as tweedie_quasi_log_likelihood,
+};
+
+pub use models::prepared::{
+    PreparedFitError, PreparedGammaDesign, PreparedGammaFit, PreparedPredictionDesign,
+    PreparedScratch, PreparedTwoPartDesign, PreparedTwoPartFit,
 };
 
 pub use models::lognormal::{

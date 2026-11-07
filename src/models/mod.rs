@@ -6,6 +6,7 @@ pub(crate) mod covariance;
 pub mod lognormal;
 pub mod matrix_ops;
 pub mod mtp;
+pub mod prepared;
 pub mod selection;
 pub mod tweedie;
 pub mod two_part;

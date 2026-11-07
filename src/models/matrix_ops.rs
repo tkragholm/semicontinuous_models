@@ -47,7 +47,7 @@ pub fn map_mat(values: &Mat<f64>, f: impl Fn(f64) -> f64) -> Mat<f64> {
 
 const CONSTANT_COLUMN_TOL: f64 = 1e-12;
 
-fn column_is_constant(x: MatRef<'_, f64>, column: usize) -> bool {
+pub(crate) fn column_is_constant(x: MatRef<'_, f64>, column: usize) -> bool {
     let n = x.nrows();
     if n == 0 {
         return true;
@@ -112,6 +112,16 @@ pub(crate) fn weighted_column_means(
 #[must_use]
 pub(crate) fn center_columns(x: MatRef<'_, f64>, means: &[f64]) -> Mat<f64> {
     Mat::from_fn(x.nrows(), x.ncols(), |i, j| x[(i, j)] - means[j])
+}
+
+/// [`center_columns`] into an existing matrix of the same shape.
+pub(crate) fn center_columns_into(out: &mut Mat<f64>, x: MatRef<'_, f64>, means: &[f64]) {
+    for (j, &mean) in means.iter().enumerate() {
+        let from = crate::utils::col_slice(x, j);
+        for (to, &value) in out.col_as_slice_mut(j).iter_mut().zip(from) {
+            *to = value - mean;
+        }
+    }
 }
 
 /// Map centered-scale coefficients back to the raw-x scale. Slopes are unchanged; the

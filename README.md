@@ -64,6 +64,11 @@ Preprocess helpers:
 - `column_has_variation`
 - `outcome_diagnostics`
 
+Repeated fits of one design under different weights, as in a fractional-random-weight bootstrap:
+
+- `PreparedGammaDesign`, `PreparedTwoPartDesign`, `PreparedPredictionDesign`, with `PreparedScratch` and `PreparedFitError`. Results agree with the dense fits up to rounding. The `models::prepared` documentation states when to fall back to them.
+- `fit_tweedie_ref_warm_prevalidated_with_scratch` with `TweedieScratch`, bit-identical to the fit that allocates.
+
 ## Data contract
 
 - Provide an intercept column explicitly if you want one.

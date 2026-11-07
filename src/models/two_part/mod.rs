@@ -18,7 +18,7 @@
 mod bootstrap;
 mod covariance;
 mod elastic_net;
-mod irls;
+pub(crate) mod irls;
 mod trainer;
 
 pub use bootstrap::{bootstrap, bootstrap_percentile_ci, bootstrap_summary};
