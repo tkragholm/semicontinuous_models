@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 - 2026-11-19
 
 All random draws now come from `epistat_rng::Stream` (SplitMix64) instead of
 `rand`'s `StdRng`: the case bootstrap, the cross-validation fold shuffle and the
