@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.9.0 - Unreleased
+## 0.9.0 - 2026-11-20
 
 Dependencies: epistat-rng 0.1.3, epistat-stats 0.2.3, epistat-inference 0.3.1 and
 epistat-glm 0.1.1. statrs is removed, and rand and rand_distr are no longer runtime
