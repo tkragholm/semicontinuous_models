@@ -44,7 +44,7 @@ epistat-inference = "0.3.0"
 epistat-stats = "0.2.0"
 
 [dev-dependencies]
-epistat-testkit = { git = "https://github.com/tkragholm/epistat", rev = "3ef48dd7ed88588ea4c64ca560f5c7d08de89b57" }
+epistat-testkit = "0.1.0"
 approx = "0.5.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
