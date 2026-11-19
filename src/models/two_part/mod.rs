@@ -884,7 +884,6 @@ mod tests {
     use super::*;
     use crate::utils::usize_to_f64;
     use approx::assert_relative_eq;
-    use rand::prelude::*;
 
     #[test]
     fn two_part_model_runs_on_synthetic_data() {
@@ -896,12 +895,12 @@ mod tests {
         );
 
         let mut y = Mat::<f64>::zeros(n, 1);
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut rng = epistat_rng::Stream::seeded(42);
         for i in 0..n {
             let p = 1.0 / (1.0 + (-0.5f64.mul_add(x[(i, 1)], -1.0)).exp());
-            if rng.random_range(0.0..1.0) < p {
+            if rng.uniform() < p {
                 let mean = 0.3f64.mul_add(x[(i, 1)], 1.0).exp();
-                y[(i, 0)] = mean * (0.5 + rng.random_range(0.0..1.0));
+                y[(i, 0)] = mean * (0.5 + rng.uniform());
             }
         }
 

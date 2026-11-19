@@ -6,10 +6,9 @@
 //! HC0 standard errors computed in R from `glm` fits on the same rows, and a
 //! clustered fit with one row per cluster must reproduce the unclustered sandwich.
 
+use epistat_rng::{Stream, replicate_seed};
 use faer::prelude::*;
 use faer::{Mat, Side};
-use rand::SeedableRng;
-use rand::rngs::StdRng;
 use rand_distr::{Distribution, Gamma};
 use semicontinuous_models::{
     FitOptions, ModelInput, TweedieOptions, fit_tweedie_input, fit_two_part_input,
@@ -17,30 +16,12 @@ use semicontinuous_models::{
 
 const N_ROWS: usize = 20_000;
 
-/// SplitMix64, so the fixture does not depend on an RNG crate's stream and the R
-/// references stay valid.
-struct Stream(u64);
-
-impl Stream {
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn uniform(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1_u64 << 53) as f64
-    }
-}
-
 /// Intercept, a uniform covariate and a binary one. `Pr(y > 0)` follows the
 /// logit `0.2 + 0.8 x1 - 0.5 x2`, and a positive `y` is exponential with mean
 /// `exp(1 + 0.3 x1 + 0.2 x2)`, so both parts are correctly specified with unit
 /// dispersion.
 fn two_part_fixture() -> (Mat<f64>, Mat<f64>) {
-    let mut stream = Stream(20_261_002);
+    let mut stream = Stream::seeded(20_261_002);
     let mut x = Mat::<f64>::zeros(N_ROWS, 3);
     let mut y = Mat::<f64>::zeros(N_ROWS, 1);
     for i in 0..N_ROWS {
@@ -177,8 +158,8 @@ fn tweedie_gamma_robust_se_matches_model_based_and_r() {
 fn tweedie_robust_se_matches_model_based_at_power_one_and_a_half() {
     // Gamma(shape = sqrt(mu), scale = sqrt(mu)) has mean mu and variance mu^1.5,
     // the Tweedie variance function at power 1.5 with unit dispersion.
-    let mut stream = Stream(20_261_003);
-    let mut rng = StdRng::seed_from_u64(20_261_003);
+    let mut stream = Stream::seeded(20_261_003);
+    let mut rng = Stream::seeded(replicate_seed(20_261_003, 1));
     let mut x = Mat::<f64>::zeros(N_ROWS, 3);
     let mut y = Mat::<f64>::zeros(N_ROWS, 1);
     for i in 0..N_ROWS {

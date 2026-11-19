@@ -48,13 +48,16 @@ pub fn benchmark_weighted_xtz(x: &Mat<f64>, weights: &Mat<f64>, response: &Mat<f
 #[cfg(feature = "bench-internals")]
 #[must_use]
 pub fn benchmark_sample_standard_normals(count: usize, seed: u64) -> f64 {
-    use rand::{SeedableRng, rngs::StdRng};
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = epistat_rng::Stream::seeded(seed);
     let mut sum = 0.0;
     for _ in 0..count {
         sum += sample_standard_normal(&mut rng);
     }
     sum
+}
+
+fn chain_seed(seed: u64, chain_index: usize) -> u64 {
+    epistat_rng::replicate_seed(seed, u64::try_from(chain_index).unwrap_or(u64::MAX))
 }
 
 #[derive(Debug, Clone)]
@@ -645,10 +648,7 @@ pub fn fit_mtp_input_multi_chain_with_posterior_config(
         let mut handles = Vec::with_capacity(multi_chain.chains);
         for chain_index in 0..multi_chain.chains {
             let mut chain_options = options;
-            let index_u64 = u64::try_from(chain_index).unwrap_or(u64::MAX);
-            chain_options.seed = options
-                .seed
-                .wrapping_add(index_u64.saturating_mul(multi_chain.seed_stride));
+            chain_options.seed = chain_seed(options.seed, chain_index);
             let chain_config = MtpSamplerConfig {
                 fit_options: chain_options,
                 ..config
@@ -686,10 +686,7 @@ pub fn fit_mtp_input_multi_chain_with_posterior_config(
         .take(multi_chain.chains)
     {
         let mut chain_options = options;
-        let index_u64 = u64::try_from(chain_index).unwrap_or(u64::MAX);
-        chain_options.seed = options
-            .seed
-            .wrapping_add(index_u64.saturating_mul(multi_chain.seed_stride));
+        chain_options.seed = chain_seed(options.seed, chain_index);
 
         let sampling = chain_result.take().ok_or(MtpError::NonConvergence)??;
 
@@ -746,13 +743,10 @@ pub fn fit_mtp_input_multi_chain_with_posterior_config(
 
 #[cfg(test)]
 mod tests {
-    use faer::Mat;
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
-
     use super::updates::update_alpha_block;
     use super::*;
     use crate::utils::{matrix_is_finite, usize_to_f64, weighted_xtx, weighted_xtz};
+    use faer::Mat;
 
     fn basic_input() -> LongitudinalModelInput {
         LongitudinalModelInput::new(
@@ -836,10 +830,7 @@ mod tests {
             .burn_in(20)
             .thin(2)
             .build();
-        let multi_chain = MtpMultiChainOptions {
-            chains: 2,
-            seed_stride: 7,
-        };
+        let multi_chain = MtpMultiChainOptions { chains: 2 };
 
         let (model, report, chains) =
             fit_mtp_input_multi_chain_with_posterior(&input, options, multi_chain)
@@ -853,41 +844,46 @@ mod tests {
     }
 
     #[test]
-    fn first_multi_chain_matches_single_chain_seed_path() {
+    fn each_chain_matches_the_single_chain_fit_of_its_replicate_seed() {
         let input = basic_input();
+        let options = MtpFitOptions::builder()
+            .iterations(70)
+            .burn_in(20)
+            .thin(2)
+            .seed(1_337)
+            .build();
         let config = MtpSamplerConfig {
-            fit_options: MtpFitOptions::builder()
-                .iterations(70)
-                .burn_in(20)
-                .thin(2)
-                .seed(1_337)
-                .build(),
+            fit_options: options,
             ..MtpSamplerConfig::default()
         };
-
-        let (_, _, single_posterior) = fit_mtp_input_with_posterior_config(&input, config)
-            .expect("single-chain fit should run");
         let (_, _, chains) = fit_mtp_input_multi_chain_with_posterior_config(
             &input,
             config,
-            MtpMultiChainOptions {
-                chains: 2,
-                seed_stride: 7,
-            },
+            MtpMultiChainOptions { chains: 2 },
         )
         .expect("multi-chain fit should run");
 
         assert_eq!(chains.len(), 2);
-        assert_eq!(chains[0].len(), single_posterior.len());
-        for (single_draw, chain_draw) in single_posterior.draws.iter().zip(&chains[0].draws) {
-            for (single_alpha, chain_alpha) in single_draw.alpha.iter().zip(&chain_draw.alpha) {
-                assert!((single_alpha - chain_alpha).abs() < 1.0e-12);
+        for (index, chain) in chains.iter().enumerate() {
+            let single_config = MtpSamplerConfig {
+                fit_options: MtpFitOptions {
+                    seed: chain_seed(options.seed, index),
+                    ..options
+                },
+                ..config
+            };
+            let (_, _, single) = fit_mtp_input_with_posterior_config(&input, single_config)
+                .expect("single-chain fit should run");
+            assert_eq!(chain.len(), single.len());
+            for (single_draw, chain_draw) in single.draws.iter().zip(&chain.draws) {
+                assert_eq!(single_draw.alpha, chain_draw.alpha);
+                assert_eq!(single_draw.beta, chain_draw.beta);
+                assert_eq!(single_draw.kappa.to_bits(), chain_draw.kappa.to_bits());
+                assert_eq!(
+                    single_draw.omega_sq.to_bits(),
+                    chain_draw.omega_sq.to_bits()
+                );
             }
-            for (single_beta, chain_beta) in single_draw.beta.iter().zip(&chain_draw.beta) {
-                assert!((single_beta - chain_beta).abs() < 1.0e-12);
-            }
-            assert!((single_draw.kappa - chain_draw.kappa).abs() < 1.0e-12);
-            assert!((single_draw.omega_sq - chain_draw.omega_sq).abs() < 1.0e-12);
         }
     }
 
@@ -1041,7 +1037,7 @@ mod tests {
         let mut posterior =
             PosteriorCache::initialize_with_likelihood(&context, &state, row_cache.total)
                 .expect("posterior cache should build");
-        let mut rng = StdRng::seed_from_u64(42);
+        let mut rng = epistat_rng::Stream::seeded(42);
         let alpha_scales = vec![0.05; state.alpha.len()];
         let n_rows = row_cache.row_log_likelihood.len();
         let mut buffers = SamplerBuffers {

@@ -1,7 +1,7 @@
 //! Row-resampling bootstrap and its percentile summaries.
 
+use epistat_rng::Stream;
 use faer::Mat;
-use rand::prelude::*;
 
 use super::{
     BootstrapOptions, BootstrapResult, BootstrapSummary, ConfidenceInterval, FitOptions,
@@ -34,14 +34,14 @@ pub fn bootstrap(
         });
     }
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(bootstrap.seed);
+    let mut rng = Stream::seeded(bootstrap.seed);
     let mut betas_logit = Vec::with_capacity(bootstrap.iterations);
     let mut betas_gamma = Vec::with_capacity(bootstrap.iterations);
     let mut failures = 0;
 
     for _ in 0..bootstrap.iterations {
         let indices = (0..x.nrows())
-            .map(|_| rng.random_range(0..x.nrows()))
+            .map(|_| rng.below(x.nrows()))
             .collect::<Vec<_>>();
         let x_sample = select_rows(x, &indices);
         let y_sample = select_values(y, &indices);

@@ -1,6 +1,5 @@
+use epistat_rng::Stream;
 use faer::Mat;
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 use semicontinuous_models::{
     LongitudinalModelInput, MtpFitOptions, MtpProposalTuning, MtpSamplerConfig,
     fit_mtp_input_with_posterior_config, posterior_predictive_summary,
@@ -19,9 +18,9 @@ fn logistic(value: f64) -> f64 {
     }
 }
 
-fn sample_standard_normal(rng: &mut StdRng) -> f64 {
-    let u1 = (1.0_f64 - rng.random::<f64>()).max(f64::MIN_POSITIVE);
-    let u2 = rng.random::<f64>();
+fn sample_standard_normal(rng: &mut Stream) -> f64 {
+    let u1 = (1.0_f64 - rng.uniform()).max(f64::MIN_POSITIVE);
+    let u2 = rng.uniform();
     (-2.0_f64 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 
@@ -43,7 +42,7 @@ fn simulate_mtp_panel(
 ) -> LongitudinalModelInput {
     let nrows = n_subjects * periods;
     let omega = omega_sq.sqrt();
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = Stream::seeded(seed);
 
     let mut outcome = Vec::with_capacity(nrows);
     let mut x_binary = Vec::with_capacity(nrows * 2);
@@ -59,7 +58,7 @@ fn simulate_mtp_panel(
             let marginal_log_mean = beta[1].mul_add(t, beta[0]);
             let xi = (-0.5 * omega_sq).mul_add(1.0, marginal_log_mean - p_positive.ln());
 
-            let y = if rng.random::<f64>() < p_positive {
+            let y = if rng.uniform() < p_positive {
                 (omega.mul_add(sample_standard_normal(&mut rng), xi)).exp()
             } else {
                 0.0
@@ -106,8 +105,8 @@ fn mtp_recovers_key_parameters_on_synthetic_data() {
     let config = MtpSamplerConfig::builder()
         .fit_options(
             MtpFitOptions::builder()
-                .iterations(420)
-                .burn_in(120)
+                .iterations(3000)
+                .burn_in(1000)
                 .thin(6)
                 .build(),
         )
@@ -123,7 +122,9 @@ fn mtp_recovers_key_parameters_on_synthetic_data() {
     assert_eq!(summary.alpha.len(), 2);
     assert_eq!(summary.beta.len(), 2);
     assert!((summary.alpha[1].mean - true_alpha[1]).abs() < 0.6);
-    assert!((summary.beta[1].mean - true_beta[1]).abs() < 0.45);
+    // 3000 iterations recover beta[1] within 0.14 on every data seed tried;
+    // a few hundred do not converge on this panel and leave it near zero.
+    assert!((summary.beta[1].mean - true_beta[1]).abs() < 0.3);
     let omega_mean = summary.omega_sq.expect("omega summary").mean;
     assert!(omega_mean.is_finite());
     assert!(omega_mean > 0.05);

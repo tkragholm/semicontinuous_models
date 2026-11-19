@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+All random draws now come from `epistat_rng::Stream` (SplitMix64) instead of
+`rand`'s `StdRng`: the case bootstrap, the cross-validation fold shuffle and the
+MTP samplers. `rand_distr` still supplies the gamma, normal, chi-square and
+Wishart draws, from the same stream. A seed gives the same results on every
+platform, but they are not the same as in 0.5.0, so bootstrap intervals,
+cross-validation fold assignments and MTP posterior draws change for a given
+seed. Fits without random draws are bit-identical to 0.5.0.
+
+- Chain `i` of a multi-chain MTP fit is seeded with
+  `epistat_rng::replicate_seed(seed, i)`. `MtpMultiChainOptions::seed_stride` and
+  `MtpError::InvalidSeedStride` are removed, and chain 0 no longer uses the base
+  seed itself.
+- The prepared designs factorise through `epistat-linalg`'s
+  `Factor::cholesky_factor` and `Factor::solve`, with the same pivot checks.
+- Builds on `epistat-linalg` 0.2.
+
 ## 0.5.0
 
 The dense solves, the cached factor of the gamma and Tweedie IRLS, the

@@ -15,7 +15,7 @@ use faer::Mat;
 
 use crate::models::Model;
 use crate::models::matrix_ops::{select_rows, select_values};
-use rand::prelude::*;
+use epistat_rng::Stream;
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -430,8 +430,8 @@ pub fn cross_validate_models_input(
     }
 
     let mut indices = (0..n).collect::<Vec<_>>();
-    let mut rng = rand::rngs::StdRng::seed_from_u64(options.seed);
-    indices.shuffle(&mut rng);
+    let mut rng = Stream::seeded(options.seed);
+    rng.shuffle(&mut indices);
 
     let fold_size = n.div_ceil(options.k_folds);
     let fold_bounds = (0..options.k_folds)

@@ -1,6 +1,5 @@
+use epistat_rng::Stream;
 use faer::Mat;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
 
 use crate::input::LongitudinalModelInput;
 use crate::models::matrix_ops::{select_rows, select_values};
@@ -195,7 +194,7 @@ pub(super) fn simulate_posterior_draws(
     } = *request;
 
     let options = config.fit_options;
-    let mut rng = StdRng::seed_from_u64(options.seed);
+    let mut rng = Stream::seeded(options.seed);
     let context = SamplerContext {
         input,
         subjects,
@@ -272,7 +271,7 @@ pub(super) fn build_initial_proposal_scales(
 #[allow(clippy::too_many_lines)]
 pub(super) fn run_mcmc_chain(
     context: &SamplerContext<'_>,
-    rng: &mut StdRng,
+    rng: &mut Stream,
     state: &mut ChainState,
     mut proposal_scales: ProposalScales,
     options: MtpFitOptions,

@@ -39,49 +39,6 @@ pub struct EffectIntervalSummary {
     pub q975: f64,
 }
 
-/// Cholesky factor of the lower triangle of `a`, computed with `Par::Seq`. The prepared
-/// designs check the pivots of this factor, which a [`Factor`] does not expose.
-pub(crate) fn llt_factor_seq(a: MatRef<'_, f64>) -> Option<Mat<f64>> {
-    let n = a.nrows();
-    let mut lower = Mat::<f64>::zeros(n, n);
-    lower.copy_from_triangular_lower(a);
-    let mut memory = dyn_stack::MemBuffer::new(
-        faer::linalg::cholesky::llt::factor::cholesky_in_place_scratch::<f64>(
-            n,
-            Par::Seq,
-            faer::Spec::default(),
-        ),
-    );
-    faer::linalg::cholesky::llt::factor::cholesky_in_place(
-        lower.as_mut(),
-        Default::default(),
-        Par::Seq,
-        dyn_stack::MemStack::new(&mut memory),
-        faer::Spec::default(),
-    )
-    .ok()?;
-    for col in 1..n {
-        for row in 0..col {
-            lower[(row, col)] = 0.0;
-        }
-    }
-    Some(lower)
-}
-
-/// Solve `L Lᵀ x = rhs` for a factor from [`llt_factor_seq`], with `Par::Seq`.
-pub(crate) fn llt_solve_seq(lower: MatRef<'_, f64>, rhs: MatRef<'_, f64>) -> Mat<f64> {
-    let mut solution = rhs.to_owned();
-    let stack = dyn_stack::MemStack::new(&mut []);
-    faer::linalg::cholesky::llt::solve::solve_in_place_with_conj(
-        lower,
-        faer::Conj::No,
-        solution.as_mut(),
-        Par::Seq,
-        stack,
-    );
-    solution
-}
-
 pub fn add_ridge_to_diagonal(matrix: &mut Mat<f64>, lambda: f64, exclude_intercept: bool) {
     if lambda <= 0.0 {
         return;

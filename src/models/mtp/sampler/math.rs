@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
 use dyn_stack::{MemBuffer, MemStack};
+use epistat_rng::Stream;
 use faer::linalg::cholesky::llt;
 use faer::linalg::cholesky::llt::factor::LltRegularization;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side, Spec};
 use rand::RngExt;
-use rand::rngs::StdRng;
 
 use crate::input::LongitudinalModelInput;
 use crate::models::matrix_ops::select_rows;
@@ -45,7 +45,7 @@ pub(super) fn random_walk_vector_into(
     output: &mut Vec<f64>,
     values: &[f64],
     scales: &[f64],
-    rng: &mut StdRng,
+    rng: &mut Stream,
     min_draw_scale: f64,
 ) {
     output.clear();
@@ -57,8 +57,8 @@ pub(super) fn random_walk_vector_into(
     );
 }
 
-pub(super) fn should_accept(log_acceptance: f64, rng: &mut StdRng) -> bool {
-    log_acceptance >= 0.0 || rng.random::<f64>().ln() < log_acceptance
+pub(super) fn should_accept(log_acceptance: f64, rng: &mut Stream) -> bool {
+    log_acceptance >= 0.0 || rng.uniform().ln() < log_acceptance
 }
 
 pub(super) fn adapt_vector_scale(scales: &mut [f64], acceptance: f64, tuning: MtpProposalTuning) {
@@ -433,7 +433,7 @@ pub(super) fn posterior_scale_matrix(
 }
 
 pub(super) fn sample_inverse_wishart(
-    rng: &mut StdRng,
+    rng: &mut Stream,
     df: f64,
     scale: &Mat<f64>,
     inverse_scratch: &mut SpdInverseScratch,
@@ -446,7 +446,7 @@ pub(super) fn sample_inverse_wishart(
 }
 
 pub(super) fn sample_wishart(
-    rng: &mut StdRng,
+    rng: &mut Stream,
     df: f64,
     scale: &Mat<f64>,
 ) -> Result<Mat<f64>, MtpError> {
@@ -503,17 +503,17 @@ pub(super) fn cholesky_lower(matrix: &Mat<f64>) -> Option<Mat<f64>> {
     }))
 }
 
-pub(super) fn sample_chi_square(rng: &mut StdRng, dof: f64) -> f64 {
+pub(super) fn sample_chi_square(rng: &mut Stream, dof: f64) -> f64 {
     sample_gamma(rng, 0.5 * dof, 2.0)
 }
 
-pub(super) fn sample_gamma(rng: &mut StdRng, shape: f64, scale: f64) -> f64 {
+pub(super) fn sample_gamma(rng: &mut Stream, shape: f64, scale: f64) -> f64 {
     if !(shape > 0.0 && scale > 0.0) {
         return f64::NAN;
     }
 
     if shape < 1.0 {
-        let u = (1.0_f64 - rng.random::<f64>()).max(f64::MIN_POSITIVE);
+        let u = (1.0_f64 - rng.uniform()).max(f64::MIN_POSITIVE);
         return sample_gamma(rng, shape + 1.0, scale) * u.powf(1.0 / shape);
     }
 
@@ -526,7 +526,7 @@ pub(super) fn sample_gamma(rng: &mut StdRng, shape: f64, scale: f64) -> f64 {
             continue;
         }
         let cubic_term = one_plus_coeff_noise * one_plus_coeff_noise * one_plus_coeff_noise;
-        let uniform = rng.random::<f64>();
+        let uniform = rng.uniform();
         if uniform
             < (0.0331 * standard_normal * standard_normal * standard_normal)
                 .mul_add(-standard_normal, 1.0)
@@ -633,7 +633,7 @@ pub(super) fn subject_effect_log_prior(effect: &[f64], random_effects_precision:
     -0.5 * quadratic_form_vec(effect, random_effects_precision)
 }
 
-pub(super) fn sample_standard_normal(rng: &mut StdRng) -> f64 {
+pub(super) fn sample_standard_normal(rng: &mut Stream) -> f64 {
     rng.sample(rand_distr::StandardNormal)
 }
 

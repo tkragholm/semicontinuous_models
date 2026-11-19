@@ -1,4 +1,4 @@
-use rand::rngs::StdRng;
+use epistat_rng::Stream;
 
 use super::math::{
     SpdInverseScratch, covariance_from_subject_effects, invert_matrix_with_jitter_and_scratch,
@@ -14,7 +14,7 @@ use super::{
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_alpha_block(
     context: &SamplerContext<'_>,
-    rng: &mut StdRng,
+    rng: &mut Stream,
     state: &mut ChainState,
     posterior: &mut PosteriorCache,
     row_cache: &mut RowLikelihoodCache,
@@ -71,7 +71,7 @@ pub(super) fn update_alpha_block(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_beta_block(
     context: &SamplerContext<'_>,
-    rng: &mut StdRng,
+    rng: &mut Stream,
     state: &mut ChainState,
     posterior: &mut PosteriorCache,
     row_cache: &mut RowLikelihoodCache,
@@ -234,7 +234,7 @@ pub(super) fn evaluate_subject_proposals(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_random_effects_block(
     context: &SamplerContext<'_>,
-    rng: &mut StdRng,
+    rng: &mut Stream,
     state: &mut ChainState,
     posterior: &mut PosteriorCache,
     row_cache: &mut RowLikelihoodCache,
@@ -291,7 +291,7 @@ pub(super) fn update_random_effects_block(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_family_effects_block(
     context: &SamplerContext<'_>,
-    rng: &mut StdRng,
+    rng: &mut Stream,
     state: &mut ChainState,
     posterior: &mut PosteriorCache,
     row_cache: &mut RowLikelihoodCache,
@@ -362,7 +362,7 @@ pub(super) fn update_family_effects_block(
 
 pub(super) fn update_sigma_block(
     context: &SamplerContext<'_>,
-    rng: &mut StdRng,
+    rng: &mut Stream,
     state: &mut ChainState,
     posterior: &mut PosteriorCache,
     inverse_scratch: &mut SpdInverseScratch,
@@ -399,7 +399,7 @@ pub(super) fn update_sigma_block(
 
 pub(super) fn update_kappa_block(
     context: &SamplerContext<'_>,
-    rng: &mut StdRng,
+    rng: &mut Stream,
     state: &mut ChainState,
     posterior: &mut PosteriorCache,
     row_cache: &mut RowLikelihoodCache,
@@ -443,7 +443,7 @@ pub(super) fn update_kappa_block(
 
 pub(super) fn update_omega_block(
     context: &SamplerContext<'_>,
-    rng: &mut StdRng,
+    rng: &mut Stream,
     state: &mut ChainState,
     posterior: &mut PosteriorCache,
     row_cache: &mut RowLikelihoodCache,

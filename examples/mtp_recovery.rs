@@ -1,6 +1,5 @@
+use epistat_rng::Stream;
 use faer::Mat;
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 use semicontinuous_models::{
     CounterfactualScenario, LongitudinalModelInput, MtpFitOptions, MtpSamplerConfig,
     PositivePartDistribution, compute_counterfactual_effects_summary,
@@ -171,7 +170,7 @@ fn simulate_longitudinal_input(
     seed: u64,
 ) -> LongitudinalModelInput {
     let rows = subjects.saturating_mul(periods_per_subject);
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = Stream::seeded(seed);
     let mut subject_re_binary = vec![0.0; subjects];
     let mut subject_re_mean = vec![0.0; subjects];
     let mut exposure_by_subject = vec![0.0; subjects];
@@ -184,7 +183,7 @@ fn simulate_longitudinal_input(
 
         subject_re_binary[subject] = truth.re_sd_binary * z1;
         subject_re_mean[subject] = truth.re_sd_mean * z_corr;
-        exposure_by_subject[subject] = if rng.random::<f64>() < 0.5 { 1.0 } else { 0.0 };
+        exposure_by_subject[subject] = if rng.uniform() < 0.5 { 1.0 } else { 0.0 };
     }
 
     let subject_ids = (0..rows)
@@ -207,7 +206,7 @@ fn simulate_longitudinal_input(
             truth.alpha[2].mul_add(exposure, truth.alpha[0] + subject_re_binary[subject]),
         );
         let p_positive = logistic(eta_binary);
-        if rng.random::<f64>() >= p_positive {
+        if rng.uniform() >= p_positive {
             return 0.0;
         }
 
@@ -272,9 +271,9 @@ fn relative_error(estimate: f64, truth: f64) -> f64 {
     ((estimate - truth) / truth).abs()
 }
 
-fn sample_standard_normal(rng: &mut StdRng) -> f64 {
-    let u1 = (1.0_f64 - rng.random::<f64>()).max(f64::MIN_POSITIVE);
-    let u2 = rng.random::<f64>();
+fn sample_standard_normal(rng: &mut Stream) -> f64 {
+    let u1 = (1.0_f64 - rng.uniform()).max(f64::MIN_POSITIVE);
+    let u2 = rng.uniform();
     (-2.0_f64 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 

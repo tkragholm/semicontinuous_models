@@ -92,7 +92,8 @@ use crate::models::two_part::irls::{
     GAMMA_LOG_LINK_ETA_CLAMP, LOGIT_ETA_CLAMP, ridge_from_regularization,
 };
 use crate::models::two_part::{FitOptions, Regularization, TwoPartWarmStart};
-use crate::utils::{add_ridge_to_diagonal, llt_factor_seq, llt_solve_seq, matrix_is_finite};
+use crate::utils::add_ridge_to_diagonal;
+use epistat_linalg::{Attempt, Factor, Method};
 
 /// The most columns a compact design holds: a row's list stores column numbers in a byte.
 pub const MAX_COLUMNS: usize = 255;
@@ -426,8 +427,12 @@ fn uncentred_information(products: &Products, p: usize) -> Mat<f64> {
 
 /// The Cholesky factor of `information`, on one thread, when every pivot keeps at least
 /// [`MIN_PIVOT_SHARE`] of its diagonal element.
-fn factor_checked(information: &Mat<f64>) -> Result<Mat<f64>, PreparedFitError> {
-    let lower = llt_factor_seq(information.as_ref()).ok_or(PreparedFitError::IllConditioned)?;
+fn factor_checked(information: &Mat<f64>) -> Result<Factor, PreparedFitError> {
+    let factor = Factor::new(information.as_ref(), &[Attempt::plain(Method::Cholesky)])
+        .map_err(|_| PreparedFitError::IllConditioned)?;
+    let lower = factor
+        .cholesky_factor()
+        .ok_or(PreparedFitError::IllConditioned)?;
     // Written so that a NaN is refused as well.
     if (0..information.nrows()).any(|j| {
         let pivot = lower[(j, j)];
@@ -436,16 +441,13 @@ fn factor_checked(information: &Mat<f64>) -> Result<Mat<f64>, PreparedFitError> 
     }) {
         return Err(PreparedFitError::IllConditioned);
     }
-    Ok(lower)
+    Ok(factor)
 }
 
-fn solve_checked(lower: &Mat<f64>, rhs: &Mat<f64>) -> Result<Mat<f64>, PreparedFitError> {
-    let solution = llt_solve_seq(lower.as_ref(), rhs.as_ref());
-    if matrix_is_finite(&solution) {
-        Ok(solution)
-    } else {
-        Err(PreparedFitError::NonFinite)
-    }
+fn solve_checked(factor: &Factor, rhs: &Mat<f64>) -> Result<Mat<f64>, PreparedFitError> {
+    factor
+        .solve(rhs.as_ref())
+        .map_err(|_| PreparedFitError::NonFinite)
 }
 
 fn check_weights(weights: &[f64], n: usize) -> Result<(), PreparedFitError> {

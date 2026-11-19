@@ -30,8 +30,6 @@ pub enum MtpError {
     InvalidCalibrationBins,
     #[error("multi-chain workflows require at least {min} chains; found {found}")]
     InvalidChainCount { min: usize, found: usize },
-    #[error("multi-chain seed stride must be positive")]
-    InvalidSeedStride,
     #[error("each chain must retain at least {minimum} draws; minimum found {found}")]
     InsufficientChainDraws { minimum: usize, found: usize },
     #[error("posterior dimensions differ across chains")]
@@ -287,19 +285,15 @@ impl MtpSamplerConfig {
 #[derive(Debug, Clone, Copy)]
 pub struct MtpMultiChainOptions {
     /// Number of independent chains to run.
-    pub chains: usize,
-    /// Seed increment between adjacent chains.
     ///
-    /// Chain `i` uses `base_seed + i * seed_stride` with wrapping arithmetic.
-    pub seed_stride: u64,
+    /// Chain `i` draws from `epistat_rng::replicate_seed(seed, i)`, so a chain
+    /// does not depend on the other chains or on the thread that runs it.
+    pub chains: usize,
 }
 
 impl Default for MtpMultiChainOptions {
     fn default() -> Self {
-        Self {
-            chains: 4,
-            seed_stride: 10_000,
-        }
+        Self { chains: 4 }
     }
 }
 
@@ -309,9 +303,6 @@ impl MtpMultiChainOptions {
     /// Returns `MtpError` if multi-chain options are invalid.
     pub fn validate(self) -> Result<(), MtpError> {
         validate_chain_count(self.chains, 2)?;
-        if self.seed_stride == 0 {
-            return Err(MtpError::InvalidSeedStride);
-        }
         Ok(())
     }
 }
@@ -450,10 +441,7 @@ mod tests {
 
     #[test]
     fn multi_chain_options_validate() {
-        let options = MtpMultiChainOptions {
-            chains: 3,
-            seed_stride: 100,
-        };
+        let options = MtpMultiChainOptions { chains: 3 };
         assert!(options.validate().is_ok());
     }
 
