@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (0.8.0)
+## 0.8.0 - 2026-11-19
 
 - `bootstrap_percentile_ci`, and so `bootstrap_summary`, read the interval bounds as R's
   type 7 quantiles (`quantile(x, c(alpha / 2, 1 - alpha / 2), type = 7)`), through
