@@ -17,6 +17,7 @@ use super::types::{
 };
 use super::{likelihood, priors};
 
+mod adaptive;
 mod chain;
 mod context;
 mod math;
@@ -71,12 +72,6 @@ struct BaselineEstimate {
     structure: RandomEffectsStructure,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum RandomBlock {
-    Binary,
-    Mean,
-}
-
 #[derive(Debug, Clone)]
 struct InitialEstimationState {
     binary_outcome: Mat<f64>,
@@ -110,12 +105,28 @@ struct ChainState {
 
 #[derive(Debug, Clone)]
 struct ProposalScales {
-    alpha: Vec<f64>,
-    beta: Vec<f64>,
+    /// Joint proposal for `alpha`, `beta` and `log(omega_sq)`.
+    fixed_effects: adaptive::BlockProposal,
+    /// Per-dimension multipliers of the Cholesky factor of the current random-effects
+    /// covariance.
     random_effects: Vec<f64>,
     family_effects: [f64; 2],
     kappa: f64,
-    log_omega_sq: f64,
+    /// Adaptations of the random-effect, family-effect and `kappa` scales so far.
+    adaptations: usize,
+}
+
+impl ProposalScales {
+    /// Every value that defines the proposal kernel, for checks that it is fixed.
+    #[cfg(test)]
+    fn snapshot(&self) -> Vec<f64> {
+        let mut out = Vec::new();
+        self.fixed_effects.snapshot_into(&mut out);
+        out.extend_from_slice(&self.random_effects);
+        out.extend_from_slice(&self.family_effects);
+        out.push(self.kappa);
+        out
+    }
 }
 
 struct SamplerContext<'a> {
@@ -132,6 +143,10 @@ struct SamplerContext<'a> {
 struct SamplingResult {
     samples: MtpPosteriorSamples,
     acceptance_rates: MtpAcceptanceRates,
+    /// The proposal kernel at the start, at the first retained iteration and at the last
+    /// iteration.
+    #[cfg(test)]
+    proposal_snapshots: Vec<Vec<f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,9 +183,11 @@ struct SubjectProposalEvaluation {
 struct SamplerBuffers {
     alpha_proposal: Vec<f64>,
     beta_proposal: Vec<f64>,
+    /// Reused random-walk step of the fixed-effect block.
+    fixed_step: Vec<f64>,
     subject_proposals: Vec<Vec<f64>>,
-    /// Reused candidate row log-likelihoods (length `n_rows`) for the
-    /// alpha/beta/kappa/omega blocks, swapped into the cache on acceptance.
+    /// Reused candidate row log-likelihoods (length `n_rows`) for the fixed-effect
+    /// block, swapped into the cache on acceptance.
     row_scratch: Vec<f64>,
     /// Reused candidate fixed-effect linear predictors (length `n_rows`).
     binary_fixed_scratch: Vec<f64>,
@@ -267,32 +284,16 @@ impl RowLikelihoodCache {
         delta
     }
 
-    /// Accept an alpha proposal by swapping in the reused scratch buffers (no
-    /// allocation, no recomputed sum — the caller already summed the rows).
-    const fn accept_rows_with_binary(
-        &mut self,
-        row_scratch: &mut Vec<f64>,
-        binary_fixed_scratch: &mut Vec<f64>,
-        total: f64,
-    ) {
-        std::mem::swap(&mut self.row_log_likelihood, row_scratch);
-        std::mem::swap(&mut self.binary_fixed, binary_fixed_scratch);
+    /// Accept a fixed-effect proposal by swapping in the reused scratch buffers. The
+    /// caller has already summed the candidate rows into `total`.
+    fn accept_fixed_effects(&mut self, buffers: &mut SamplerBuffers, total: f64) {
+        std::mem::swap(&mut self.row_log_likelihood, &mut buffers.row_scratch);
+        std::mem::swap(&mut self.binary_fixed, &mut buffers.binary_fixed_scratch);
+        std::mem::swap(&mut self.mean_fixed, &mut buffers.mean_fixed_scratch);
         self.total = total;
     }
 
-    /// Accept a beta proposal by swapping in the reused scratch buffers.
-    const fn accept_rows_with_mean(
-        &mut self,
-        row_scratch: &mut Vec<f64>,
-        mean_fixed_scratch: &mut Vec<f64>,
-        total: f64,
-    ) {
-        std::mem::swap(&mut self.row_log_likelihood, row_scratch);
-        std::mem::swap(&mut self.mean_fixed, mean_fixed_scratch);
-        self.total = total;
-    }
-
-    /// Accept a kappa/omega proposal: only the row log-likelihoods change.
+    /// Accept a `kappa` proposal: only the row log-likelihoods change.
     const fn accept_rows(&mut self, row_scratch: &mut Vec<f64>, total: f64) {
         std::mem::swap(&mut self.row_log_likelihood, row_scratch);
         self.total = total;
@@ -335,7 +336,7 @@ struct PosteriorSimulationRequest<'a> {
     retained_draws: usize,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct AcceptanceCounts {
     accepted_alpha: usize,
     proposed_alpha: usize,
@@ -352,14 +353,20 @@ struct AcceptanceCounts {
 }
 
 impl AcceptanceCounts {
-    fn record_alpha(&mut self, accepted: bool) {
+    /// Record one joint update of `alpha`, `beta` and `omega_sq`.
+    fn record_fixed_effects(&mut self, accepted: bool) {
+        let accepted = usize::from(accepted);
         self.proposed_alpha += 1;
-        self.accepted_alpha += usize::from(accepted);
+        self.accepted_alpha += accepted;
+        self.proposed_beta += 1;
+        self.accepted_beta += accepted;
+        self.proposed_omega += 1;
+        self.accepted_omega += accepted;
     }
 
-    fn record_beta(&mut self, accepted: bool) {
-        self.proposed_beta += 1;
-        self.accepted_beta += usize::from(accepted);
+    fn record_kappa(&mut self, accepted: bool) {
+        self.proposed_kappa += 1;
+        self.accepted_kappa += usize::from(accepted);
     }
 
     const fn record_random_effects(&mut self, accepted: usize, proposed: usize) {
@@ -372,14 +379,22 @@ impl AcceptanceCounts {
         self.accepted_family_effects += accepted;
     }
 
-    fn record_kappa(&mut self, accepted: bool) {
-        self.proposed_kappa += 1;
-        self.accepted_kappa += usize::from(accepted);
-    }
-
-    fn record_omega(&mut self, accepted: bool) {
-        self.proposed_omega += 1;
-        self.accepted_omega += usize::from(accepted);
+    /// Counts accumulated since `earlier`, a copy of these counts taken before.
+    const fn since(&self, earlier: &Self) -> Self {
+        Self {
+            accepted_alpha: self.accepted_alpha - earlier.accepted_alpha,
+            proposed_alpha: self.proposed_alpha - earlier.proposed_alpha,
+            accepted_beta: self.accepted_beta - earlier.accepted_beta,
+            proposed_beta: self.proposed_beta - earlier.proposed_beta,
+            accepted_random_effects: self.accepted_random_effects - earlier.accepted_random_effects,
+            proposed_random_effects: self.proposed_random_effects - earlier.proposed_random_effects,
+            accepted_family_effects: self.accepted_family_effects - earlier.accepted_family_effects,
+            proposed_family_effects: self.proposed_family_effects - earlier.proposed_family_effects,
+            accepted_kappa: self.accepted_kappa - earlier.accepted_kappa,
+            proposed_kappa: self.proposed_kappa - earlier.proposed_kappa,
+            accepted_omega: self.accepted_omega - earlier.accepted_omega,
+            proposed_omega: self.proposed_omega - earlier.proposed_omega,
+        }
     }
 
     fn rates(&self) -> MtpAcceptanceRates {
@@ -746,8 +761,9 @@ pub fn fit_mtp_input_multi_chain_with_posterior_config(
 
 #[cfg(test)]
 mod tests {
-    use super::updates::update_alpha_block;
+    use super::updates::update_fixed_effects_block;
     use super::*;
+    use crate::models::mtp::types::MtpProposalTuning;
     use crate::utils::{matrix_is_finite, usize_to_f64, weighted_xtx, weighted_xtz};
     use faer::Mat;
 
@@ -1041,11 +1057,18 @@ mod tests {
             PosteriorCache::initialize_with_likelihood(&context, &state, row_cache.total)
                 .expect("posterior cache should build");
         let mut rng = epistat_rng::Stream::seeded(42);
-        let alpha_scales = vec![0.05; state.alpha.len()];
+        let block_dim = state.alpha.len() + state.beta.len() + 1;
+        let proposal = adaptive::BlockProposal::new(
+            Mat::from_fn(block_dim, block_dim, |row, col| {
+                if row == col { 0.05 * 0.05 } else { 0.0 }
+            }),
+            1.0e-3,
+        );
         let n_rows = row_cache.row_log_likelihood.len();
         let mut buffers = SamplerBuffers {
             alpha_proposal: vec![0.0; state.alpha.len()],
             beta_proposal: vec![0.0; state.beta.len()],
+            fixed_step: Vec::with_capacity(block_dim),
             subject_proposals: state
                 .subject_effects
                 .iter()
@@ -1056,19 +1079,70 @@ mod tests {
             mean_fixed_scratch: Vec::with_capacity(n_rows),
             family_row_scratch: Vec::new(),
         };
-        let _ = update_alpha_block(
-            &context,
-            &mut rng,
-            &mut state,
-            &mut posterior,
-            &mut row_cache,
-            &mut buffers,
-            &alpha_scales,
-            1.0e-3,
-        );
-        let recomputed = context.log_likelihood(&state);
-        assert!((row_cache.total - recomputed).abs() < 1.0e-8);
-        assert!((posterior.log_likelihood - recomputed).abs() < 1.0e-8);
+        let mut accepted = 0;
+        for _ in 0..20 {
+            accepted += usize::from(update_fixed_effects_block(
+                &context,
+                &mut rng,
+                &mut state,
+                &mut posterior,
+                &mut row_cache,
+                &mut buffers,
+                &proposal,
+            ));
+            let recomputed = context.log_likelihood(&state);
+            assert!((row_cache.total - recomputed).abs() < 1.0e-8);
+            assert!((posterior.log_likelihood - recomputed).abs() < 1.0e-8);
+            let recomputed_total =
+                PosteriorCache::initialize_with_likelihood(&context, &state, recomputed)
+                    .expect("posterior cache should rebuild")
+                    .total();
+            assert!((posterior.total() - recomputed_total).abs() < 1.0e-8);
+        }
+        assert!(accepted > 0);
+    }
+
+    #[test]
+    fn proposal_kernel_is_fixed_after_burn_in() {
+        let input = basic_input();
+        let prepared = prepare_input(&input).expect("input should be valid");
+        let row_to_subject =
+            build_row_to_subject_map(prepared.input.outcome.nrows(), &prepared.subjects);
+        let options = MtpFitOptions::builder()
+            .iterations(600)
+            .burn_in(300)
+            .thin(2)
+            .build();
+        let baseline = estimate_correlated_random_effects(&prepared, &row_to_subject, options)
+            .expect("baseline should run");
+        let config = MtpSamplerConfig {
+            fit_options: options,
+            proposal_tuning: MtpProposalTuning {
+                adaptation_interval: 20,
+                ..MtpProposalTuning::default()
+            },
+            ..MtpSamplerConfig::default()
+        };
+        let sampling = simulate_posterior_draws(&PosteriorSimulationRequest {
+            input: prepared.input,
+            subjects: &prepared.subjects,
+            row_to_subject: &row_to_subject,
+            row_to_family: None,
+            family_count: 0,
+            baseline: &baseline,
+            config,
+            retained_draws: options.retained_draws(),
+        })
+        .expect("sampling should run");
+
+        let [initial, first_retained, last] = sampling.proposal_snapshots.as_slice() else {
+            panic!("expected three proposal snapshots");
+        };
+        assert_ne!(initial, first_retained, "burn-in should adapt the proposal");
+        assert_eq!(first_retained.len(), last.len());
+        for (at_first, at_last) in first_retained.iter().zip(last) {
+            assert_eq!(at_first.to_bits(), at_last.to_bits());
+        }
     }
 
     #[test]

@@ -186,6 +186,22 @@ pub(super) const fn validate_draw_dimensions(
 }
 
 /// Proposal-scale and adaptation controls for MTP MCMC.
+///
+/// `alpha`, `beta` and `log(omega_sq)` are updated as one block whose proposal
+/// covariance is estimated from the chain during burn-in. `kappa` has its own random
+/// walk, which holds the variance of the log positive part fixed. A subject's
+/// random-effect step is a multiple of the Cholesky factor of the current random-effects
+/// covariance.
+///
+/// Every `adaptation_interval` burn-in iterations each step size `s` takes a
+/// Robbins-Monro step on the log scale towards the middle of the acceptance band,
+/// `log(s) += adaptation_gain / sqrt(k) * (rate - target)`, where `rate` is its
+/// acceptance rate over the interval and `k` counts its adaptations (Andrieu and Thoms
+/// 2008). The step is not capped, so the gains sum without bound and any starting scale
+/// can be corrected given enough intervals. All adaptation stops at the end of burn-in.
+///
+/// Andrieu, C. and Thoms, J. (2008). A tutorial on adaptive MCMC. Statistics and
+/// Computing 18(4), 343-373.
 #[derive(bon::Builder, Debug, Clone, Copy)]
 pub struct MtpProposalTuning {
     /// Minimum allowed proposal scale.
@@ -194,24 +210,22 @@ pub struct MtpProposalTuning {
     /// Initial random-walk scale for `kappa`.
     #[builder(default = 0.05_f64)]
     pub kappa_draw_scale: f64,
-    /// Initial random-walk scale for `log(omega_sq)`.
+    /// Initial proposal standard deviation of `log(omega_sq)` in the fixed-effect block,
+    /// used until the block covariance is estimated from the chain.
     #[builder(default = 0.03_f64)]
     pub log_omega_draw_scale: f64,
     /// Adapt every `adaptation_interval` iterations during burn-in.
     #[builder(default = 50_usize)]
     pub adaptation_interval: usize,
-    /// Lower acceptance-rate target for adaptation.
+    /// Lower end of the acceptance band; adaptation targets the band's midpoint.
     #[builder(default = 0.2_f64)]
     pub acceptance_target_low: f64,
-    /// Upper acceptance-rate target for adaptation.
+    /// Upper end of the acceptance band; adaptation targets the band's midpoint.
     #[builder(default = 0.35_f64)]
     pub acceptance_target_high: f64,
-    /// Multiplicative scale decrease when acceptance is below target.
-    #[builder(default = 0.9_f64)]
-    pub scale_decrease_factor: f64,
-    /// Multiplicative scale increase when acceptance is above target.
-    #[builder(default = 1.1_f64)]
-    pub scale_increase_factor: f64,
+    /// Gain `c` of the Robbins-Monro step `c / sqrt(k)` on the log step size.
+    #[builder(default = 3.0_f64)]
+    pub adaptation_gain: f64,
     /// Initial random-walk scale for family-level random effects.
     #[builder(default = 0.05_f64)]
     pub family_effect_draw_scale: f64,
@@ -226,8 +240,7 @@ impl Default for MtpProposalTuning {
             adaptation_interval: 50,
             acceptance_target_low: 0.2,
             acceptance_target_high: 0.35,
-            scale_decrease_factor: 0.9,
-            scale_increase_factor: 1.1,
+            adaptation_gain: 3.0,
             family_effect_draw_scale: 0.05,
         }
     }
@@ -244,8 +257,7 @@ impl MtpProposalTuning {
             && self.acceptance_target_low >= 0.0
             && self.acceptance_target_high <= 1.0
             && self.acceptance_target_low < self.acceptance_target_high
-            && self.scale_decrease_factor > 0.0
-            && self.scale_increase_factor > 0.0
+            && self.adaptation_gain > 0.0
             && self.family_effect_draw_scale > 0.0
     }
 }
@@ -338,7 +350,9 @@ impl MtpPrediction {
     }
 }
 
-/// Component-wise acceptance rates from the MCMC sampler.
+/// Component-wise acceptance rates from the MCMC sampler, over all iterations.
+///
+/// `alpha`, `beta` and `omega_sq` are proposed together, so the three rates are equal.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MtpAcceptanceRates {
     pub alpha: f64,

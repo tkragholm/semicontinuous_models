@@ -19,7 +19,7 @@ use crate::utils::{
     quadratic_form_vec, solve_linear_system, usize_to_f64, weighted_xtx, weighted_xtz_with_buffer,
 };
 
-use super::{BaselineEstimate, MIN_WEIGHT, RIDGE_L2, RandomBlock};
+use super::{BaselineEstimate, MIN_WEIGHT, RIDGE_L2};
 
 pub(super) fn build_family_rows(
     row_to_family: Option<&[usize]>,
@@ -41,45 +41,78 @@ pub(super) fn build_family_rows(
     family_rows
 }
 
-pub(super) fn random_walk_vector_into(
+/// Fill `output` with `values + lower * (scales * z)`, where `z` is a vector of standard
+/// normal draws and `lower` is a lower-triangular factor. The proposal is symmetric in
+/// `values` for a fixed `lower`.
+pub(super) fn correlated_random_walk_into(
     output: &mut Vec<f64>,
     values: &[f64],
+    lower: &Mat<f64>,
     scales: &[f64],
     rng: &mut Stream,
     min_draw_scale: f64,
 ) {
+    let dim = values.len();
+    let mut whitened = [0.0_f64; 4];
+    for (slot, scale) in whitened.iter_mut().zip(scales).take(dim) {
+        *slot = scale.max(min_draw_scale) * sample_standard_normal(rng);
+    }
     output.clear();
-    output.extend(
-        values
-            .iter()
-            .zip(scales.iter())
-            .map(|(value, scale)| value + scale.max(min_draw_scale) * sample_standard_normal(rng)),
-    );
+    output.extend((0..dim).map(|row| {
+        values[row]
+            + (0..=row)
+                .map(|col| lower[(row, col)] * whitened[col])
+                .sum::<f64>()
+    }));
+}
+
+/// Lower Cholesky factor of a covariance matrix, or the diagonal of its standard
+/// deviations when the matrix is not positive definite.
+pub(super) fn proposal_factor(covariance: &Mat<f64>) -> Mat<f64> {
+    cholesky_lower(covariance).unwrap_or_else(|| {
+        let dim = covariance.ncols();
+        Mat::from_fn(dim, dim, |row, col| {
+            if row == col {
+                covariance[(row, row)].max(0.0).sqrt()
+            } else {
+                0.0
+            }
+        })
+    })
 }
 
 pub(super) fn should_accept(log_acceptance: f64, rng: &mut Stream) -> bool {
     log_acceptance >= 0.0 || rng.uniform().ln() < log_acceptance
 }
 
-pub(super) fn adapt_vector_scale(scales: &mut [f64], acceptance: f64, tuning: MtpProposalTuning) {
-    let factor = adaptation_factor(acceptance, tuning);
+/// Multiplier `exp(gain / sqrt(step) * (acceptance - target))` of a Robbins-Monro step
+/// on the log step size, with `target` the midpoint of the acceptance band and `step`
+/// the 1-based count of adaptations of that scale.
+pub(super) fn robbins_monro_factor(acceptance: f64, step: usize, tuning: MtpProposalTuning) -> f64 {
+    let target = 0.5 * (tuning.acceptance_target_low + tuning.acceptance_target_high);
+    let gain = tuning.adaptation_gain / usize_to_f64(step.max(1)).sqrt();
+    (gain * (acceptance - target)).exp()
+}
+
+pub(super) fn adapt_vector_scale(
+    scales: &mut [f64],
+    acceptance: f64,
+    step: usize,
+    tuning: MtpProposalTuning,
+) {
+    let factor = robbins_monro_factor(acceptance, step, tuning);
     for scale in scales {
         *scale = (*scale * factor).max(tuning.min_draw_scale);
     }
 }
 
-pub(super) fn adapt_scalar_scale(scale: f64, acceptance: f64, tuning: MtpProposalTuning) -> f64 {
-    (scale * adaptation_factor(acceptance, tuning)).max(tuning.min_draw_scale)
-}
-
-pub(super) fn adaptation_factor(acceptance: f64, tuning: MtpProposalTuning) -> f64 {
-    if acceptance < tuning.acceptance_target_low {
-        tuning.scale_decrease_factor
-    } else if acceptance > tuning.acceptance_target_high {
-        tuning.scale_increase_factor
-    } else {
-        1.0
-    }
+pub(super) fn adapt_scalar_scale(
+    scale: f64,
+    acceptance: f64,
+    step: usize,
+    tuning: MtpProposalTuning,
+) -> f64 {
+    (scale * robbins_monro_factor(acceptance, step, tuning)).max(tuning.min_draw_scale)
 }
 
 pub(super) fn fit_logistic_irls_with_offset(
@@ -140,11 +173,16 @@ pub(super) fn weighted_least_squares(
     solve_linear_system(&information, &weighted_response).map_err(|_| MtpError::SolveFailed)
 }
 
-pub(super) fn approximate_alpha_scales(
+/// Inverse of the Fisher information plus the prior precision `1 / prior_variance` of
+/// the binary coefficients at the baseline estimate, the starting proposal covariance of
+/// `alpha`. The prior term bounds the covariance when the information is close to
+/// singular, as under separation.
+pub(super) fn approximate_alpha_covariance(
     input: &LongitudinalModelInput,
     row_to_subject: &[usize],
     baseline: &BaselineEstimate,
-) -> Result<Vec<f64>, MtpError> {
+    prior_variance: f64,
+) -> Result<Mat<f64>, MtpError> {
     let alpha_column = MatRef::from_column_major_slice(&baseline.alpha, baseline.alpha.len(), 1);
     let fixed_linear = &input.x_binary * alpha_column;
 
@@ -163,23 +201,18 @@ pub(super) fn approximate_alpha_scales(
     });
 
     let mut information = weighted_xtx(&input.x_binary, &weights);
-    let re_variance = random_block_variance(
-        &baseline.random_effects_cov,
-        baseline.structure,
-        RandomBlock::Binary,
-    );
-    add_ridge_to_diagonal(
-        &mut information,
-        RIDGE_L2 + 1.0 / re_variance.max(1.0e-8),
-        false,
-    );
-    diagonal_sqrt_inverse(&information)
+    add_ridge_to_diagonal(&mut information, RIDGE_L2 + 1.0 / prior_variance, false);
+    matrix_inverse(&information)
 }
 
-pub(super) fn approximate_beta_scales(
+/// Inverse of the Fisher information from the positive outcomes at the baseline
+/// `omega_sq` plus the prior precision `1 / prior_variance` of the mean coefficients, the
+/// starting proposal covariance of `beta`.
+pub(super) fn approximate_beta_covariance(
     input: &LongitudinalModelInput,
     baseline: &BaselineEstimate,
-) -> Result<Vec<f64>, MtpError> {
+    prior_variance: f64,
+) -> Result<Mat<f64>, MtpError> {
     let positive_indices: Vec<usize> = (0..input.outcome.nrows())
         .filter(|&row| input.outcome[(row, 0)] > 0.0)
         .collect();
@@ -192,38 +225,17 @@ pub(super) fn approximate_beta_scales(
     let mut information = Mat::from_fn(xtx.nrows(), xtx.ncols(), |row, col| {
         xtx[(row, col)] / baseline.omega_sq.max(1.0e-8)
     });
+    add_ridge_to_diagonal(&mut information, RIDGE_L2 + 1.0 / prior_variance, false);
 
-    let re_variance = random_block_variance(
-        &baseline.random_effects_cov,
-        baseline.structure,
-        RandomBlock::Mean,
-    );
-    add_ridge_to_diagonal(
-        &mut information,
-        RIDGE_L2 + 1.0 / re_variance.max(1.0e-8),
-        false,
-    );
-
-    let scales = diagonal_sqrt_inverse(&information)?;
-    if scales.len() != baseline.beta.len() {
+    let covariance = matrix_inverse(&information)?;
+    if covariance.ncols() != baseline.beta.len() {
         return Err(MtpError::DesignCoefficientMismatch {
-            design_cols: scales.len(),
+            design_cols: covariance.ncols(),
             coef_len: baseline.beta.len(),
         });
     }
 
-    Ok(scales)
-}
-
-pub(super) fn diagonal_sqrt_inverse(matrix: &Mat<f64>) -> Result<Vec<f64>, MtpError> {
-    let dim = matrix.ncols();
-    let identity = Mat::<f64>::identity(dim, dim);
-    let inverse = solve_linear_system(matrix, &identity).map_err(|_| MtpError::SolveFailed)?;
-    let diagonal = (0..dim)
-        .map(|idx| inverse[(idx, idx)].abs().sqrt().max(f64::MIN_POSITIVE))
-        .collect();
-
-    Ok(diagonal)
+    Ok(covariance)
 }
 
 pub(super) fn residual_variance_with_subject_offsets(
@@ -305,24 +317,6 @@ pub(super) fn add_scaled_outer_product(
             hessian[(row, col)] = (scale * basis[row]).mul_add(basis[col], hessian[(row, col)]);
         }
     }
-}
-
-pub(super) fn random_block_variance(
-    covariance: &Mat<f64>,
-    structure: RandomEffectsStructure,
-    block: RandomBlock,
-) -> f64 {
-    let (start, len) = match (structure, block) {
-        (RandomEffectsStructure::InterceptsOnly, RandomBlock::Binary) => (0, 1),
-        (RandomEffectsStructure::InterceptsOnly, RandomBlock::Mean) => (1, 1),
-        (RandomEffectsStructure::InterceptsAndTimeSlopes, RandomBlock::Binary) => (0, 2),
-        (RandomEffectsStructure::InterceptsAndTimeSlopes, RandomBlock::Mean) => (2, 2),
-    };
-
-    let sum = (start..start + len)
-        .map(|idx| covariance[(idx, idx)])
-        .sum::<f64>();
-    (sum / usize_to_f64(len)).max(1.0e-8)
 }
 
 pub(super) fn build_row_to_subject_map(nrows: usize, subjects: &[SubjectRows]) -> Vec<usize> {
@@ -635,11 +629,6 @@ pub(super) fn subject_effect_log_prior(effect: &[f64], random_effects_precision:
 
 pub(super) fn sample_standard_normal(rng: &mut Stream) -> f64 {
     rng.sample(rand_distr::StandardNormal)
-}
-
-pub(super) fn diagonal_from_matrix(matrix: &Mat<f64>) -> Vec<f64> {
-    let n = matrix.nrows().min(matrix.ncols());
-    (0..n).map(|idx| matrix[(idx, idx)]).collect()
 }
 
 pub(super) fn identity_matrix(dim: usize) -> Mat<f64> {

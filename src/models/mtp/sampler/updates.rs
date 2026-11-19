@@ -1,126 +1,184 @@
 use epistat_rng::Stream;
 
+use super::adaptive::BlockProposal;
 use super::math::{
-    SpdInverseScratch, covariance_from_subject_effects, invert_matrix_with_jitter_and_scratch,
-    linear_predictor_into, posterior_scale_matrix, random_walk_vector_into, sample_inverse_wishart,
-    sample_standard_normal, should_accept, subject_effect_log_prior,
-    usize_to_f64_reexport as usize_to_f64,
+    SpdInverseScratch, correlated_random_walk_into, covariance_from_subject_effects,
+    invert_matrix_with_jitter_and_scratch, linear_predictor_into, posterior_scale_matrix,
+    proposal_factor, sample_inverse_wishart, sample_standard_normal, should_accept,
+    subject_effect_log_prior, usize_to_f64_reexport as usize_to_f64,
 };
 use super::{
     ChainState, FamilyRandomEffects, PosteriorCache, RowLikelihoodCache, SamplerBuffers,
     SamplerContext, SubjectProposalEvaluation,
 };
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn update_alpha_block(
+/// `log(1 - 2 delta^2 / pi)` with `delta = kappa / sqrt(1 + kappa^2)`: the log ratio of
+/// the variance of a skew-normal with shape `kappa` to its squared scale `omega_sq`.
+/// It is 0 at `kappa = 0` and lies above `log(1 - 2 / pi)`.
+pub(super) fn log_skew_variance_factor(kappa: f64) -> f64 {
+    let delta_sq = kappa * kappa / kappa.mul_add(kappa, 1.0);
+    (-2.0 * delta_sq / std::f64::consts::PI).ln_1p()
+}
+
+/// Write the fixed-effect block `(alpha, beta, log(omega_sq))` of `state` into `theta`.
+pub(super) fn fixed_effect_block_into(theta: &mut Vec<f64>, state: &ChainState) {
+    theta.clear();
+    theta.extend_from_slice(&state.alpha);
+    theta.extend_from_slice(&state.beta);
+    theta.push(state.omega_sq.ln());
+}
+
+/// Joint random-walk Metropolis update of `alpha`, `beta` and `log(omega_sq)`. The walk
+/// on `log(omega_sq)` adds the Jacobian `log(omega_sq') - log(omega_sq)` to the
+/// acceptance ratio.
+pub(super) fn update_fixed_effects_block(
     context: &SamplerContext<'_>,
     rng: &mut Stream,
     state: &mut ChainState,
     posterior: &mut PosteriorCache,
     row_cache: &mut RowLikelihoodCache,
     buffers: &mut SamplerBuffers,
-    scales: &[f64],
-    min_draw_scale: f64,
+    proposal: &BlockProposal,
 ) -> bool {
-    let current_total = posterior.total();
-    random_walk_vector_into(
-        &mut buffers.alpha_proposal,
-        &state.alpha,
-        scales,
-        rng,
-        min_draw_scale,
+    let n_alpha = state.alpha.len();
+    let n_beta = state.beta.len();
+    proposal.draw_step_into(&mut buffers.fixed_step, rng);
+    let step = &buffers.fixed_step;
+
+    buffers.alpha_proposal.clear();
+    buffers.alpha_proposal.extend(
+        state
+            .alpha
+            .iter()
+            .zip(&step[..n_alpha])
+            .map(|(value, delta)| value + delta),
     );
-    std::mem::swap(&mut state.alpha, &mut buffers.alpha_proposal);
+    buffers.beta_proposal.clear();
+    buffers.beta_proposal.extend(
+        state
+            .beta
+            .iter()
+            .zip(&step[n_alpha..n_alpha + n_beta])
+            .map(|(value, delta)| value + delta),
+    );
+    let previous_omega_sq = state.omega_sq;
+    let candidate_omega_sq = previous_omega_sq * step[n_alpha + n_beta].exp();
+    if !(candidate_omega_sq.is_finite() && candidate_omega_sq > 0.0) {
+        return false;
+    }
 
     linear_predictor_into(
         &mut buffers.binary_fixed_scratch,
         &context.input.x_binary,
-        &state.alpha,
+        &buffers.alpha_proposal,
     );
+    linear_predictor_into(
+        &mut buffers.mean_fixed_scratch,
+        &context.input.x_mean,
+        &buffers.beta_proposal,
+    );
+    state.omega_sq = candidate_omega_sq;
     if !context.recompute_all_rows_from_offsets_into(
         &mut buffers.row_scratch,
         state,
         &buffers.binary_fixed_scratch,
-        &row_cache.mean_fixed,
+        &buffers.mean_fixed_scratch,
         &row_cache.binary_offset,
         &row_cache.mean_offset,
     ) {
-        std::mem::swap(&mut state.alpha, &mut buffers.alpha_proposal);
+        state.omega_sq = previous_omega_sq;
         return false;
     }
+
     let candidate_log_likelihood = buffers.row_scratch.iter().sum::<f64>();
-    let candidate_alpha_prior = context.log_alpha_prior(&state.alpha);
-    let candidate_total = current_total - posterior.log_likelihood - posterior.log_prior_alpha
-        + candidate_log_likelihood
-        + candidate_alpha_prior;
-    let accepted = should_accept(candidate_total - current_total, rng);
+    let candidate_alpha_prior = context.log_alpha_prior(&buffers.alpha_proposal);
+    let candidate_beta_prior = context.log_beta_prior(&buffers.beta_proposal);
+    let candidate_omega_prior = context.log_omega_prior(candidate_omega_sq);
+    let log_acceptance = (candidate_log_likelihood - posterior.log_likelihood)
+        + (candidate_alpha_prior - posterior.log_prior_alpha)
+        + (candidate_beta_prior - posterior.log_prior_beta)
+        + (candidate_omega_prior - posterior.log_prior_omega)
+        + (candidate_omega_sq.ln() - previous_omega_sq.ln());
+
+    let accepted = should_accept(log_acceptance, rng);
     if accepted {
+        std::mem::swap(&mut state.alpha, &mut buffers.alpha_proposal);
+        std::mem::swap(&mut state.beta, &mut buffers.beta_proposal);
         posterior.log_likelihood = candidate_log_likelihood;
         posterior.log_prior_alpha = candidate_alpha_prior;
-        row_cache.accept_rows_with_binary(
-            &mut buffers.row_scratch,
-            &mut buffers.binary_fixed_scratch,
-            candidate_log_likelihood,
-        );
+        posterior.log_prior_beta = candidate_beta_prior;
+        posterior.log_prior_omega = candidate_omega_prior;
+        row_cache.accept_fixed_effects(buffers, candidate_log_likelihood);
     } else {
-        std::mem::swap(&mut state.alpha, &mut buffers.alpha_proposal);
+        state.omega_sq = previous_omega_sq;
     }
     accepted
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn update_beta_block(
+/// Random-walk Metropolis update of `kappa` that holds the variance of `log(y)` given
+/// `y > 0`, `omega_sq * (1 - 2 delta^2 / pi)`, fixed and moves `omega_sq` with it.
+///
+/// The data identify that variance well, while `kappa` is weakly identified near 0,
+/// where the information matrix of the skew-normal is singular (Azzalini 1985). At a
+/// fixed variance `omega_sq` grows with `|kappa|`, so a walk in `kappa` alone at fixed
+/// `omega_sq` is held to small steps, and this walk is not. The step is a walk in the
+/// `kappa` coordinate of `(log variance, kappa)`, the variance coordinate of Azzalini's
+/// centred parameterisation, in which the target density carries the Jacobian
+/// `omega_sq`, so `log(omega_sq') - log(omega_sq)` enters the acceptance ratio. A
+/// `kappa` outside its uniform prior has zero prior density and is rejected.
+pub(super) fn update_kappa_block(
     context: &SamplerContext<'_>,
     rng: &mut Stream,
     state: &mut ChainState,
     posterior: &mut PosteriorCache,
     row_cache: &mut RowLikelihoodCache,
-    buffers: &mut SamplerBuffers,
-    scales: &[f64],
-    min_draw_scale: f64,
+    row_scratch: &mut Vec<f64>,
+    scale: f64,
 ) -> bool {
-    let current_total = posterior.total();
-    random_walk_vector_into(
-        &mut buffers.beta_proposal,
-        &state.beta,
-        scales,
-        rng,
-        min_draw_scale,
-    );
-    std::mem::swap(&mut state.beta, &mut buffers.beta_proposal);
+    let previous_kappa = state.kappa;
+    let previous_omega_sq = state.omega_sq;
+    let candidate_kappa = scale.mul_add(sample_standard_normal(rng), previous_kappa);
+    let candidate_kappa_prior = context.log_kappa_prior(candidate_kappa);
+    let candidate_omega_sq = previous_omega_sq
+        * (log_skew_variance_factor(previous_kappa) - log_skew_variance_factor(candidate_kappa))
+            .exp();
+    if !candidate_kappa_prior.is_finite()
+        || !(candidate_omega_sq.is_finite() && candidate_omega_sq > 0.0)
+    {
+        return false;
+    }
 
-    linear_predictor_into(
-        &mut buffers.mean_fixed_scratch,
-        &context.input.x_mean,
-        &state.beta,
-    );
+    state.kappa = candidate_kappa;
+    state.omega_sq = candidate_omega_sq;
     if !context.recompute_all_rows_from_offsets_into(
-        &mut buffers.row_scratch,
+        row_scratch,
         state,
         &row_cache.binary_fixed,
-        &buffers.mean_fixed_scratch,
+        &row_cache.mean_fixed,
         &row_cache.binary_offset,
         &row_cache.mean_offset,
     ) {
-        std::mem::swap(&mut state.beta, &mut buffers.beta_proposal);
+        state.kappa = previous_kappa;
+        state.omega_sq = previous_omega_sq;
         return false;
     }
-    let candidate_log_likelihood = buffers.row_scratch.iter().sum::<f64>();
-    let candidate_beta_prior = context.log_beta_prior(&state.beta);
-    let candidate_total = current_total - posterior.log_likelihood - posterior.log_prior_beta
-        + candidate_log_likelihood
-        + candidate_beta_prior;
-    let accepted = should_accept(candidate_total - current_total, rng);
+
+    let candidate_log_likelihood = row_scratch.iter().sum::<f64>();
+    let candidate_omega_prior = context.log_omega_prior(candidate_omega_sq);
+    let log_acceptance = (candidate_log_likelihood - posterior.log_likelihood)
+        + (candidate_kappa_prior - posterior.log_prior_kappa)
+        + (candidate_omega_prior - posterior.log_prior_omega)
+        + (candidate_omega_sq.ln() - previous_omega_sq.ln());
+
+    let accepted = should_accept(log_acceptance, rng);
     if accepted {
         posterior.log_likelihood = candidate_log_likelihood;
-        posterior.log_prior_beta = candidate_beta_prior;
-        row_cache.accept_rows_with_mean(
-            &mut buffers.row_scratch,
-            &mut buffers.mean_fixed_scratch,
-            candidate_log_likelihood,
-        );
+        posterior.log_prior_kappa = candidate_kappa_prior;
+        posterior.log_prior_omega = candidate_omega_prior;
+        row_cache.accept_rows(row_scratch, candidate_log_likelihood);
     } else {
-        std::mem::swap(&mut state.beta, &mut buffers.beta_proposal);
+        state.kappa = previous_kappa;
+        state.omega_sq = previous_omega_sq;
     }
     accepted
 }
@@ -246,10 +304,12 @@ pub(super) fn update_random_effects_block(
         return (0, 0);
     }
 
+    let factor = proposal_factor(&state.random_effects_cov);
     for (index, effect) in state.subject_effects.iter().enumerate() {
-        random_walk_vector_into(
+        correlated_random_walk_into(
             &mut proposal_buffer[index],
             effect,
+            &factor,
             scales,
             rng,
             min_draw_scale,
@@ -395,90 +455,4 @@ pub(super) fn update_sigma_block(
     state.random_effects_cov = sampled_covariance;
     state.random_effects_precision = sampled_precision;
     posterior.log_prior_random_effects = SamplerContext::log_subject_random_effect_prior(state);
-}
-
-pub(super) fn update_kappa_block(
-    context: &SamplerContext<'_>,
-    rng: &mut Stream,
-    state: &mut ChainState,
-    posterior: &mut PosteriorCache,
-    row_cache: &mut RowLikelihoodCache,
-    row_scratch: &mut Vec<f64>,
-    scale: f64,
-) -> bool {
-    let current_total = posterior.total();
-    let previous = state.kappa;
-    let kappa_lower = context.prior_config.kappa_lower;
-    let kappa_upper = context.prior_config.kappa_upper;
-    state.kappa = scale
-        .mul_add(sample_standard_normal(rng), state.kappa)
-        .clamp(kappa_lower, kappa_upper);
-
-    if !context.recompute_all_rows_from_offsets_into(
-        row_scratch,
-        state,
-        &row_cache.binary_fixed,
-        &row_cache.mean_fixed,
-        &row_cache.binary_offset,
-        &row_cache.mean_offset,
-    ) {
-        state.kappa = previous;
-        return false;
-    }
-    let candidate_log_likelihood = row_scratch.iter().sum::<f64>();
-    let candidate_kappa_prior = context.log_kappa_prior(state.kappa);
-    let candidate_total = current_total - posterior.log_likelihood - posterior.log_prior_kappa
-        + candidate_log_likelihood
-        + candidate_kappa_prior;
-    let accepted = should_accept(candidate_total - current_total, rng);
-    if accepted {
-        posterior.log_likelihood = candidate_log_likelihood;
-        posterior.log_prior_kappa = candidate_kappa_prior;
-        row_cache.accept_rows(row_scratch, candidate_log_likelihood);
-    } else {
-        state.kappa = previous;
-    }
-    accepted
-}
-
-pub(super) fn update_omega_block(
-    context: &SamplerContext<'_>,
-    rng: &mut Stream,
-    state: &mut ChainState,
-    posterior: &mut PosteriorCache,
-    row_cache: &mut RowLikelihoodCache,
-    row_scratch: &mut Vec<f64>,
-    scale: f64,
-) -> bool {
-    let current_total = posterior.total();
-    let previous = state.omega_sq;
-    let proposed_log_omega = scale.mul_add(sample_standard_normal(rng), previous.ln());
-    state.omega_sq = proposed_log_omega.exp().max(1.0e-8);
-
-    if !context.recompute_all_rows_from_offsets_into(
-        row_scratch,
-        state,
-        &row_cache.binary_fixed,
-        &row_cache.mean_fixed,
-        &row_cache.binary_offset,
-        &row_cache.mean_offset,
-    ) {
-        state.omega_sq = previous;
-        return false;
-    }
-    let candidate_log_likelihood = row_scratch.iter().sum::<f64>();
-    let candidate_omega_prior = context.log_omega_prior(state.omega_sq);
-    let candidate_total = current_total - posterior.log_likelihood - posterior.log_prior_omega
-        + candidate_log_likelihood
-        + candidate_omega_prior;
-    let log_acceptance = candidate_total + state.omega_sq.ln() - (current_total + previous.ln());
-    let accepted = should_accept(log_acceptance, rng);
-    if accepted {
-        posterior.log_likelihood = candidate_log_likelihood;
-        posterior.log_prior_omega = candidate_omega_prior;
-        row_cache.accept_rows(row_scratch, candidate_log_likelihood);
-    } else {
-        state.omega_sq = previous;
-    }
-    accepted
 }

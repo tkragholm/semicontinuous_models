@@ -1,8 +1,9 @@
 use epistat_rng::Stream;
 use faer::Mat;
 use semicontinuous_models::{
-    LongitudinalModelInput, MtpFitOptions, MtpProposalTuning, MtpSamplerConfig,
-    fit_mtp_input_with_posterior_config, posterior_predictive_summary,
+    LongitudinalModelInput, MtpFitOptions, MtpMultiChainOptions, MtpProposalTuning,
+    MtpSamplerConfig, fit_mtp_input_multi_chain_with_config, fit_mtp_input_with_posterior_config,
+    posterior_predictive_summary,
 };
 
 fn usize_to_f64(value: usize) -> f64 {
@@ -138,48 +139,25 @@ fn mtp_recovers_key_parameters_on_synthetic_data() {
     assert!(omega_mean < 3.0);
 }
 
-/// The same fit as the recovery test, held to a split R-hat below 1.05 for alpha[1] and
-/// beta[1]. The chain does not reach it at 3000 iterations (about 1.6 and 2.3), nor at
-/// 10000, and beta[1] only approaches it at 30000, so the check is kept but not run.
+/// The recovery panel at the crate's default sampler settings (4000 iterations, 1000 of
+/// burn-in, every fourth draw kept), run as four chains from the same starting point,
+/// holds a split R-hat below 1.05 for alpha[1], beta[1] and omega_sq.
 #[test]
-#[ignore = "the sampler's split R-hat for alpha[1] and beta[1] is above 1.05 at 3000 iterations"]
 fn mtp_split_rhat_below_threshold_on_synthetic_data() {
     let input = simulate_mtp_panel(120, 4, [-0.35, 0.8], [1.2, 0.55], 0.45, 42);
-    let config = MtpSamplerConfig::builder()
-        .fit_options(
-            MtpFitOptions::builder()
-                .iterations(3000)
-                .burn_in(1000)
-                .thin(6)
-                .build(),
-        )
-        .proposal_tuning(MtpProposalTuning::builder().adaptation_interval(40).build())
-        .build();
-    let (_model, _report, posterior) =
-        fit_mtp_input_with_posterior_config(&input, config).expect("fit should run");
-    for (name, chain) in [
-        (
-            "alpha[1]",
-            posterior
-                .draws
-                .iter()
-                .map(|d| d.alpha[1])
-                .collect::<Vec<_>>(),
-        ),
-        (
-            "beta[1]",
-            posterior
-                .draws
-                .iter()
-                .map(|d| d.beta[1])
-                .collect::<Vec<_>>(),
-        ),
+    let (_model, report) = fit_mtp_input_multi_chain_with_config(
+        &input,
+        MtpSamplerConfig::default(),
+        MtpMultiChainOptions { chains: 4 },
+    )
+    .expect("fit should run");
+    let convergence = report.convergence;
+    for (name, rhat) in [
+        ("alpha[1]", convergence.alpha_split_rhat[1]),
+        ("beta[1]", convergence.beta_split_rhat[1]),
+        ("omega_sq", convergence.omega_sq_split_rhat),
     ] {
-        // `split_rhat` needs two chains, so the single chain enters as its two halves,
-        // which it then cuts again.
-        let (first, second) = chain.split_at(chain.len() / 2);
-        let rhat = epistat_stats::mcmc::split_rhat(&[first, second])
-            .unwrap_or_else(|| panic!("{name}: split R-hat is undefined"));
+        let rhat = rhat.unwrap_or_else(|| panic!("{name}: split R-hat is undefined"));
         assert!(rhat < 1.05, "{name}: split R-hat {rhat}");
     }
 }

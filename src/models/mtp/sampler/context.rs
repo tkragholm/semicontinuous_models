@@ -115,6 +115,12 @@ impl SamplerContext<'_> {
         true
     }
 
+    /// Whether `kappa` is a sampled parameter, true under the log-skew-normal positive
+    /// part.
+    pub(super) fn samples_kappa(&self) -> bool {
+        self.positive_part_distribution == PositivePartDistribution::LogSkewNormal
+    }
+
     pub(super) const fn effective_kappa(&self, state: &ChainState) -> f64 {
         match self.positive_part_distribution {
             PositivePartDistribution::LogSkewNormal => state.kappa,

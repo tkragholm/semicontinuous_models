@@ -5,11 +5,10 @@ use crate::input::LongitudinalModelInput;
 use crate::models::matrix_ops::{select_rows, select_values};
 use crate::models::mtp::input::MtpPreparedInput;
 use crate::models::mtp::posterior::{MtpPosteriorDraw, MtpPosteriorSamples};
-use crate::models::mtp::types::{
-    MtpError, MtpFitOptions, MtpProposalTuning, PositivePartDistribution,
-};
+use crate::models::mtp::types::{MtpError, MtpFitOptions, MtpProposalTuning, MtpSamplerConfig};
 use crate::utils::to_binary_outcome;
 
+use super::adaptive::{BlockProposal, RANDOM_WALK_SCALE};
 use super::{
     AcceptanceCounts, BaselineEstimate, ChainState, InitialEstimationState, OUTER_TOLERANCE,
     PosteriorCache, PosteriorSimulationRequest, ProposalScales, RowLikelihoodCache, SamplerBuffers,
@@ -218,8 +217,7 @@ pub(super) fn simulate_posterior_draws(
         kappa: baseline.kappa,
         omega_sq: baseline.omega_sq,
     };
-    let proposal_scales =
-        build_initial_proposal_scales(input, row_to_subject, baseline, config.proposal_tuning)?;
+    let proposal_scales = build_initial_proposal_scales(input, row_to_subject, baseline, &config)?;
     run_mcmc_chain(
         &context,
         &mut rng,
@@ -240,34 +238,65 @@ pub(super) fn combine_posteriors(chains: &[MtpPosteriorSamples]) -> MtpPosterior
     MtpPosteriorSamples { draws }
 }
 
+/// Starting proposals. The fixed-effect block starts from a block-diagonal covariance:
+/// the inverse of information plus prior precision of `alpha` and of `beta` at the
+/// baseline estimate, and the
+/// squared initial scale of `log(omega_sq)` from `tuning`. A subject's
+/// random-effect step is `2.38 / sqrt(d)` times the Cholesky factor of the current
+/// random-effects covariance, the scale that suits a conditional posterior close to
+/// the random-effects prior.
 pub(super) fn build_initial_proposal_scales(
     input: &LongitudinalModelInput,
     row_to_subject: &[usize],
     baseline: &BaselineEstimate,
-    tuning: MtpProposalTuning,
+    config: &MtpSamplerConfig,
 ) -> Result<ProposalScales, MtpError> {
+    let tuning = config.proposal_tuning;
+    let priors = config.prior_config;
+    let alpha_covariance =
+        approximate_alpha_covariance(input, row_to_subject, baseline, priors.alpha_variance)?;
+    let beta_covariance = approximate_beta_covariance(input, baseline, priors.beta_variance)?;
+    let n_alpha = alpha_covariance.ncols();
+    let n_beta = beta_covariance.ncols();
+    let omega_index = n_alpha + n_beta;
+    let dim = omega_index + 1;
+    let initial = Mat::from_fn(dim, dim, |row, col| {
+        if row < n_alpha && col < n_alpha {
+            alpha_covariance[(row, col)]
+        } else if (n_alpha..omega_index).contains(&row) && (n_alpha..omega_index).contains(&col) {
+            beta_covariance[(row - n_alpha, col - n_alpha)]
+        } else if row == col && row == omega_index {
+            tuning.log_omega_draw_scale * tuning.log_omega_draw_scale
+        } else {
+            0.0
+        }
+    });
+
+    let random_dim = baseline.random_effects_cov.ncols();
+    let random_scale = RANDOM_WALK_SCALE / usize_to_f64_reexport(random_dim.max(1)).sqrt();
     Ok(ProposalScales {
-        alpha: approximate_alpha_scales(input, row_to_subject, baseline)?
-            .into_iter()
-            .map(|value| value.max(tuning.min_draw_scale))
-            .collect(),
-        beta: approximate_beta_scales(input, baseline)?
-            .into_iter()
-            .map(|value| value.max(tuning.min_draw_scale))
-            .collect(),
-        random_effects: diagonal_from_matrix(&baseline.random_effects_cov)
-            .into_iter()
-            .map(|value| value.sqrt().max(tuning.min_draw_scale))
-            .collect(),
+        fixed_effects: BlockProposal::new(initial, tuning.min_draw_scale),
+        random_effects: vec![random_scale.max(tuning.min_draw_scale); random_dim],
         family_effects: [
             tuning.family_effect_draw_scale,
             tuning.family_effect_draw_scale,
         ],
         kappa: tuning.kappa_draw_scale,
-        log_omega_sq: tuning.log_omega_draw_scale,
+        adaptations: 0,
     })
 }
 
+/// Burn-in iterations at which the two covariance windows of the fixed-effect block
+/// start and end: `[burn_in / 4, burn_in / 2)` and `[burn_in / 2, 7 * burn_in / 8)`.
+/// The first quarter lets the chain leave its starting point, and the last eighth
+/// tunes the step size for the final covariance.
+const fn covariance_windows(burn_in: usize) -> [usize; 3] {
+    [burn_in / 4, burn_in / 2, burn_in - burn_in / 8]
+}
+
+/// Run one chain. Every adaptation, of the step sizes and of the fixed-effect
+/// covariance, happens in iterations before `burn_in`, so the retained draws come from
+/// one fixed Markov kernel.
 #[allow(clippy::too_many_lines)]
 pub(super) fn run_mcmc_chain(
     context: &SamplerContext<'_>,
@@ -283,11 +312,16 @@ pub(super) fn run_mcmc_chain(
         PosteriorCache::initialize_with_likelihood(context, state, row_cache.total)?;
     let family_rows = build_family_rows(context.row_to_family, state.family_effects.len());
     let mut counts = AcceptanceCounts::default();
+    let mut window_start = counts;
     let mut draws = Vec::with_capacity(retained_draws);
     let n_rows = row_cache.row_log_likelihood.len();
+    let includes_kappa = context.samples_kappa();
+    let [window_open, window_split, window_close] = covariance_windows(options.burn_in);
+    let mut block_value = Vec::with_capacity(proposal_scales.fixed_effects.dim());
     let mut buffers = SamplerBuffers {
         alpha_proposal: vec![0.0; state.alpha.len()],
         beta_proposal: vec![0.0; state.beta.len()],
+        fixed_step: Vec::with_capacity(proposal_scales.fixed_effects.dim()),
         subject_proposals: state
             .subject_effects
             .iter()
@@ -300,27 +334,24 @@ pub(super) fn run_mcmc_chain(
     };
     let mut inverse_scratch = SpdInverseScratch::new(state.random_effects_cov.ncols());
 
+    #[cfg(test)]
+    let mut proposal_snapshots = vec![proposal_scales.snapshot()];
+
     for iter in 0usize..options.iterations {
-        counts.record_alpha(update_alpha_block(
+        #[cfg(test)]
+        if iter == options.burn_in || iter + 1 == options.iterations {
+            proposal_snapshots.push(proposal_scales.snapshot());
+        }
+        let accepted_fixed = update_fixed_effects_block(
             context,
             rng,
             state,
             &mut posterior,
             &mut row_cache,
             &mut buffers,
-            &proposal_scales.alpha,
-            tuning.min_draw_scale,
-        ));
-        counts.record_beta(update_beta_block(
-            context,
-            rng,
-            state,
-            &mut posterior,
-            &mut row_cache,
-            &mut buffers,
-            &proposal_scales.beta,
-            tuning.min_draw_scale,
-        ));
+            &proposal_scales.fixed_effects,
+        );
+        counts.record_fixed_effects(accepted_fixed);
         let (accepted_random, proposed_random) = update_random_effects_block(
             context,
             rng,
@@ -345,7 +376,7 @@ pub(super) fn run_mcmc_chain(
         );
         counts.record_family_effects(accepted_family, proposed_family);
         update_sigma_block(context, rng, state, &mut posterior, &mut inverse_scratch);
-        if context.positive_part_distribution == PositivePartDistribution::LogSkewNormal {
+        if includes_kappa {
             counts.record_kappa(update_kappa_block(
                 context,
                 rng,
@@ -356,15 +387,6 @@ pub(super) fn run_mcmc_chain(
                 proposal_scales.kappa,
             ));
         }
-        counts.record_omega(update_omega_block(
-            context,
-            rng,
-            state,
-            &mut posterior,
-            &mut row_cache,
-            &mut buffers.row_scratch,
-            proposal_scales.log_omega_sq,
-        ));
 
         #[cfg(debug_assertions)]
         if iter.is_multiple_of(25) {
@@ -377,11 +399,20 @@ pub(super) fn run_mcmc_chain(
             debug_assert!((recomputed_total - posterior.total()).abs() < 1.0e-8);
         }
 
-        if options.adapt_during_burn_in
-            && iter < options.burn_in
-            && (iter + 1).is_multiple_of(tuning.adaptation_interval)
-        {
-            adapt_proposal_scales(&mut proposal_scales, &counts, tuning);
+        if options.adapt_during_burn_in && iter < options.burn_in {
+            if (window_open..window_close).contains(&iter) {
+                fixed_effect_block_into(&mut block_value, state);
+                proposal_scales.fixed_effects.record(&block_value);
+            }
+            if (iter + 1).is_multiple_of(tuning.adaptation_interval) {
+                adapt_proposal_scales(&mut proposal_scales, &counts.since(&window_start), tuning);
+                window_start = counts;
+            }
+            if (iter + 1 == window_split || iter + 1 == window_close)
+                && proposal_scales.fixed_effects.refresh_from_window()
+            {
+                window_start = counts;
+            }
         }
 
         if iter >= options.burn_in && (iter - options.burn_in).is_multiple_of(options.thin) {
@@ -397,26 +428,43 @@ pub(super) fn run_mcmc_chain(
     Ok(SamplingResult {
         samples: MtpPosteriorSamples { draws },
         acceptance_rates: counts.rates(),
+        #[cfg(test)]
+        proposal_snapshots,
     })
 }
 
+/// One Robbins-Monro step of every step size from the acceptance rates in `counts`, the
+/// counts of the last interval. A scale whose block made no proposal in the interval,
+/// such as `kappa` under the log-normal positive part, is left as it is.
 pub(super) fn adapt_proposal_scales(
     proposal_scales: &mut ProposalScales,
     counts: &AcceptanceCounts,
     tuning: MtpProposalTuning,
 ) {
     let rates = counts.rates();
-    adapt_vector_scale(&mut proposal_scales.alpha, rates.alpha, tuning);
-    adapt_vector_scale(&mut proposal_scales.beta, rates.beta, tuning);
-    adapt_vector_scale(
-        &mut proposal_scales.random_effects,
-        rates.random_effects,
-        tuning,
-    );
-    for scale in &mut proposal_scales.family_effects {
-        *scale = adapt_scalar_scale(*scale, rates.family_effects, tuning);
+    proposal_scales.adaptations += 1;
+    let step = proposal_scales.adaptations;
+    // `alpha`, `beta` and `omega_sq` share the block's acceptance rate.
+    if counts.proposed_alpha > 0 {
+        proposal_scales
+            .fixed_effects
+            .adapt_scale(rates.alpha, tuning);
     }
-    proposal_scales.kappa = adapt_scalar_scale(proposal_scales.kappa, rates.kappa, tuning);
-    proposal_scales.log_omega_sq =
-        adapt_scalar_scale(proposal_scales.log_omega_sq, rates.omega_sq, tuning);
+    if counts.proposed_random_effects > 0 {
+        adapt_vector_scale(
+            &mut proposal_scales.random_effects,
+            rates.random_effects,
+            step,
+            tuning,
+        );
+    }
+    if counts.proposed_family_effects > 0 {
+        for scale in &mut proposal_scales.family_effects {
+            *scale = adapt_scalar_scale(*scale, rates.family_effects, step, tuning);
+        }
+    }
+    if counts.proposed_kappa > 0 {
+        proposal_scales.kappa =
+            adapt_scalar_scale(proposal_scales.kappa, rates.kappa, step, tuning);
+    }
 }
