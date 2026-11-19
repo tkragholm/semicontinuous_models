@@ -104,7 +104,13 @@ pub fn summarize_posterior(samples: &MtpPosteriorSamples) -> MtpPosteriorSummary
 #[must_use]
 fn summarize_scalar_in_place(values: &mut [f64]) -> ParameterSummary {
     if values.is_empty() {
-        return ParameterSummary::default();
+        return ParameterSummary {
+            mean: f64::NAN,
+            std_dev: f64::NAN,
+            q025: f64::NAN,
+            q50: f64::NAN,
+            q975: f64::NAN,
+        };
     }
 
     let n = usize_to_f64(values.len());
@@ -123,9 +129,9 @@ fn summarize_scalar_in_place(values: &mut [f64]) -> ParameterSummary {
     ParameterSummary {
         mean,
         std_dev: variance.sqrt(),
-        q025: calculate_quantile(values, 0.025),
-        q50: calculate_quantile(values, 0.5),
-        q975: calculate_quantile(values, 0.975),
+        q025: calculate_quantile(values, 0.025).unwrap_or(f64::NAN),
+        q50: calculate_quantile(values, 0.5).unwrap_or(f64::NAN),
+        q975: calculate_quantile(values, 0.975).unwrap_or(f64::NAN),
     }
 }
 

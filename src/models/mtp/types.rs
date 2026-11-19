@@ -393,16 +393,26 @@ pub struct MtpConvergenceSummary {
     pub chain_count: usize,
     /// Draws per chain used after truncation to equal even length.
     pub draws_per_chain_used: usize,
-    /// Split-R-hat for each alpha coefficient.
-    pub alpha_split_rhat: Vec<f64>,
-    /// Split-R-hat for each beta coefficient.
-    pub beta_split_rhat: Vec<f64>,
+    /// Split-R-hat for each alpha coefficient, `None` where a half-chain is constant.
+    pub alpha_split_rhat: Vec<Option<f64>>,
+    /// Split-R-hat for each beta coefficient, `None` where a half-chain is constant.
+    pub beta_split_rhat: Vec<Option<f64>>,
     /// Split-R-hat for kappa.
     pub kappa_split_rhat: Option<f64>,
     /// Split-R-hat for omega squared.
     pub omega_sq_split_rhat: Option<f64>,
-    /// Maximum split-R-hat across all tracked scalar parameters.
+    /// Maximum split-R-hat across all tracked scalar parameters, `None` when any of
+    /// them is undefined.
     pub max_split_rhat: Option<f64>,
+}
+
+impl MtpConvergenceSummary {
+    /// Whether every tracked parameter has a defined split-R-hat below `threshold`.
+    /// A parameter whose chains are constant is not converged.
+    #[must_use]
+    pub fn is_converged(&self, threshold: f64) -> bool {
+        self.max_split_rhat.is_some_and(|max| max < threshold)
+    }
 }
 
 /// Output report for multi-chain MTP fitting.

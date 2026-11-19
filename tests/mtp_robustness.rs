@@ -121,14 +121,67 @@ fn mtp_recovers_key_parameters_on_synthetic_data() {
 
     assert_eq!(summary.alpha.len(), 2);
     assert_eq!(summary.beta.len(), 2);
-    assert!((summary.alpha[1].mean - true_alpha[1]).abs() < 0.6);
-    // 3000 iterations recover beta[1] within 0.14 on every data seed tried;
-    // a few hundred do not converge on this panel and leave it near zero.
-    assert!((summary.beta[1].mean - true_beta[1]).abs() < 0.3);
+    for (name, truth, parameter) in [
+        ("alpha[1]", true_alpha[1], summary.alpha[1]),
+        ("beta[1]", true_beta[1], summary.beta[1]),
+    ] {
+        let deviation = (parameter.mean - truth).abs();
+        assert!(
+            deviation < 4.0 * parameter.std_dev,
+            "{name}: truth {truth} is {deviation} from the posterior mean, posterior sd {}",
+            parameter.std_dev
+        );
+    }
     let omega_mean = summary.omega_sq.expect("omega summary").mean;
     assert!(omega_mean.is_finite());
     assert!(omega_mean > 0.05);
     assert!(omega_mean < 3.0);
+}
+
+/// The same fit as the recovery test, held to a split R-hat below 1.05 for alpha[1] and
+/// beta[1]. The chain does not reach it at 3000 iterations (about 1.6 and 2.3), nor at
+/// 10000, and beta[1] only approaches it at 30000, so the check is kept but not run.
+#[test]
+#[ignore = "the sampler's split R-hat for alpha[1] and beta[1] is above 1.05 at 3000 iterations"]
+fn mtp_split_rhat_below_threshold_on_synthetic_data() {
+    let input = simulate_mtp_panel(120, 4, [-0.35, 0.8], [1.2, 0.55], 0.45, 42);
+    let config = MtpSamplerConfig::builder()
+        .fit_options(
+            MtpFitOptions::builder()
+                .iterations(3000)
+                .burn_in(1000)
+                .thin(6)
+                .build(),
+        )
+        .proposal_tuning(MtpProposalTuning::builder().adaptation_interval(40).build())
+        .build();
+    let (_model, _report, posterior) =
+        fit_mtp_input_with_posterior_config(&input, config).expect("fit should run");
+    for (name, chain) in [
+        (
+            "alpha[1]",
+            posterior
+                .draws
+                .iter()
+                .map(|d| d.alpha[1])
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "beta[1]",
+            posterior
+                .draws
+                .iter()
+                .map(|d| d.beta[1])
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        // `split_rhat` needs two chains, so the single chain enters as its two halves,
+        // which it then cuts again.
+        let (first, second) = chain.split_at(chain.len() / 2);
+        let rhat = epistat_stats::mcmc::split_rhat(&[first, second])
+            .unwrap_or_else(|| panic!("{name}: split R-hat is undefined"));
+        assert!(rhat < 1.05, "{name}: split R-hat {rhat}");
+    }
 }
 
 #[test]

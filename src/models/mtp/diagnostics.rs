@@ -13,18 +13,23 @@ use super::types::{
     MtpConvergenceSummary, MtpError, validate_chain_count, validate_draw_dimensions,
 };
 
-/// Lag-`k` autocorrelation for a scalar chain, 0 when the lag is not shorter than the
-/// chain or the chain is constant.
+/// Lag-`k` autocorrelation for a scalar chain, `None` when the lag is not shorter than
+/// the chain or the chain is constant.
 #[must_use]
-pub fn autocorrelation(series: &[f64], lag: usize) -> f64 {
-    epistat_stats::mcmc::autocorrelation(series, lag).unwrap_or(0.0)
+pub fn autocorrelation(series: &[f64], lag: usize) -> Option<f64> {
+    epistat_stats::mcmc::autocorrelation(series, lag)
 }
 
-/// Heuristic effective sample size using positive autocorrelation truncation. A constant
-/// chain, and a chain of fewer than two draws, count as that many independent draws.
+/// Heuristic effective sample size using positive autocorrelation truncation. `None`
+/// for a chain of fewer than two draws and for a constant chain, which carries no
+/// information about mixing.
 #[must_use]
-pub fn effective_sample_size(series: &[f64]) -> f64 {
-    epistat_stats::mcmc::effective_sample_size(series)
+pub fn effective_sample_size(series: &[f64]) -> Option<f64> {
+    let first = *series.first()?;
+    if series.len() < 2 || series.iter().all(|&value| value == first) {
+        return None;
+    }
+    Some(epistat_stats::mcmc::effective_sample_size(series))
 }
 
 /// Summarize split-R-hat convergence diagnostics across posterior chains.
@@ -39,6 +44,20 @@ pub fn effective_sample_size(series: &[f64]) -> f64 {
 /// Returns `MtpError` if chain counts/draw lengths are insufficient or dimensions mismatch.
 pub fn summarize_multi_chain_convergence(
     chains: &[MtpPosteriorSamples],
+) -> Result<MtpConvergenceSummary, MtpError> {
+    summarize_multi_chain_convergence_tracking(chains, true)
+}
+
+/// [`summarize_multi_chain_convergence`] with a choice of whether `kappa` is a sampled
+/// parameter. A fixed `kappa` (the log-normal positive part) is left out of the maximum
+/// and reported as `None`, since it is not a draw that could fail to converge.
+///
+/// # Errors
+///
+/// Returns `MtpError` if chain counts/draw lengths are insufficient or dimensions mismatch.
+pub fn summarize_multi_chain_convergence_tracking(
+    chains: &[MtpPosteriorSamples],
+    track_kappa: bool,
 ) -> Result<MtpConvergenceSummary, MtpError> {
     validate_chain_count(chains.len(), 2)?;
 
@@ -83,18 +102,23 @@ pub fn summarize_multi_chain_convergence(
     let beta_split_rhat = (0..beta_len)
         .map(|index| split_rhat_from_chains(chains, draws_per_chain_used, |draw| draw.beta[index]))
         .collect::<Result<Vec<_>, _>>()?;
-    let kappa_split_rhat =
-        split_rhat_from_chains(chains, draws_per_chain_used, |draw| draw.kappa).ok();
+    let kappa_split_rhat = if track_kappa {
+        split_rhat_from_chains(chains, draws_per_chain_used, |draw| draw.kappa)?
+    } else {
+        None
+    };
     let omega_sq_split_rhat =
-        split_rhat_from_chains(chains, draws_per_chain_used, |draw| draw.omega_sq).ok();
+        split_rhat_from_chains(chains, draws_per_chain_used, |draw| draw.omega_sq)?;
 
     let max_split_rhat = alpha_split_rhat
         .iter()
+        .chain(&beta_split_rhat)
+        .chain(track_kappa.then_some(&kappa_split_rhat))
+        .chain([&omega_sq_split_rhat])
         .copied()
-        .chain(beta_split_rhat.iter().copied())
-        .chain(kappa_split_rhat)
-        .chain(omega_sq_split_rhat)
-        .max_by(f64::total_cmp);
+        .try_fold(f64::NEG_INFINITY, |largest, rhat| {
+            rhat.map(|value| largest.max(value))
+        });
 
     Ok(MtpConvergenceSummary {
         chain_count: chains.len(),
@@ -223,7 +247,7 @@ fn split_rhat_from_chains<F>(
     chains: &[MtpPosteriorSamples],
     draws_per_chain_used: usize,
     extractor: F,
-) -> Result<f64, MtpError>
+) -> Result<Option<f64>, MtpError>
 where
     F: Fn(&super::posterior::MtpPosteriorDraw) -> f64,
 {
@@ -246,8 +270,8 @@ where
         })
         .collect();
     let slices: Vec<&[f64]> = values.iter().map(Vec::as_slice).collect();
-    // Half-chains without variance carry no evidence of disagreement.
-    Ok(epistat_stats::mcmc::split_rhat(&slices).unwrap_or(1.0))
+    // Half-chains without variance leave the statistic undefined.
+    Ok(epistat_stats::mcmc::split_rhat(&slices))
 }
 
 #[cfg(test)]
@@ -257,15 +281,24 @@ mod tests {
     use faer::Mat;
 
     #[test]
-    fn autocorrelation_is_zero_for_invalid_lag() {
+    fn autocorrelation_is_undefined_for_invalid_lag_and_constant_chain() {
         let values = [1.0, 2.0, 3.0];
-        assert!((autocorrelation(&values, 3) - 0.0).abs() < f64::EPSILON);
+        assert!(autocorrelation(&values, 3).is_none());
+        assert!(autocorrelation(&[2.0; 8], 1).is_none());
+        assert!(autocorrelation(&values, 1).is_some());
+    }
+
+    #[test]
+    fn effective_sample_size_is_undefined_for_constant_chain() {
+        assert!(effective_sample_size(&[0.5; 20]).is_none());
+        assert!(effective_sample_size(&[0.5]).is_none());
+        assert!(effective_sample_size(&[]).is_none());
     }
 
     #[test]
     fn ess_bounded_by_chain_length() {
         let values = [1.0, 1.5, 2.0, 2.5, 3.0];
-        let ess = effective_sample_size(&values);
+        let ess = effective_sample_size(&values).expect("varying chain has an ess");
         assert!(ess <= 5.0);
         assert!(ess > 0.0);
     }
@@ -290,8 +323,12 @@ mod tests {
         let summary = summarize_multi_chain_convergence(&[chain.clone(), chain])
             .expect("two valid chains should summarize");
         assert_eq!(summary.alpha_split_rhat.len(), 1);
-        assert!((summary.alpha_split_rhat[0] - 1.0).abs() < 1.0e-9);
-        assert!((summary.max_split_rhat.unwrap() - 1.0).abs() < 1.0e-9);
+        assert!((summary.alpha_split_rhat[0].expect("alpha varies") - 1.0).abs() < 1.0e-9);
+        // beta is constant at 0 and kappa at 0.1 in these chains, so their R-hat is
+        // undefined and the maximum is too.
+        assert!(summary.beta_split_rhat[0].is_none());
+        assert!(summary.kappa_split_rhat.is_none());
+        assert!(summary.max_split_rhat.is_none());
     }
 
     #[test]
@@ -300,7 +337,7 @@ mod tests {
         let chain_b = chain_from_alphas(&[5.0, 6.0, 5.0, 6.0]);
         let summary = summarize_multi_chain_convergence(&[chain_a, chain_b])
             .expect("two valid chains should summarize");
-        let rhat = summary.alpha_split_rhat[0];
+        let rhat = summary.alpha_split_rhat[0].expect("alpha varies");
         assert!(rhat.is_finite());
         assert!(rhat >= 1.0);
         // Means differ sharply between chains, so R-hat must exceed 1.
@@ -452,5 +489,30 @@ mod tests {
         assert_eq!(summary.alpha_split_rhat.len(), 2);
         assert_eq!(summary.beta_split_rhat.len(), 1);
         assert!(summary.max_split_rhat.is_some());
+        assert!(summary.is_converged(10.0));
+    }
+
+    #[test]
+    fn stuck_sampler_is_not_reported_as_converged() {
+        // Two chains that never move, as a sampler that accepts no proposal produces.
+        let stuck = MtpPosteriorSamples {
+            draws: vec![
+                MtpPosteriorDraw {
+                    alpha: vec![0.3],
+                    beta: vec![1.0],
+                    kappa: 0.1,
+                    omega_sq: 1.0,
+                };
+                8
+            ],
+        };
+        let summary = summarize_multi_chain_convergence(&[stuck.clone(), stuck])
+            .expect("constant chains still summarize");
+        assert!(summary.alpha_split_rhat[0].is_none());
+        assert!(summary.beta_split_rhat[0].is_none());
+        assert!(summary.kappa_split_rhat.is_none());
+        assert!(summary.omega_sq_split_rhat.is_none());
+        assert!(summary.max_split_rhat.is_none());
+        assert!(!summary.is_converged(1.05));
     }
 }

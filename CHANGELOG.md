@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+Breaking: statistics that do not exist are no longer reported as numbers.
+
+- `autocorrelation` returns `Option<f64>`, `None` for a constant chain or a lag not
+  shorter than the chain, where it returned 0.
+- `effective_sample_size` returns `Option<f64>`, `None` for a constant chain or fewer
+  than two draws.
+- `MtpConvergenceSummary::alpha_split_rhat` and `beta_split_rhat` hold `Option<f64>`,
+  `None` where a half-chain is constant. A constant chain, as a sampler that accepts no
+  proposal produces, used to report a split R-hat of 1. `kappa_split_rhat` is `None`
+  likewise, and `max_split_rhat` is `None` when any tracked parameter is undefined.
+  `MtpConvergenceSummary::is_converged(threshold)` is false unless every split R-hat
+  is defined and below the threshold.
+- `summarize_multi_chain_convergence_tracking` takes whether `kappa` is a sampled
+  parameter. The multi-chain fit leaves a fixed `kappa` (log-normal positive part) out
+  of the diagnostics.
+- `utils::calculate_quantile` returns `Option<f64>`, `None` for no values. The
+  posterior and effect summaries of an empty sample report NaN instead of 0.
+
+Deterministic fits are bit-identical to 0.6.0.
+
+Tests: the Tweedie fitter is checked against `glm` with `statmod::tweedie` at powers
+1.2, 1.5 and 1.8, and the elastic-net coordinate descent against `glmnet`; the R
+scripts and reference output are in `tests/r` and `tests/reference`. The MTP recovery
+test compares the truth with the posterior mean in posterior standard deviations.
+
 ## 0.6.0 - 2026-11-19
 
 All random draws now come from `epistat_rng::Stream` (SplitMix64) instead of

@@ -418,11 +418,11 @@ pub fn add_outer_product_scaled(meat: &mut Mat<f64>, v: &[f64], scale: f64) {
     }
 }
 
-/// The type 7 quantile of sorted values, 0 for no values. `quantile` is clamped to
+/// The type 7 quantile of sorted values, `None` for no values. `quantile` is clamped to
 /// `[0, 1]`.
 #[must_use]
-pub fn calculate_quantile(sorted_values: &[f64], quantile: f64) -> f64 {
-    epistat_stats::quantile::type7(sorted_values, quantile.clamp(0.0, 1.0)).unwrap_or(0.0)
+pub fn calculate_quantile(sorted_values: &[f64], quantile: f64) -> Option<f64> {
+    epistat_stats::quantile::type7(sorted_values, quantile.clamp(0.0, 1.0))
 }
 
 #[must_use]
@@ -500,7 +500,12 @@ pub fn summarize_draws(values: &[f64]) -> EffectIntervalSummary {
 #[must_use]
 pub fn summarize_draws_in_place(values: &mut [f64]) -> EffectIntervalSummary {
     if values.is_empty() {
-        return EffectIntervalSummary::default();
+        return EffectIntervalSummary {
+            mean: f64::NAN,
+            q025: f64::NAN,
+            q50: f64::NAN,
+            q975: f64::NAN,
+        };
     }
 
     let mean = values.iter().sum::<f64>() / usize_to_f64(values.len());
@@ -508,9 +513,9 @@ pub fn summarize_draws_in_place(values: &mut [f64]) -> EffectIntervalSummary {
 
     EffectIntervalSummary {
         mean,
-        q025: calculate_quantile(values, 0.025),
-        q50: calculate_quantile(values, 0.5),
-        q975: calculate_quantile(values, 0.975),
+        q025: calculate_quantile(values, 0.025).unwrap_or(f64::NAN),
+        q50: calculate_quantile(values, 0.5).unwrap_or(f64::NAN),
+        q975: calculate_quantile(values, 0.975).unwrap_or(f64::NAN),
     }
 }
 

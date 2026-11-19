@@ -46,6 +46,8 @@ epistat-stats = "0.1.1"
 [dev-dependencies]
 epistat-testkit = { git = "https://github.com/tkragholm/epistat", rev = "95bf8e56c44037c58c0dea25418593fc1d78d470" }
 approx = "0.5.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 criterion = { version = "0.8.2", default-features = false }
 rstest = "0.26"
 proptest = "1.6.0"

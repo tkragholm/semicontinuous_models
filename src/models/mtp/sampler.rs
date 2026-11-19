@@ -7,7 +7,7 @@ use crate::utils::{weighted_xtx, weighted_xtz};
 use faer::Mat;
 use std::time::Instant;
 
-use super::diagnostics::summarize_multi_chain_convergence;
+use super::diagnostics::summarize_multi_chain_convergence_tracking;
 use super::input::{SubjectRows, prepare_input};
 use super::posterior::{MtpPosteriorSamples, summarize_posterior};
 use super::types::{
@@ -721,7 +721,10 @@ pub fn fit_mtp_input_multi_chain_with_posterior_config(
     } else {
         Some(summarize_posterior(&pooled))
     };
-    let convergence = summarize_multi_chain_convergence(&chain_posteriors)?;
+    let convergence = summarize_multi_chain_convergence_tracking(
+        &chain_posteriors,
+        config.positive_part_distribution != PositivePartDistribution::LogNormal,
+    )?;
 
     let model = MtpModel {
         n_binary_covariates: prepared.input.x_binary.ncols(),
