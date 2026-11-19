@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 - 2026-11-19
 
 Dependencies: epistat-stats 0.2.0, epistat-linalg 0.3.0, epistat-inference 0.3.0 and
 epistat-rng 0.1.2.
