@@ -446,18 +446,6 @@ pub fn calculate_quantile(sorted_values: &[f64], quantile: f64) -> Option<f64> {
 }
 
 #[must_use]
-pub fn boot_index_bounds(alpha: f64, n: usize) -> (usize, usize) {
-    let n_f = f64::from(u32::try_from(n).unwrap_or(u32::MAX));
-    let lower_idx = ((alpha / 2.0) * n_f).floor().to_usize().unwrap_or(0);
-    let upper_idx = ((1.0 - alpha / 2.0) * n_f)
-        .ceil()
-        .to_usize()
-        .unwrap_or(0)
-        .saturating_sub(1);
-    (lower_idx, upper_idx)
-}
-
-#[must_use]
 pub fn calibration_bins_summary(
     predicted_probability: &[f64],
     input: &LongitudinalModelInput,
@@ -580,22 +568,5 @@ mod tests {
     fn matrix_is_finite_detects_nan() {
         let matrix = Mat::from_fn(2, 1, |i, _| if i == 0 { 1.0 } else { f64::NAN });
         assert!(!matrix_is_finite(&matrix));
-    }
-
-    #[test]
-    fn boot_index_bounds_are_ordered_and_in_range() {
-        let (lower, upper) = boot_index_bounds(0.1, 100);
-        assert!(lower <= upper);
-        assert!(upper < 100);
-    }
-
-    use proptest::prelude::*;
-    proptest! {
-        #[test]
-        fn boot_index_bounds_invariants(alpha in 0.001..0.5f64, n in 10..1000usize) {
-            let (lower, upper) = boot_index_bounds(alpha, n);
-            prop_assert!(lower <= upper);
-            prop_assert!(upper < n);
-        }
     }
 }

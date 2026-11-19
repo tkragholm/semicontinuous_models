@@ -14,14 +14,13 @@ fn bootstrap_percentile_ci_sorted_reference(
         return Vec::new();
     }
     let n = betas[0].nrows();
-    let (lower_idx, upper_idx) =
-        semicontinuous_models::utils::boot_index_bounds(alpha, betas.len());
     let mut intervals = Vec::with_capacity(n);
     for col in 0..n {
         let mut values = betas.iter().map(|b| b[(col, 0)]).collect::<Vec<_>>();
         values.sort_by(f64::total_cmp);
-        let lower = values[lower_idx.min(values.len().saturating_sub(1))];
-        let upper = values[upper_idx.min(values.len().saturating_sub(1))];
+        let lower = semicontinuous_models::utils::calculate_quantile(&values, alpha / 2.0).unwrap();
+        let upper =
+            semicontinuous_models::utils::calculate_quantile(&values, 1.0 - alpha / 2.0).unwrap();
         intervals.push(ConfidenceInterval { lower, upper });
     }
     intervals

@@ -1112,16 +1112,32 @@ mod tests {
             return Vec::new();
         }
         let n = betas[0].nrows();
-        let (lower_idx, upper_idx) = crate::utils::boot_index_bounds(alpha, betas.len());
         let mut intervals = Vec::with_capacity(n);
         for col in 0..n {
             let mut values = betas.iter().map(|b| b[(col, 0)]).collect::<Vec<_>>();
             values.sort_by(f64::total_cmp);
-            let lower = values[lower_idx.min(values.len().saturating_sub(1))];
-            let upper = values[upper_idx.min(values.len().saturating_sub(1))];
+            let lower = crate::utils::calculate_quantile(&values, alpha / 2.0).unwrap();
+            let upper = crate::utils::calculate_quantile(&values, 1.0 - alpha / 2.0).unwrap();
             intervals.push(ConfidenceInterval { lower, upper });
         }
         intervals
+    }
+
+    #[test]
+    fn bootstrap_percentile_ci_equals_r_type_7() {
+        // R: x <- c(2.5, -1.0, 4.0, 0.5, 3.0, 1.5, -0.5, 6.0, 2.0, 1.0, 3.5)
+        //    quantile(x, c(0.025, 0.975), type = 7)  # -0.875  5.5
+        //    quantile(x, c(0.1, 0.9), type = 7)      # -0.5    4.0
+        let x = [2.5, -1.0, 4.0, 0.5, 3.0, 1.5, -0.5, 6.0, 2.0, 1.0, 3.5];
+        let betas = x
+            .iter()
+            .map(|&v| Mat::from_fn(1, 1, |_, _| v))
+            .collect::<Vec<_>>();
+        for (alpha, lower, upper) in [(0.05, -0.875, 5.5), (0.2, -0.5, 4.0)] {
+            let ci = bootstrap_percentile_ci(&betas, alpha);
+            assert!((ci[0].lower - lower).abs() < 1e-12, "alpha={alpha}");
+            assert!((ci[0].upper - upper).abs() < 1e-12, "alpha={alpha}");
+        }
     }
 
     #[test]

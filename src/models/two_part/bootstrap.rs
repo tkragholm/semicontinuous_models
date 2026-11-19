@@ -1,5 +1,6 @@
 //! Row-resampling bootstrap and its percentile summaries.
 
+use epistat_inference::interval::{Percentile, percentile};
 use epistat_rng::Stream;
 use faer::Mat;
 
@@ -67,40 +68,27 @@ pub fn bootstrap(
     })
 }
 
-/// Percentile confidence intervals from bootstrap draws.
+/// Percentile confidence intervals from bootstrap draws, one per coefficient.
+///
+/// The bounds are R's type 7 quantiles (`quantile(x, c(alpha / 2, 1 - alpha / 2), type = 7)`)
+/// of the draws, so they can fall between two draws. A coefficient whose draws contain a
+/// NaN, or an `alpha` outside `(0, 1)`, gives NaN bounds.
 #[must_use]
 pub fn bootstrap_percentile_ci(betas: &[Mat<f64>], alpha: f64) -> Vec<ConfidenceInterval> {
     if betas.is_empty() {
         return Vec::new();
     }
     let n = betas[0].nrows();
-    let last = betas.len().saturating_sub(1);
-    let (mut lower_idx, mut upper_idx) = crate::utils::boot_index_bounds(alpha, betas.len());
-    lower_idx = lower_idx.min(last);
-    upper_idx = upper_idx.min(last).max(lower_idx);
-
     let mut intervals = Vec::with_capacity(n);
     let mut values: Vec<f64> = Vec::with_capacity(betas.len());
     for col in 0..n {
         values.clear();
         values.extend(betas.iter().map(|b| b[(col, 0)]));
-        let upper = order_statistic_unsorted(&mut values, upper_idx).unwrap_or(f64::NAN);
-        let lower = if lower_idx == upper_idx {
-            upper
-        } else {
-            order_statistic_unsorted(&mut values[..=upper_idx], lower_idx).unwrap_or(upper)
-        };
+        let (lower, upper) =
+            percentile(&mut values, alpha, Percentile::Type7).unwrap_or((f64::NAN, f64::NAN));
         intervals.push(ConfidenceInterval { lower, upper });
     }
     intervals
-}
-
-fn order_statistic_unsorted(values: &mut [f64], nth: usize) -> Option<f64> {
-    if values.is_empty() || nth >= values.len() {
-        return None;
-    }
-    values.select_nth_unstable_by(nth, f64::total_cmp);
-    Some(values[nth])
 }
 
 /// Compute bootstrap mean, SE, and percentile CI.

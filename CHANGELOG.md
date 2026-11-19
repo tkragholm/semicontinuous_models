@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased (0.8.0)
+
+- `bootstrap_percentile_ci`, and so `bootstrap_summary`, read the interval bounds as R's
+  type 7 quantiles (`quantile(x, c(alpha / 2, 1 - alpha / 2), type = 7)`), through
+  `epistat_inference::interval::percentile`. Before, the bounds were the draws at
+  positions `floor(alpha / 2 * n)` and `ceil((1 - alpha / 2) * n) - 1`. Endpoints move by
+  about one draw at each end and can now fall between two draws. A coefficient with a
+  NaN draw, or an `alpha` outside `(0, 1)`, gives NaN bounds. To reproduce results from
+  0.7.0 and earlier, compute the bounds with
+  `epistat_inference::interval::Percentile::OutwardFromCount`.
+- Deterministic fits are unchanged, and no golden hash in `tests/fit_golden.rs` moves.
+- `utils::boot_index_bounds`, the earlier rule's index computation, is removed.
+
 ## 0.7.0 - 2026-11-19
 
 Dependencies: epistat-stats 0.2.0, epistat-linalg 0.3.0, epistat-inference 0.3.0 and
