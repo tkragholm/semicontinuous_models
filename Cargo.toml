@@ -38,6 +38,9 @@ comfy-table = "7.2.2"
 dyn-stack = "0.13.2"
 tracing = "0.1.41"
 rayon = "1.11.0"
+epistat-linalg = { git = "https://github.com/tkragholm/epistat", rev = "9b49113fb7493846f033694c0034c74eb86c8938" }
+epistat-inference = { git = "https://github.com/tkragholm/epistat", rev = "9b49113fb7493846f033694c0034c74eb86c8938" }
+epistat-stats = { git = "https://github.com/tkragholm/epistat", rev = "9b49113fb7493846f033694c0034c74eb86c8938" }
 
 [dev-dependencies]
 approx = "0.5.1"

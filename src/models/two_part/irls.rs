@@ -9,7 +9,7 @@ use crate::models::matrix_ops::{
     weighted_column_means,
 };
 use crate::utils::{
-    CachedFactor, add_ridge_to_diagonal, linear_predictor, matvec_into, max_abs_diff,
+    add_ridge_to_diagonal, cached_factor, linear_predictor, matvec_into, max_abs_diff,
     mean_column_ref, weighted_xtx_ref, weighted_xtz_ref_with_buffer,
 };
 
@@ -257,7 +257,7 @@ pub(super) fn fit_gamma_log_link_weighted(
         {
             add_ridge_to_diagonal(&mut xtwx, lambda, exclude_intercept);
         }
-        Some(CachedFactor::factor(&xtwx))
+        Some(cached_factor(&xtwx)?)
     };
 
     // Column buffers reused across iterations (the bootstrap runs thousands of these

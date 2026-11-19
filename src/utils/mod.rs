@@ -11,16 +11,10 @@
 //! Shared helpers for solving linear systems, computing summary statistics,
 //! and working with faer matrices.
 
+use epistat_linalg::{Attempt, Factor, Method, ROW_BLOCK, Ridge};
 use faer::linalg::matmul::matmul;
-use faer::linalg::matmul::triangular::{self, BlockStructure};
-use faer::linalg::solvers::{Llt, PartialPivLu};
-use faer::prelude::*;
-use faer::{Accum, Mat, MatMut, MatRef, Par, Side};
+use faer::{Accum, Mat, MatMut, MatRef, Par};
 use num_traits::ToPrimitive;
-use rayon::prelude::*;
-use std::cell::Cell;
-use std::ops::Range;
-use std::sync::OnceLock;
 
 use crate::input::LongitudinalModelInput;
 use crate::models::two_part::TwoPartError;
@@ -45,54 +39,8 @@ pub struct EffectIntervalSummary {
     pub q975: f64,
 }
 
-thread_local! {
-    static SERIAL_INNER: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Marks the current thread's fit as serial for the lifetime of the guard: every
-/// row-block pass, matrix-vector product and dense solve run by the fit stays on this
-/// thread. Guards nest, and a serial scope is never widened by an inner one.
-pub(crate) struct SerialInnerScope {
-    previous: bool,
-}
-
-impl SerialInnerScope {
-    /// Enter a serial scope when `serial` is true, and leave the current mode alone
-    /// otherwise.
-    pub(crate) fn enter(serial: bool) -> Self {
-        let previous = SERIAL_INNER.with(Cell::get);
-        if serial {
-            SERIAL_INNER.with(|flag| flag.set(true));
-        }
-        Self { previous }
-    }
-}
-
-impl Drop for SerialInnerScope {
-    fn drop(&mut self) {
-        SERIAL_INNER.with(|flag| flag.set(self.previous));
-    }
-}
-
-fn serial_inner() -> bool {
-    SERIAL_INNER.with(Cell::get)
-}
-
-/// Run `f` where faer's global parallelism resolves to one thread: on a rayon pool of
-/// one worker, `Par::rayon(0)` is the size of that pool.
-fn on_single_thread<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .thread_name(|_| "semicontinuous-serial".to_owned())
-            .build()
-            .expect("single-thread pool")
-    })
-    .install(f)
-}
-
-/// Cholesky factor of the lower triangle of `a`, computed with `Par::Seq`.
+/// Cholesky factor of the lower triangle of `a`, computed with `Par::Seq`. The prepared
+/// designs check the pivots of this factor, which a [`Factor`] does not expose.
 pub(crate) fn llt_factor_seq(a: MatRef<'_, f64>) -> Option<Mat<f64>> {
     let n = a.nrows();
     let mut lower = Mat::<f64>::zeros(n, n);
@@ -164,63 +112,9 @@ pub(crate) fn solve_linear_system_ref(
     a_ref: MatRef<'_, f64>,
     b_ref: MatRef<'_, f64>,
 ) -> Result<Mat<f64>, TwoPartError> {
-    if serial_inner() {
-        return solve_linear_system_serial(a_ref, b_ref);
-    }
-    if let Ok(cholesky) = a_ref.llt(Side::Lower) {
-        let solution = cholesky.solve(b_ref);
-        if matrix_is_finite(&solution) {
-            return Ok(solution);
-        }
-    }
-
-    let lblt_solution = a_ref.lblt(Side::Lower).solve(b_ref);
-    if matrix_is_finite(&lblt_solution) {
-        return Ok(lblt_solution);
-    }
-
-    let partial_solution = a_ref.partial_piv_lu().solve(b_ref);
-    if matrix_is_finite(&partial_solution) {
-        return Ok(partial_solution);
-    }
-
-    let robust_solution = a_ref.full_piv_lu().solve(b_ref);
-    if !matrix_is_finite(&robust_solution) {
-        return Err(TwoPartError::SolveFailed);
-    }
-    Ok(robust_solution)
-}
-
-/// [`solve_linear_system_ref`] with every factorisation and solve on one thread.
-fn solve_linear_system_serial(
-    a_ref: MatRef<'_, f64>,
-    b_ref: MatRef<'_, f64>,
-) -> Result<Mat<f64>, TwoPartError> {
-    if let Some(lower) = llt_factor_seq(a_ref) {
-        let solution = llt_solve_seq(lower.as_ref(), b_ref);
-        if matrix_is_finite(&solution) {
-            return Ok(solution);
-        }
-    }
-    // The pivoted fallbacks are rare and p-by-p. They run on a one-worker pool, so
-    // faer's global parallelism resolves to one thread there.
-    let (a, b) = (a_ref.to_owned(), b_ref.to_owned());
-    on_single_thread(|| {
-        let lblt_solution = a.as_ref().lblt(Side::Lower).solve(b.as_ref());
-        if matrix_is_finite(&lblt_solution) {
-            return Ok(lblt_solution);
-        }
-        let partial_solution = a.as_ref().partial_piv_lu().solve(b.as_ref());
-        if matrix_is_finite(&partial_solution) {
-            return Ok(partial_solution);
-        }
-        let robust_solution = a.as_ref().full_piv_lu().solve(b.as_ref());
-        if matrix_is_finite(&robust_solution) {
-            Ok(robust_solution)
-        } else {
-            Err(TwoPartError::SolveFailed)
-        }
-    })
+    epistat_linalg::solve(a_ref, b_ref, &Attempt::SYMMETRIC)
+        .map(|solution| solution.x)
+        .map_err(|_| TwoPartError::SolveFailed)
 }
 
 /// # Errors
@@ -230,94 +124,29 @@ pub fn solve_linear_system(a: &Mat<f64>, b: &Mat<f64>) -> Result<Mat<f64>, TwoPa
     solve_linear_system_ref(a.as_ref(), b.as_ref())
 }
 
-/// A factorization of a fixed left-hand side, cached so an IRLS loop whose
-/// information matrix `X'WX` is invariant across iterations factors it once and
-/// only back-substitutes the changing right-hand side each pass.
+/// Cholesky with a jitter of `1e-10`, growing tenfold up to eight times, on failure,
+/// then partial-pivot LU.
+const CACHED_FACTOR_ATTEMPTS: [Attempt; 2] = [
+    Attempt::ridged(
+        Method::Cholesky,
+        Ridge {
+            start: 1e-10,
+            growth: 10.0,
+            tries: 8,
+        },
+    ),
+    Attempt::plain(Method::PartialPivLu),
+];
+
+/// Factor a (ridged) Gram matrix `X'WX` once for reuse across IRLS iterations whose
+/// information matrix does not change, so each pass only back-substitutes the new
+/// right-hand side.
 ///
-/// This applies to log-link GLMs whose Fisher-scoring weight `μ^(2-power)` is
-/// β-independent — the gamma / Tweedie-power-2 case, where `W` is the fixed
-/// sample weights — so the cached factor is the *exact* information matrix at
-/// every iterate. The build mirrors [`solve_linear_system_ref`]: a Cholesky of
-/// the symmetric, positive-definite ridged Gram matrix, with incremental jitter
-/// on the rare failure, falling back to a pivoted LU.
-pub(crate) enum CachedFactor {
-    Llt(Llt<f64>),
-    /// The lower Cholesky factor, built and applied with `Par::Seq`.
-    LltSeq(Mat<f64>),
-    Lu(PartialPivLu<f64>),
-}
-
-impl CachedFactor {
-    /// Factor a (ridged) Gram matrix `X'WX` once for reuse across IRLS iterations.
-    pub(crate) fn factor(matrix: &Mat<f64>) -> Self {
-        if serial_inner() {
-            return Self::factor_serial(matrix);
-        }
-        if let Ok(llt) = matrix.as_ref().llt(Side::Lower) {
-            return Self::Llt(llt);
-        }
-        // Cholesky failed (numerically indefinite); jitter the diagonal and retry,
-        // matching the stabilization the per-iteration solver applies on failure.
-        let dim = matrix.nrows().min(matrix.ncols());
-        let mut jitter = 1e-10;
-        for _ in 0..8 {
-            let stabilized = Mat::from_fn(matrix.nrows(), matrix.ncols(), |r, c| {
-                if r == c && r < dim {
-                    matrix[(r, c)] + jitter
-                } else {
-                    matrix[(r, c)]
-                }
-            });
-            if let Ok(llt) = stabilized.as_ref().llt(Side::Lower) {
-                return Self::Llt(llt);
-            }
-            jitter *= 10.0;
-        }
-        Self::Lu(matrix.as_ref().partial_piv_lu())
-    }
-
-    /// [`CachedFactor::factor`] with every factorisation on one thread.
-    fn factor_serial(matrix: &Mat<f64>) -> Self {
-        if let Some(lower) = llt_factor_seq(matrix.as_ref()) {
-            return Self::LltSeq(lower);
-        }
-        let dim = matrix.nrows().min(matrix.ncols());
-        let mut jitter = 1e-10;
-        for _ in 0..8 {
-            let stabilized = Mat::from_fn(matrix.nrows(), matrix.ncols(), |r, c| {
-                if r == c && r < dim {
-                    matrix[(r, c)] + jitter
-                } else {
-                    matrix[(r, c)]
-                }
-            });
-            if let Some(lower) = llt_factor_seq(stabilized.as_ref()) {
-                return Self::LltSeq(lower);
-            }
-            jitter *= 10.0;
-        }
-        let owned = matrix.clone();
-        Self::Lu(on_single_thread(|| owned.as_ref().partial_piv_lu()))
-    }
-
-    /// Back-substitute the cached factor against `rhs`. Returns `SolveFailed` if the
-    /// solution is non-finite (a pathological RHS), so the caller can fall back.
-    pub(crate) fn solve(&self, rhs: MatRef<'_, f64>) -> Result<Mat<f64>, TwoPartError> {
-        let solution = match self {
-            Self::Llt(factor) => factor.solve(rhs),
-            Self::LltSeq(lower) => llt_solve_seq(lower.as_ref(), rhs),
-            Self::Lu(factor) if serial_inner() => {
-                let rhs = rhs.to_owned();
-                on_single_thread(|| factor.solve(rhs.as_ref()))
-            }
-            Self::Lu(factor) => factor.solve(rhs),
-        };
-        if matrix_is_finite(&solution) {
-            Ok(solution)
-        } else {
-            Err(TwoPartError::SolveFailed)
-        }
-    }
+/// # Errors
+///
+/// Returns `TwoPartError::SolveFailed` if `matrix` is not square.
+pub(crate) fn cached_factor(matrix: &Mat<f64>) -> Result<Factor, TwoPartError> {
+    Factor::new(matrix.as_ref(), &CACHED_FACTOR_ATTEMPTS).map_err(|_| TwoPartError::SolveFailed)
 }
 
 /// IRLS weights for a log-link GLM whose Fisher-scoring weight is β-independent
@@ -473,124 +302,6 @@ pub fn quadratic_form_vec(vector: &[f64], matrix: &Mat<f64>) -> f64 {
     quadratic
 }
 
-/// Rows per block in every sum over the rows of a design matrix.
-///
-/// Each block is reduced on one thread with faer's sequential kernels, and the block
-/// partials are added in block order. The partition depends only on the number of rows,
-/// so the result is bit-identical for any thread count and any scheduling. faer's own
-/// parallel kernels are not used for these products: its parallel matrix-vector product
-/// splits the inner dimension across threads and adds the pieces, so its result depends
-/// on the thread count.
-const ROW_BLOCK: usize = 4096;
-
-/// Sum of the `rows × cols` partials `block_term` writes for each block of `n` rows,
-/// added in block order. Blocks are evaluated in parallel.
-fn sum_over_row_blocks<F>(n: usize, rows: usize, cols: usize, block_term: F) -> Mat<f64>
-where
-    F: Fn(Range<usize>, MatMut<'_, f64>) + Sync,
-{
-    let mut total = Mat::<f64>::zeros(rows, cols);
-    if n <= ROW_BLOCK {
-        block_term(0..n, total.as_mut());
-        return total;
-    }
-    let blocks = n.div_ceil(ROW_BLOCK);
-    if serial_inner() {
-        // The same partials added in the same block order, on this thread.
-        for block in 0..blocks {
-            let mut partial = Mat::<f64>::zeros(rows, cols);
-            block_term(
-                block * ROW_BLOCK..((block + 1) * ROW_BLOCK).min(n),
-                partial.as_mut(),
-            );
-            add_in_place(&mut total, &partial);
-        }
-        return total;
-    }
-    let partials: Vec<Mat<f64>> = (0..blocks)
-        .into_par_iter()
-        .map(|block| {
-            let mut partial = Mat::<f64>::zeros(rows, cols);
-            block_term(
-                block * ROW_BLOCK..((block + 1) * ROW_BLOCK).min(n),
-                partial.as_mut(),
-            );
-            partial
-        })
-        .collect();
-    for partial in &partials {
-        add_in_place(&mut total, partial);
-    }
-    total
-}
-
-fn add_in_place(total: &mut Mat<f64>, partial: &Mat<f64>) {
-    for col in 0..total.ncols() {
-        for row in 0..total.nrows() {
-            total[(row, col)] += partial[(row, col)];
-        }
-    }
-}
-
-/// `Σ_i s_i² x_i x_iᵀ` for the row scales `s_i = scale(i)`, exactly symmetric.
-///
-/// Each block forms `S X` for its rows and adds `(S X)ᵀ (S X)` through a symmetric
-/// rank-k update of the lower triangle, which is then mirrored.
-pub(crate) fn row_scaled_gram(x: MatRef<'_, f64>, scale: impl Fn(usize) -> f64 + Sync) -> Mat<f64> {
-    let p = x.ncols();
-    let mut gram = sum_over_row_blocks(x.nrows(), p, p, |rows, out| {
-        let start = rows.start;
-        // One scale per row rather than one per element: the same values, p times fewer calls.
-        let scales: Vec<f64> = rows.clone().map(&scale).collect();
-        let mut scaled = Mat::<f64>::zeros(rows.len(), p);
-        for col in 0..p {
-            let from = &col_slice(x, col)[start..start + rows.len()];
-            for ((to, &value), &row_scale) in scaled
-                .col_as_slice_mut(col)
-                .iter_mut()
-                .zip(from)
-                .zip(&scales)
-            {
-                *to = value * row_scale;
-            }
-        }
-        triangular::matmul(
-            out,
-            BlockStructure::TriangularLower,
-            Accum::Replace,
-            scaled.transpose(),
-            BlockStructure::Rectangular,
-            scaled.as_ref(),
-            BlockStructure::Rectangular,
-            1.0,
-            Par::Seq,
-        );
-    });
-    for col in 0..p {
-        for row in (col + 1)..p {
-            gram[(col, row)] = gram[(row, col)];
-        }
-    }
-    gram
-}
-
-/// `Xᵀ v` for a column `v` of the same length as `X`.
-pub(crate) fn xt_column(x: MatRef<'_, f64>, v: &[f64]) -> Mat<f64> {
-    sum_over_row_blocks(x.nrows(), x.ncols(), 1, |rows, out| {
-        let start = rows.start;
-        let len = rows.len();
-        let block = MatRef::from_column_major_slice(&v[rows], len, 1);
-        matmul(
-            out,
-            Accum::Replace,
-            x.as_ref().subrows(start, len).transpose(),
-            block,
-            1.0,
-            Par::Seq,
-        );
-    })
-}
-
 /// `X'WX` with the weights floored at zero, exactly symmetric.
 #[must_use]
 pub fn weighted_xtx(x: &Mat<f64>, weights: &Mat<f64>) -> Mat<f64> {
@@ -600,51 +311,13 @@ pub fn weighted_xtx(x: &Mat<f64>, weights: &Mat<f64>) -> Mat<f64> {
 /// [`weighted_xtx`] on borrowed matrices.
 #[must_use]
 pub fn weighted_xtx_ref(x: MatRef<'_, f64>, weights: MatRef<'_, f64>) -> Mat<f64> {
-    row_scaled_gram(x, |row| weights[(row, 0)].max(0.0).sqrt())
+    epistat_linalg::weighted_gram(x, col_slice(weights, 0))
 }
 
-/// In-place matrix-vector product `dst <- x * beta`, reusing `dst`'s storage so an
-/// IRLS loop does not allocate a fresh linear-predictor column every iteration.
-///
-/// Rows are split into fixed blocks, so each element is the same sequential sum over
-/// the columns whatever the thread count.
+/// `dst <- x * beta`, reusing `dst`'s storage so an IRLS loop does not allocate a fresh
+/// linear-predictor column every iteration.
 pub(crate) fn matvec_into(dst: &mut Mat<f64>, x: MatRef<'_, f64>, beta: &Mat<f64>) {
-    let n = x.nrows();
-    if n <= ROW_BLOCK {
-        matmul(
-            dst.as_mut(),
-            Accum::Replace,
-            x.as_ref(),
-            beta.as_ref(),
-            1.0,
-            Par::Seq,
-        );
-        return;
-    }
-    let column = dst.col_as_slice_mut(0);
-    if serial_inner() {
-        for (block, chunk) in column.chunks_mut(ROW_BLOCK).enumerate() {
-            matvec_block(chunk, x, beta, block);
-        }
-    } else {
-        column
-            .par_chunks_mut(ROW_BLOCK)
-            .enumerate()
-            .for_each(|(block, chunk)| matvec_block(chunk, x, beta, block));
-    }
-}
-
-/// `chunk <- x[block rows] * beta` for the rows of block number `block`.
-fn matvec_block(chunk: &mut [f64], x: MatRef<'_, f64>, beta: &Mat<f64>, block: usize) {
-    let len = chunk.len();
-    matmul(
-        MatMut::from_column_major_slice_mut(chunk, len, 1),
-        Accum::Replace,
-        x.subrows(block * ROW_BLOCK, len),
-        beta.as_ref(),
-        1.0,
-        Par::Seq,
-    );
+    epistat_linalg::matvec_into(dst.col_as_slice_mut(0), x, beta.as_ref());
 }
 
 /// The mean over the rows of `x` of `row_mean(eta_1, .., eta_K)`, where `eta_k` is the
@@ -717,8 +390,11 @@ pub(crate) fn linear_predictor(x: MatRef<'_, f64>, beta: &Mat<f64>) -> Mat<f64> 
 
 #[must_use]
 pub fn weighted_xtz(x: &Mat<f64>, weights: &Mat<f64>, response: &Mat<f64>) -> Mat<f64> {
-    let mut weighted_buffer = Vec::new();
-    weighted_xtz_with_buffer(x, weights, response, &mut weighted_buffer)
+    epistat_linalg::weighted_xtz(
+        x.as_ref(),
+        col_slice(weights.as_ref(), 0),
+        col_slice(response.as_ref(), 0),
+    )
 }
 
 #[must_use]
@@ -736,7 +412,8 @@ pub fn weighted_xtz_with_buffer(
     )
 }
 
-/// [`weighted_xtz_with_buffer`] on borrowed matrices.
+/// [`weighted_xtz_with_buffer`] on borrowed matrices. The products `w_i z_i` are formed
+/// in `weighted_buffer`, which an IRLS loop reuses across iterations.
 #[must_use]
 pub fn weighted_xtz_ref_with_buffer(
     x: MatRef<'_, f64>,
@@ -755,7 +432,7 @@ pub fn weighted_xtz_ref_with_buffer(
     {
         *slot = weight * value;
     }
-    xt_column(x, &weighted_buffer[..n])
+    epistat_linalg::xtv(x, &weighted_buffer[..n])
 }
 
 /// Add a scaled outer-product row contribution to a sandwich "meat" matrix.
@@ -784,23 +461,11 @@ pub fn add_outer_product_scaled(meat: &mut Mat<f64>, v: &[f64], scale: f64) {
     }
 }
 
+/// The type 7 quantile of sorted values, 0 for no values. `quantile` is clamped to
+/// `[0, 1]`.
 #[must_use]
 pub fn calculate_quantile(sorted_values: &[f64], quantile: f64) -> f64 {
-    if sorted_values.is_empty() {
-        return 0.0;
-    }
-    let last = sorted_values.len() - 1;
-    let clamped = quantile.clamp(0.0, 1.0);
-    let position = clamped * usize_to_f64(last);
-    let lower = position.floor().to_usize().unwrap_or(0);
-    let upper = position.ceil().to_usize().unwrap_or(last);
-
-    if lower == upper {
-        sorted_values[lower]
-    } else {
-        let weight = position - position.floor();
-        sorted_values[lower].mul_add(1.0 - weight, sorted_values[upper] * weight)
-    }
+    epistat_stats::quantile::type7(sorted_values, quantile.clamp(0.0, 1.0)).unwrap_or(0.0)
 }
 
 #[must_use]
@@ -895,35 +560,7 @@ pub fn summarize_draws_in_place(values: &mut [f64]) -> EffectIntervalSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
-    use std::sync::Mutex;
 
-    #[test]
-    fn serial_scope_keeps_row_blocks_on_the_calling_thread() {
-        let n = 5 * ROW_BLOCK + 17;
-        let x = Mat::from_fn(n, 3, |i, j| ((i * 7 + j * 3) % 11) as f64);
-        let threads_used = |serial: bool| {
-            let seen = Mutex::new(HashSet::new());
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(4)
-                .build()
-                .expect("pool");
-            let gram = pool.install(|| {
-                let _scope = SerialInnerScope::enter(serial);
-                row_scaled_gram(x.as_ref(), |row| {
-                    seen.lock()
-                        .expect("lock")
-                        .insert(std::thread::current().id());
-                    1.0 + (row % 3) as f64
-                })
-            });
-            (gram, seen.into_inner().expect("lock").len())
-        };
-        let (serial_gram, serial_threads) = threads_used(true);
-        let (parallel_gram, _) = threads_used(false);
-        assert_eq!(serial_threads, 1);
-        assert_eq!(serial_gram, parallel_gram);
-    }
     use approx::assert_relative_eq;
 
     #[test]

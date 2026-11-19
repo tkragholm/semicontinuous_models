@@ -27,8 +27,8 @@ use crate::models::{
     run_with_retries,
 };
 use crate::utils::{
-    CachedFactor, SerialInnerScope, add_ridge_to_diagonal, col_slice, fill_constant_irls_weights,
-    linear_predictor, matvec_into, max_abs_diff, solve_linear_system_ref, weighted_xtx_ref,
+    add_ridge_to_diagonal, cached_factor, col_slice, fill_constant_irls_weights, linear_predictor,
+    matvec_into, max_abs_diff, solve_linear_system_ref, weighted_xtx_ref,
     weighted_xtz_ref_with_buffer,
 };
 
@@ -59,9 +59,8 @@ pub struct TweedieOptions {
     /// Strategy for handling non-convergence.
     #[builder(default = FitStrategy::Strict)]
     pub strategy: FitStrategy,
-    /// If true (the default), the passes inside one fit use rayon, as for
-    /// [`FitOptions::inner_parallel`](crate::FitOptions::inner_parallel). If false,
-    /// every pass runs on the calling thread in a fixed order.
+    /// Has no effect, as for
+    /// [`FitOptions::inner_parallel`](crate::FitOptions::inner_parallel).
     #[builder(default = true)]
     pub inner_parallel: bool,
 }
@@ -324,7 +323,6 @@ fn fit_tweedie_weighted(
     initial_beta: Option<&Mat<f64>>,
     scratch: &mut TweedieScratch,
 ) -> Result<(TweedieModel, TweedieReport), TweedieError> {
-    let _serial = SerialInnerScope::enter(!options.inner_parallel);
     let start_time = Instant::now();
     if !(1.0..=2.0).contains(&power) {
         return Err(TweedieError::InvalidPower);
@@ -481,7 +479,7 @@ fn fit_tweedie_with_lambda(
         if lambda > 0.0 {
             add_ridge_to_diagonal(&mut xtwx, lambda, options.l2_penalty_exclude_intercept);
         }
-        Some(CachedFactor::factor(&xtwx))
+        Some(cached_factor(&xtwx).map_err(|_| TweedieError::SolveFailed)?)
     } else {
         None
     };
@@ -945,7 +943,7 @@ fn robust_covariance(
             * mu[(i, 0)].powf(1.0 - power)
     };
     let (meat, cluster_count) = score_meat(x, score_residual, clusters);
-    let cov = sandwich(xtwx, &meat, solve_with_stabilization)?;
+    let cov = stabilized_sandwich(xtwx, &meat)?;
     Ok((Some(cov), cluster_count.is_some(), cluster_count))
 }
 
@@ -1090,6 +1088,27 @@ fn solve_with_stabilization(
         }
         if let Ok(solution) = solve_linear_system_ref(stabilized.as_ref(), rhs) {
             return Ok(solution);
+        }
+        jitter *= 10.0;
+    }
+    Err(TweedieError::SolveFailed)
+}
+
+/// [`sandwich`] with the same growing diagonal jitter from 1e-10 as
+/// [`solve_with_stabilization`], added to the information matrix when the plain one fails.
+fn stabilized_sandwich(information: &Mat<f64>, meat: &Mat<f64>) -> Result<Mat<f64>, TweedieError> {
+    if let Some(cov) = sandwich(information.as_ref(), meat.as_ref()) {
+        return Ok(cov);
+    }
+    let mut stabilized = information.clone();
+    let dim = information.nrows().min(information.ncols());
+    let mut jitter = 1e-10;
+    for _ in 0..8 {
+        for idx in 0..dim {
+            stabilized[(idx, idx)] = information[(idx, idx)] + jitter;
+        }
+        if let Some(cov) = sandwich(stabilized.as_ref(), meat.as_ref()) {
+            return Ok(cov);
         }
         jitter *= 10.0;
     }

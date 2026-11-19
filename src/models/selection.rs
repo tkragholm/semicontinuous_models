@@ -29,7 +29,8 @@ use super::tweedie::{
 };
 use super::two_part::{FitOptions, TwoPartError, fit_two_part_input};
 use crate::input::{InputError, ModelInput};
-use crate::utils::{row_scaled_gram, solve_linear_system, xt_column};
+use crate::utils::solve_linear_system;
+use epistat_linalg::{row_scaled_gram, xtv};
 
 /// Goodness-of-fit metrics for model comparison.
 #[derive(Debug, Clone, Copy)]
@@ -189,7 +190,7 @@ pub fn park_test(x: &Mat<f64>, y: &Mat<f64>) -> Option<ParkTestResult> {
         |i, j| if j == 0 { 1.0 } else { log_mu[(i, 0)] },
     );
     let xtx = row_scaled_gram(design.as_ref(), |_| 1.0);
-    let xty = xt_column(design.as_ref(), log_resid.col_as_slice(0));
+    let xty = xtv(design.as_ref(), log_resid.col_as_slice(0));
     let beta = solve_linear_system(&xtx, &xty).ok()?;
 
     Some(ParkTestResult {

@@ -1,7 +1,7 @@
-//! Fits with `inner_parallel: false` run every inner pass on the calling thread.
+//! Fits with `inner_parallel: false` and `true` agree, because the option has no effect.
 //!
-//! The serial results are pinned as bit patterns, must not depend on the rayon thread
-//! count or on `RAYON_NUM_THREADS`, and must stay close to the parallel results.
+//! The results are pinned as bit patterns and must not depend on the rayon thread count
+//! or on `RAYON_NUM_THREADS`.
 
 use faer::Mat;
 use semicontinuous_models::{
@@ -271,10 +271,10 @@ fn serial_fits_stay_close_to_the_parallel_fits() {
 #[test]
 fn serial_fits_match_the_recorded_bit_patterns() {
     const GOLDEN: &[(&str, u64)] = &[
-        ("two_part/robust/clustered", 0x85d6_4422_4881_372a),
+        ("two_part/robust/clustered", 0x286c_106e_eaa6_2b85),
         ("two_part/model_se", 0xccd5_d65d_7055_f000),
         ("two_part/warm/no_cov", 0xa99b_e55f_83d3_9adf),
-        ("tweedie2/robust/clustered", 0xb42e_4db2_4504_51b4),
+        ("tweedie2/robust/clustered", 0x342c_d209_c1b1_55a0),
         ("tweedie1.5/robust/clustered", 0x28a2_0d9c_3320_38af),
     ];
     let actual = hash(&collect(false));

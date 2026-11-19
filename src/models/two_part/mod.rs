@@ -34,11 +34,10 @@ use crate::models::{
     AttemptDiagnostics, FitMetadata, FitStrategy, Model, RetryableError, SolverKind,
     run_with_retries,
 };
+use crate::utils::linear_predictor;
 #[cfg(feature = "bench-internals")]
 use crate::utils::weighted_xtz;
-use crate::utils::{SerialInnerScope, linear_predictor};
 use faer::{Mat, MatRef};
-use statrs::distribution::{ContinuousCDF, Normal};
 use statrs::function::gamma::ln_gamma;
 use std::collections::HashSet;
 use std::time::Instant;
@@ -117,15 +116,10 @@ pub struct FitOptions {
     /// Strategy for handling non-convergence.
     #[builder(default = FitStrategy::Strict)]
     pub strategy: FitStrategy,
-    /// If true (the default), the passes inside one fit use rayon: the row blocks of
-    /// `X'WX`, `X'z` and the linear predictor, and faer's own parallel kernels in the
-    /// dense solves. If false, every one of those runs on the calling thread in a fixed
-    /// order, which suits a caller that already fits many replicates in parallel.
-    ///
-    /// The row-block sums keep their block partition and their block order, so they
-    /// are bit-identical in both modes. The dense solves use faer's sequential kernels,
-    /// which can move the last bits of a coefficient. A serial fit does not depend on
-    /// the rayon thread count.
+    /// Has no effect. The row blocks of `X'WX`, `X'z` and the linear predictor always use
+    /// rayon with a fixed partition and block order, and the dense solves always run on
+    /// one thread, so a fit gives the same bits for any rayon thread count. The field is
+    /// kept so that existing struct literals still compile.
     #[builder(default = true)]
     pub inner_parallel: bool,
 }
@@ -620,7 +614,6 @@ pub(crate) fn fit_two_part_weighted(
     options: FitOptions,
     warm: Option<&TwoPartWarmStart>,
 ) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
-    let _serial = SerialInnerScope::enter(!options.inner_parallel);
     let start_time = Instant::now();
 
     let is_positive = Mat::from_fn(y.nrows(), 1, |i, _| if y[(i, 0)] > 0.0 { 1.0 } else { 0.0 });
@@ -761,7 +754,6 @@ pub(crate) fn fit_two_part_clustered_weighted(
     options: FitOptions,
     warm: Option<&TwoPartWarmStart>,
 ) -> Result<(TwoPartModel, TwoPartReport), TwoPartError> {
-    let _serial = SerialInnerScope::enter(!options.inner_parallel);
     let (model, base_report) = fit_two_part_weighted(x, y, weights, options, warm)?;
     if !options.robust_se {
         return Ok((model, base_report));
@@ -861,7 +853,7 @@ pub fn coefficient_confidence_intervals(
     cov: &Mat<f64>,
     alpha: f64,
 ) -> Vec<ConfidenceInterval> {
-    let z = normal_quantile(1.0 - alpha / 2.0);
+    let z = epistat_stats::normal::quantile(1.0 - alpha / 2.0);
     let mut intervals = Vec::with_capacity(beta.nrows());
     for i in 0..beta.nrows() {
         let se = cov[(i, i)].max(0.0).sqrt();
@@ -881,10 +873,6 @@ fn select_cluster_ids(clusters: &[u64], indices: &[usize]) -> Vec<u64> {
 #[must_use]
 pub fn benchmark_two_part_weighted_xtz(x: &Mat<f64>, weights: &Mat<f64>, z: &Mat<f64>) -> Mat<f64> {
     weighted_xtz(x, weights, z)
-}
-
-fn normal_quantile(p: f64) -> f64 {
-    Normal::new(0.0, 1.0).map_or(f64::NAN, |normal| normal.inverse_cdf(p))
 }
 
 fn cluster_count(clusters: &[u64]) -> usize {

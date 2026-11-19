@@ -25,8 +25,7 @@ use thiserror::Error;
 
 use crate::input::{InputError, ModelInput};
 use crate::utils::{
-    add_ridge_to_diagonal, linear_predictor, max_abs_diff, mean_column, row_scaled_gram,
-    solve_linear_system, solve_linear_system_ref, xt_column,
+    add_ridge_to_diagonal, linear_predictor, max_abs_diff, mean_column, solve_linear_system,
 };
 
 /// Tuning parameters for log-normal fitting.
@@ -343,9 +342,9 @@ fn fit_lognormal_with_lambda(
 
     // `xtx` and `xty` do not depend on `beta`, so they are loop-invariant;
     // compute them once and reuse for every solve and for the robust covariance.
-    let mut xtx = row_scaled_gram(x_pos.as_ref(), |_| 1.0);
+    let mut xtx = epistat_linalg::row_scaled_gram(x_pos.as_ref(), |_| 1.0);
     add_ridge_to_diagonal(&mut xtx, lambda, options.l2_penalty_exclude_intercept);
-    let xty = xt_column(x_pos.as_ref(), y_log.col_as_slice(0));
+    let xty = epistat_linalg::xtv(x_pos.as_ref(), y_log.col_as_slice(0));
 
     for iteration in 0..options.max_iter {
         iterations = iteration + 1;
@@ -420,9 +419,7 @@ fn robust_covariance(
     xtx: &Mat<f64>,
 ) -> Result<RobustCovarianceResult, LogNormalError> {
     let (meat, cluster_count) = score_meat(x.as_ref(), |i| residuals[(i, 0)], clusters);
-    let cov = sandwich(xtx, &meat, |lhs, rhs| {
-        solve_linear_system_ref(lhs, rhs).map_err(|_| LogNormalError::SolveFailed)
-    })?;
+    let cov = sandwich(xtx.as_ref(), meat.as_ref()).ok_or(LogNormalError::SolveFailed)?;
     Ok((Some(cov), cluster_count.is_some(), cluster_count))
 }
 

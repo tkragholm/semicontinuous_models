@@ -7,8 +7,7 @@ use super::{FitOptions, TwoPartError};
 use crate::models::covariance::{sandwich, score_meat};
 use crate::models::matrix_ops::map_mat;
 use crate::utils::{
-    add_ridge_to_diagonal, linear_predictor, solve_linear_system, solve_linear_system_ref,
-    weighted_xtx_ref,
+    add_ridge_to_diagonal, linear_predictor, solve_linear_system, weighted_xtx_ref,
 };
 
 /// Logit-part covariance: model-based, or the sandwich when `robust_se` is set, with
@@ -44,7 +43,7 @@ pub(super) fn covariance_logit(
         (y[(i, 0)] - p[(i, 0)]) * weights[(i, 0)]
     });
     let (meat, _) = score_meat(x, |i| residuals[(i, 0)], clusters);
-    sandwich(&xtwx, &meat, solve_linear_system_ref)
+    sandwich(xtwx.as_ref(), meat.as_ref()).ok_or(TwoPartError::SolveFailed)
 }
 
 /// Gamma-part covariance: model-based, or the sandwich when `robust_se` is set, with
@@ -74,7 +73,7 @@ pub(super) fn covariance_gamma(
         ((y[(i, 0)] - mu[(i, 0)]) / mu[(i, 0)]) * weights[(i, 0)]
     });
     let (meat, _) = score_meat(x, |i| residuals[(i, 0)], clusters);
-    sandwich(&xtx, &meat, solve_linear_system_ref)
+    sandwich(xtx.as_ref(), meat.as_ref()).ok_or(TwoPartError::SolveFailed)
 }
 
 fn covariance_from_information(information: &Mat<f64>) -> Result<Mat<f64>, TwoPartError> {

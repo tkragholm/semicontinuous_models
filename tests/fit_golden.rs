@@ -54,7 +54,10 @@ fn fixture(zeros: bool, weighted: bool, clustered: bool) -> ModelInput {
     }
     let mut y = Mat::<f64>::zeros(N_ROWS, 1);
     for i in 0..N_ROWS {
-        let eta = 0.4f64.mul_add(x[(i, 1)], 0.2 * x[(i, 2)] - 0.1 * x[(i, 9)] + 0.15 * x[(i, 10)]);
+        let eta = 0.4f64.mul_add(
+            x[(i, 1)],
+            0.2 * x[(i, 2)] - 0.1 * x[(i, 9)] + 0.15 * x[(i, 10)],
+        );
         let is_zero = zeros && stream.uniform() < 0.4 - 0.1 * x[(i, 3)];
         let noise = -stream.uniform().max(1e-12).ln() - stream.uniform().max(1e-12).ln();
         if !is_zero {
@@ -259,7 +262,10 @@ fn collect() -> Golden {
         "tweedie2/weighted/ridge/warm/robust",
         &positive_weighted,
         2.0,
-        TweedieOptions::builder().l2_penalty(1e-4).robust_se(true).build(),
+        TweedieOptions::builder()
+            .l2_penalty(1e-4)
+            .robust_se(true)
+            .build(),
         Some(&cold),
     );
     tweedie(
@@ -307,20 +313,20 @@ fn collect() -> Golden {
 }
 
 const GOLDEN: &[(&str, u64)] = &[
-    ("two_part/unweighted/robust/clustered", 0x3e3d9fae257d710a),
+    ("two_part/unweighted/robust/clustered", 0x9faf1d3115ef7984),
     ("two_part/unweighted/model_se", 0x7238922a71787077),
     ("two_part/weighted/model_se", 0x288fd34eb86d1456),
-    ("two_part/weighted/robust/clustered", 0x72815ba62317b4af),
+    ("two_part/weighted/robust/clustered", 0x0650c93229ec61a5),
     ("two_part/weighted/stable", 0x18cb2aa04df1f58e),
     ("two_part/weighted/warm/no_cov", 0xc925fead5cba18f0),
     ("two_part/weighted/warm/model_se", 0xa90112d7dbe6f2b5),
-    ("tweedie2/weighted/robust/clustered", 0x45c26879984fe036),
+    ("tweedie2/weighted/robust/clustered", 0x7514a90d91e105ed),
     ("tweedie2/unweighted/plain", 0x66ca3ead887a50d8),
     ("tweedie2/weighted/warm", 0x169946344253d936),
-    ("tweedie2/weighted/ridge/warm/robust", 0xdef64d567232e1b3),
-    ("tweedie1.5/weighted/robust/clustered", 0xcd192701a061b424),
+    ("tweedie2/weighted/ridge/warm/robust", 0x948c51be25293cb4),
+    ("tweedie1.5/weighted/robust/clustered", 0x6975dbc2f59ebfab),
     ("tweedie1.5/unweighted/plain", 0x7366d249674b0c28),
-    ("lognormal/weighted/robust/clustered", 0x32c2c90488bab51a),
+    ("lognormal/weighted/robust/clustered", 0xd1900b83bd952489),
     ("two_part/input/default", 0x50443c256527acf3),
     ("tweedie2/input/default", 0xfeca4cccd30d521c),
 ];

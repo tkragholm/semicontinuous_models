@@ -13,68 +13,18 @@ use super::types::{
     MtpConvergenceSummary, MtpError, validate_chain_count, validate_draw_dimensions,
 };
 
-/// Lag-`k` autocorrelation for a scalar chain.
+/// Lag-`k` autocorrelation for a scalar chain, 0 when the lag is not shorter than the
+/// chain or the chain is constant.
 #[must_use]
 pub fn autocorrelation(series: &[f64], lag: usize) -> f64 {
-    if series.is_empty() || lag >= series.len() {
-        return 0.0;
-    }
-
-    let mean = series.iter().sum::<f64>() / usize_to_f64(series.len());
-    let denominator = sum_squared_deviations(series, mean);
-    if denominator <= 0.0 {
-        return 0.0;
-    }
-
-    autocorrelation_with_stats(series, lag, mean, denominator)
+    epistat_stats::mcmc::autocorrelation(series, lag).unwrap_or(0.0)
 }
 
-/// Sum of squared deviations from `mean`, i.e. the lag-0 autocovariance numerator.
-fn sum_squared_deviations(series: &[f64], mean: f64) -> f64 {
-    series.iter().fold(0.0, |acc, value| {
-        let centered = value - mean;
-        centered.mul_add(centered, acc)
-    })
-}
-
-/// Lag-`k` autocorrelation given a precomputed `mean` and lag-0 `denominator`.
-///
-/// The denominator (sum of squared deviations) is identical for every lag of a
-/// given series, so callers that sweep many lags should compute it once and
-/// reuse it here instead of paying an O(n) pass per lag.
-fn autocorrelation_with_stats(series: &[f64], lag: usize, mean: f64, denominator: f64) -> f64 {
-    let n = series.len() - lag;
-    let mut numerator = 0.0;
-    for idx in 0..n {
-        numerator = (series[idx] - mean).mul_add(series[idx + lag] - mean, numerator);
-    }
-    numerator / denominator
-}
-
-/// Heuristic effective sample size using positive autocorrelation truncation.
+/// Heuristic effective sample size using positive autocorrelation truncation. A constant
+/// chain, and a chain of fewer than two draws, count as that many independent draws.
 #[must_use]
 pub fn effective_sample_size(series: &[f64]) -> f64 {
-    let n = series.len();
-    if n < 2 {
-        return usize_to_f64(n);
-    }
-
-    let mean = series.iter().sum::<f64>() / usize_to_f64(n);
-    let denominator = sum_squared_deviations(series, mean);
-    if denominator <= 0.0 {
-        return usize_to_f64(n);
-    }
-
-    let mut rho_sum = 0.0;
-    for lag in 1..n {
-        let rho = autocorrelation_with_stats(series, lag, mean, denominator);
-        if rho <= 0.0 {
-            break;
-        }
-        rho_sum += rho;
-    }
-
-    usize_to_f64(n) / (2.0f64.mul_add(rho_sum, 1.0)).max(1.0)
+    epistat_stats::mcmc::effective_sample_size(series)
 }
 
 /// Summarize split-R-hat convergence diagnostics across posterior chains.
@@ -284,88 +234,20 @@ where
         });
     }
 
-    let half = draws_per_chain_used / 2;
-    // Accumulate only the per-split-chain (mean, variance) moments in a single
-    // pass, rather than materializing 2·`chains.len()` value vectors of length
-    // `half` for every parameter.
-    let mut means = Vec::with_capacity(chains.len() * 2);
-    let mut variances = Vec::with_capacity(chains.len() * 2);
-    for chain in chains {
-        let (first_mean, first_var, _) =
-            mean_and_sample_variance(chain.draws.iter().take(half).map(&extractor));
-        let (second_mean, second_var, _) =
-            mean_and_sample_variance(chain.draws.iter().skip(half).take(half).map(&extractor));
-        means.push(first_mean);
-        variances.push(first_var);
-        means.push(second_mean);
-        variances.push(second_var);
-    }
-
-    split_rhat_from_moments(&means, &variances, half)
-}
-
-/// Streaming mean and sample variance (Welford, `n - 1` denominator) returning
-/// `(mean, variance, count)`. Single pass, no allocation.
-fn mean_and_sample_variance<I>(values: I) -> (f64, f64, usize)
-where
-    I: Iterator<Item = f64>,
-{
-    let mut count = 0usize;
-    let mut mean = 0.0;
-    let mut m2 = 0.0;
-    for value in values {
-        count += 1;
-        let delta = value - mean;
-        mean += delta / usize_to_f64(count);
-        let delta2 = value - mean;
-        m2 = delta.mul_add(delta2, m2);
-    }
-    let variance = if count < 2 {
-        0.0
-    } else {
-        m2 / usize_to_f64(count - 1)
-    };
-    (mean, variance, count)
-}
-
-/// Split-R-hat from per-split-chain means and variances (each split chain has
-/// `n` draws). Equivalent to the prior `split_rhat_scalar`, but fed precomputed
-/// moments instead of value vectors.
-fn split_rhat_from_moments(means: &[f64], variances: &[f64], n: usize) -> Result<f64, MtpError> {
-    let m = means.len();
-    if m < 2 {
-        return Err(MtpError::InvalidChainCount { min: 2, found: m });
-    }
-    if n < 2 {
-        return Err(MtpError::InsufficientChainDraws {
-            minimum: 2,
-            found: n,
-        });
-    }
-
-    let mean_of_means = means.iter().sum::<f64>() / usize_to_f64(m);
-    let between = usize_to_f64(n)
-        * means
-            .iter()
-            .map(|mean| {
-                let centered = *mean - mean_of_means;
-                centered * centered
-            })
-            .sum::<f64>()
-        / usize_to_f64(m - 1);
-    let within = variances.iter().sum::<f64>() / usize_to_f64(m);
-
-    if !(within.is_finite() && within > 0.0 && between.is_finite()) {
-        return Ok(1.0);
-    }
-
-    let n_f64 = usize_to_f64(n);
-    let var_plus = ((n_f64 - 1.0) / n_f64).mul_add(within, between / n_f64);
-    if !var_plus.is_finite() || var_plus <= 0.0 {
-        return Ok(1.0);
-    }
-
-    Ok((var_plus / within).sqrt().max(1.0))
+    let values: Vec<Vec<f64>> = chains
+        .iter()
+        .map(|chain| {
+            chain
+                .draws
+                .iter()
+                .take(draws_per_chain_used)
+                .map(&extractor)
+                .collect()
+        })
+        .collect();
+    let slices: Vec<&[f64]> = values.iter().map(Vec::as_slice).collect();
+    // Half-chains without variance carry no evidence of disagreement.
+    Ok(epistat_stats::mcmc::split_rhat(&slices).unwrap_or(1.0))
 }
 
 #[cfg(test)]
