@@ -11,6 +11,7 @@
 //! -- --nocapture` after a change that is meant to alter results.
 #![cfg(all(target_arch = "aarch64", target_os = "macos"))]
 
+use epistat_testkit::Fingerprint;
 use faer::Mat;
 use semicontinuous_models::{
     FitOptions, LogNormalOptions, Model, ModelInput, TweedieOptions, TwoPartWarmStart,
@@ -83,17 +84,21 @@ fn fixture(zeros: bool, weighted: bool, clustered: bool) -> ModelInput {
     input
 }
 
-struct Hasher(u64);
+/// Accumulates a testkit fingerprint through `&mut` calls and adds the matrix
+/// layouts the fits return.
+struct Hasher(Fingerprint);
 
 impl Hasher {
     fn new() -> Self {
-        Self(0xcbf2_9ce4_8422_2325)
+        Self(Fingerprint::new())
     }
 
     fn word(&mut self, word: u64) {
-        for byte in word.to_le_bytes() {
-            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
-        }
+        self.0 = std::mem::take(&mut self.0).u64(word);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0.finish()
     }
 
     fn mat(&mut self, m: &Mat<f64>) {
@@ -138,7 +143,7 @@ fn two_part(
     h.mat(&prediction.prob_positive);
     h.mat(&prediction.mean_positive);
     h.mat(&prediction.expected_outcome);
-    out.push((name, h.0));
+    out.push((name, h.finish()));
     TwoPartWarmStart {
         beta_logit: model.beta_logit,
         beta_gamma: model.beta_gamma,
@@ -161,7 +166,7 @@ fn tweedie(
     h.word(report.meta.iterations as u64);
     h.word(report.meta.fallback_attempts as u64);
     h.mat(&model.predict(&input.design_matrix).mean);
-    out.push((name, h.0));
+    out.push((name, h.finish()));
     model.beta
 }
 
@@ -295,19 +300,19 @@ fn collect() -> Golden {
     h.mat(&model.beta);
     h.opt(&report.se);
     h.opt(&report.cov);
-    out.push(("lognormal/weighted/robust/clustered", h.0));
+    out.push(("lognormal/weighted/robust/clustered", h.finish()));
 
     // The plain-API wrappers used elsewhere.
     let (model, _) = fit_two_part_input(&zeros_plain, FitOptions::default()).expect("two-part");
     let mut h = Hasher::new();
     h.mat(&model.beta_logit);
     h.mat(&model.beta_gamma);
-    out.push(("two_part/input/default", h.0));
+    out.push(("two_part/input/default", h.finish()));
     let (model, _) =
         fit_tweedie_input(&positive_plain, 2.0, TweedieOptions::default()).expect("tweedie");
     let mut h = Hasher::new();
     h.mat(&model.beta);
-    out.push(("tweedie2/input/default", h.0));
+    out.push(("tweedie2/input/default", h.finish()));
 
     out
 }

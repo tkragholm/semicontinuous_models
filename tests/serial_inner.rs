@@ -3,6 +3,7 @@
 //! The results are pinned as bit patterns and must not depend on the rayon thread count
 //! or on `RAYON_NUM_THREADS`.
 
+use epistat_testkit::{Fingerprint, on_threads};
 use faer::Mat;
 use semicontinuous_models::{
     FitOptions, Model, ModelInput, TweedieOptions, TwoPartWarmStart, fit_tweedie_input_warm,
@@ -167,18 +168,11 @@ fn collect(inner_parallel: bool) -> Vec<Fit> {
 fn hash(fits: &[Fit]) -> Vec<(&'static str, u64)> {
     fits.iter()
         .map(|fit| {
-            let mut h = 0xcbf2_9ce4_8422_2325_u64;
-            for value in fit
-                .coefficients
-                .iter()
-                .chain(&fit.standard_errors)
-                .chain(&fit.predictions)
-            {
-                for byte in value.to_bits().to_le_bytes() {
-                    h = (h ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
-                }
-            }
-            (fit.name, h)
+            let hash = Fingerprint::new()
+                .f64s(&fit.coefficients)
+                .f64s(&fit.standard_errors)
+                .f64s(&fit.predictions);
+            (fit.name, hash.finish())
         })
         .collect()
 }
@@ -197,13 +191,9 @@ fn largest_differences(a: &[f64], b: &[f64]) -> (f64, f64) {
 #[test]
 fn serial_fits_do_not_depend_on_the_rayon_thread_count() {
     let reference = hash(&collect(false));
-    for threads in THREAD_COUNTS {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .expect("rayon pool");
-        let hashes = pool.install(|| hash(&collect(false)));
-        assert_eq!(hashes, reference, "{threads} threads differs");
+    let runs = on_threads(&THREAD_COUNTS, || hash(&collect(false)));
+    for (hashes, threads) in runs.iter().zip(THREAD_COUNTS) {
+        assert_eq!(*hashes, reference, "{threads} threads differs");
     }
 }
 

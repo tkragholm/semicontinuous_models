@@ -7,6 +7,7 @@
 //! rayon pools of 1, 2 and 8 threads, and compare every coefficient and every
 //! standard error bit for bit.
 
+use epistat_testkit::on_threads;
 use faer::Mat;
 use semicontinuous_models::{
     FitOptions, LogNormalOptions, ModelInput, TweedieOptions, fit_lognormal_smearing_input,
@@ -110,16 +111,9 @@ fn assert_reproducible(label: &str, fit: impl Fn() -> Vec<u64> + Sync) {
     for repeat in 0..REPEATS {
         assert_eq!(fit(), reference, "{label}: repeat {repeat} differs");
     }
-    for threads in THREAD_COUNTS {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .expect("rayon pool");
-        assert_eq!(
-            pool.install(&fit),
-            reference,
-            "{label}: {threads} threads differs"
-        );
+    let runs = on_threads(&THREAD_COUNTS, &fit);
+    for (run, threads) in runs.iter().zip(THREAD_COUNTS) {
+        assert_eq!(*run, reference, "{label}: {threads} threads differs");
     }
 }
 
