@@ -27,7 +27,7 @@ pub(super) fn covariance_logit(
         (value.max(options.min_weight)) * weights[(i, 0)]
     });
 
-    let mut xtwx = weighted_xtx_ref(x, irls_weights.as_ref());
+    let mut xtwx = weighted_xtx_ref(x, irls_weights.as_ref())?;
     if let Some((lambda, exclude_intercept)) = ridge_from_regularization(options.regularization)
         && lambda > 0.0
     {
@@ -59,7 +59,7 @@ pub(super) fn covariance_gamma(
     let eta = linear_predictor(x, beta);
     let mu = map_mat(&eta, f64::exp);
 
-    let mut xtx = weighted_xtx_ref(x, weights);
+    let mut xtx = weighted_xtx_ref(x, weights)?;
     if let Some((lambda, exclude_intercept)) = ridge_from_regularization(options.regularization)
         && lambda > 0.0
     {

@@ -11,7 +11,7 @@
 //! Shared helpers for solving linear systems, computing summary statistics,
 //! and working with faer matrices.
 
-use epistat_linalg::{Attempt, Factor, Method, ROW_BLOCK, Ridge};
+use epistat_linalg::{Attempt, DesignError, Factor, Method, ROW_BLOCK, Ridge};
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatMut, MatRef, Par};
 use num_traits::ToPrimitive;
@@ -259,15 +259,25 @@ pub fn quadratic_form_vec(vector: &[f64], matrix: &Mat<f64>) -> f64 {
     quadratic
 }
 
-/// `X'WX` with the weights floored at zero, exactly symmetric.
-#[must_use]
-pub fn weighted_xtx(x: &Mat<f64>, weights: &Mat<f64>) -> Mat<f64> {
+/// `X'WX`, exactly symmetric.
+///
+/// # Errors
+///
+/// [`DesignError::Weight`] for a weight that is negative or not finite, and
+/// [`DesignError::Length`] when `weights` does not have one entry per row of `x`.
+pub fn weighted_xtx(x: &Mat<f64>, weights: &Mat<f64>) -> Result<Mat<f64>, DesignError> {
     weighted_xtx_ref(x.as_ref(), weights.as_ref())
 }
 
 /// [`weighted_xtx`] on borrowed matrices.
-#[must_use]
-pub fn weighted_xtx_ref(x: MatRef<'_, f64>, weights: MatRef<'_, f64>) -> Mat<f64> {
+///
+/// # Errors
+///
+/// As [`weighted_xtx`].
+pub fn weighted_xtx_ref(
+    x: MatRef<'_, f64>,
+    weights: MatRef<'_, f64>,
+) -> Result<Mat<f64>, DesignError> {
     epistat_linalg::weighted_gram(x, col_slice(weights, 0))
 }
 
@@ -345,8 +355,18 @@ pub(crate) fn linear_predictor(x: MatRef<'_, f64>, beta: &Mat<f64>) -> Mat<f64> 
     eta
 }
 
-#[must_use]
-pub fn weighted_xtz(x: &Mat<f64>, weights: &Mat<f64>, response: &Mat<f64>) -> Mat<f64> {
+/// `X'Wz` for the diagonal `W` of `weights`.
+///
+/// # Errors
+///
+/// [`DesignError::Weight`] for a weight that is negative or not finite, and
+/// [`DesignError::Length`] when `weights` or `response` does not have one entry per row
+/// of `x`.
+pub fn weighted_xtz(
+    x: &Mat<f64>,
+    weights: &Mat<f64>,
+    response: &Mat<f64>,
+) -> Result<Mat<f64>, DesignError> {
     epistat_linalg::weighted_xtz(
         x.as_ref(),
         col_slice(weights.as_ref(), 0),

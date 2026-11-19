@@ -35,14 +35,25 @@ const OUTER_TOLERANCE: f64 = 1.0e-5;
 const SUBJECT_NEWTON_MAX_ITERS: usize = 8;
 
 #[cfg(feature = "bench-internals")]
-#[must_use]
-pub fn benchmark_weighted_xtx(x: &Mat<f64>, weights: &Mat<f64>) -> Mat<f64> {
+/// # Errors
+///
+/// Returns `DesignError` for a negative or non-finite weight.
+pub fn benchmark_weighted_xtx(
+    x: &Mat<f64>,
+    weights: &Mat<f64>,
+) -> Result<Mat<f64>, epistat_linalg::DesignError> {
     weighted_xtx(x, weights)
 }
 
 #[cfg(feature = "bench-internals")]
-#[must_use]
-pub fn benchmark_weighted_xtz(x: &Mat<f64>, weights: &Mat<f64>, response: &Mat<f64>) -> Mat<f64> {
+/// # Errors
+///
+/// Returns `DesignError` for a negative or non-finite weight.
+pub fn benchmark_weighted_xtz(
+    x: &Mat<f64>,
+    weights: &Mat<f64>,
+    response: &Mat<f64>,
+) -> Result<Mat<f64>, epistat_linalg::DesignError> {
     weighted_xtz(x, weights, response)
 }
 
@@ -1158,7 +1169,7 @@ mod tests {
             0.9f64.mul_add((0.2f64 * usize_to_f64(row)).cos().abs(), 0.1)
         });
 
-        let optimized = weighted_xtx(&x, &weights);
+        let optimized = weighted_xtx(&x, &weights).expect("weights are valid");
         let diagonal = Mat::from_fn(
             n,
             n,
@@ -1187,7 +1198,7 @@ mod tests {
         });
         let response = Mat::from_fn(n, 1, |row, _| (0.25f64 * usize_to_f64(row)).sin());
 
-        let optimized = weighted_xtz(&x, &weights, &response);
+        let optimized = weighted_xtz(&x, &weights, &response).expect("weights are valid");
         let diagonal = Mat::from_fn(
             n,
             n,

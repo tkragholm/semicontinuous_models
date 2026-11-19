@@ -44,6 +44,8 @@ pub enum MtpError {
     NoPositiveOutcomes,
     #[error("MTP solver failed")]
     SolveFailed,
+    #[error("invalid weights in a weighted product: {0}")]
+    InvalidWeights(#[from] epistat_linalg::DesignError),
     #[error("MTP fitting did not converge")]
     NonConvergence,
     #[error("MTP sampler not implemented yet: {0}")]

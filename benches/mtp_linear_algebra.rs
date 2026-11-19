@@ -39,7 +39,7 @@ fn bench_weighted_xtx(criterion: &mut Criterion) {
         group.bench_function(format!("current/n{n}_p{p}"), |bencher| {
             bencher.iter(|| {
                 let result = benchmark_weighted_xtx(black_box(&x), black_box(&weights));
-                black_box(result);
+                black_box(result.expect("weights are valid"));
             });
         });
         group.bench_function(format!("faer_ref/n{n}_p{p}"), |bencher| {
@@ -68,7 +68,7 @@ fn bench_weighted_xtz(criterion: &mut Criterion) {
                     black_box(&weights),
                     black_box(&response),
                 );
-                black_box(result);
+                black_box(result.expect("weights are valid"));
             });
         });
     }
@@ -88,7 +88,7 @@ fn bench_two_part_weighted_xtz(criterion: &mut Criterion) {
                     black_box(&weights),
                     black_box(&response),
                 );
-                black_box(result);
+                black_box(result.expect("weights are valid"));
             });
         });
     }

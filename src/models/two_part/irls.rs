@@ -251,7 +251,7 @@ pub(super) fn fit_gamma_log_link_weighted(
     let cached = if matches!(regularization, Regularization::ElasticNet { .. }) {
         None
     } else {
-        let mut xtwx = weighted_xtx_ref(cx, weights);
+        let mut xtwx = weighted_xtx_ref(cx, weights)?;
         if let Some((lambda, exclude_intercept)) = ridge_from_regularization(regularization)
             && lambda > 0.0
         {
@@ -341,7 +341,7 @@ fn weighted_least_squares(
         return elastic_net_wls(x, weights, z, regularization);
     }
 
-    let mut xtwx = weighted_xtx_ref(x, weights);
+    let mut xtwx = weighted_xtx_ref(x, weights)?;
     if let Some((lambda, exclude_intercept)) = ridge_from_regularization(regularization)
         && lambda > 0.0
     {

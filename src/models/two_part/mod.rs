@@ -188,6 +188,8 @@ pub enum TwoPartError {
     NonConvergence,
     #[error("linear solve failed")]
     SolveFailed,
+    #[error("invalid weights in a weighted product: {0}")]
+    InvalidWeights(#[from] epistat_linalg::DesignError),
     #[error("bootstrap iterations must be positive")]
     InvalidBootstrapIterations,
     #[error("bootstrap requires at least one row")]
@@ -870,8 +872,14 @@ fn select_cluster_ids(clusters: &[u64], indices: &[usize]) -> Vec<u64> {
 }
 
 #[cfg(feature = "bench-internals")]
-#[must_use]
-pub fn benchmark_two_part_weighted_xtz(x: &Mat<f64>, weights: &Mat<f64>, z: &Mat<f64>) -> Mat<f64> {
+/// # Errors
+///
+/// Returns `DesignError` for a negative or non-finite weight.
+pub fn benchmark_two_part_weighted_xtz(
+    x: &Mat<f64>,
+    weights: &Mat<f64>,
+    z: &Mat<f64>,
+) -> Result<Mat<f64>, epistat_linalg::DesignError> {
     weighted_xtz(x, weights, z)
 }
 

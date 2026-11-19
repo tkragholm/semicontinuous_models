@@ -23,13 +23,16 @@ pub fn autocorrelation(series: &[f64], lag: usize) -> Option<f64> {
 /// Heuristic effective sample size using positive autocorrelation truncation. `None`
 /// for a chain of fewer than two draws and for a constant chain, which carries no
 /// information about mixing.
+///
+/// The check for equal draws is exact. The variance test inside epistat does not catch
+/// a constant chain whose mean rounds away from the draws, such as three copies of 0.1.
 #[must_use]
 pub fn effective_sample_size(series: &[f64]) -> Option<f64> {
     let first = *series.first()?;
     if series.len() < 2 || series.iter().all(|&value| value == first) {
         return None;
     }
-    Some(epistat_stats::mcmc::effective_sample_size(series))
+    epistat_stats::mcmc::effective_sample_size(series)
 }
 
 /// Summarize split-R-hat convergence diagnostics across posterior chains.

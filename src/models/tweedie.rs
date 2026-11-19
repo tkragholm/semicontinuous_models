@@ -167,6 +167,8 @@ pub enum TweedieError {
     NonConvergence,
     #[error("linear solve failed")]
     SolveFailed,
+    #[error("invalid weights in a weighted product: {0}")]
+    InvalidWeights(#[from] epistat_linalg::DesignError),
 }
 
 crate::impl_input_error_from!(TweedieError, {
@@ -475,7 +477,7 @@ fn fit_tweedie_with_lambda(
     // so the β-path is identical to rebuilding it each iteration.
     let constant_weight = if (2.0 - power).abs() < 1e-12 {
         fill_constant_irls_weights(constant_weights, sample_weights);
-        let mut xtwx = weighted_xtx_ref(cx, constant_weights.as_ref());
+        let mut xtwx = weighted_xtx_ref(cx, constant_weights.as_ref())?;
         if lambda > 0.0 {
             add_ridge_to_diagonal(&mut xtwx, lambda, options.l2_penalty_exclude_intercept);
         }
@@ -522,7 +524,7 @@ fn fit_tweedie_with_lambda(
                 Ok(candidate) => candidate,
                 Err(_) => {
                     // Pathological RHS: stabilized solve on the (constant) matrix.
-                    let mut xtwx = weighted_xtx_ref(cx, constant_weights.as_ref());
+                    let mut xtwx = weighted_xtx_ref(cx, constant_weights.as_ref())?;
                     if lambda > 0.0 {
                         add_ridge_to_diagonal(
                             &mut xtwx,
@@ -541,7 +543,7 @@ fn fit_tweedie_with_lambda(
                 let w = mu[(i, 0)].powf(2.0 - power).max(options.min_weight);
                 weight_buffer[(i, 0)] = base_weight * w;
             }
-            let mut xtwx = weighted_xtx_ref(cx, weight_buffer.as_ref());
+            let mut xtwx = weighted_xtx_ref(cx, weight_buffer.as_ref())?;
             if lambda > 0.0 {
                 add_ridge_to_diagonal(&mut xtwx, lambda, options.l2_penalty_exclude_intercept);
             }
@@ -680,7 +682,7 @@ fn finalize_fit(
             let w = mu[(i, 0)].powf(2.0 - power).max(options.min_weight);
             base_weight * w
         });
-        let mut xtwx = weighted_xtx_ref(x, weights.as_ref());
+        let mut xtwx = weighted_xtx_ref(x, weights.as_ref())?;
         if lambda > 0.0 {
             add_ridge_to_diagonal(&mut xtwx, lambda, options.l2_penalty_exclude_intercept);
         }

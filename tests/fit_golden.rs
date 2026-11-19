@@ -318,20 +318,20 @@ fn collect() -> Golden {
 }
 
 const GOLDEN: &[(&str, u64)] = &[
-    ("two_part/unweighted/robust/clustered", 0x9faf1d3115ef7984),
+    ("two_part/unweighted/robust/clustered", 0x005fca9846ef4ac6),
     ("two_part/unweighted/model_se", 0x7238922a71787077),
     ("two_part/weighted/model_se", 0x288fd34eb86d1456),
-    ("two_part/weighted/robust/clustered", 0x0650c93229ec61a5),
+    ("two_part/weighted/robust/clustered", 0x67d24eae4970d5b5),
     ("two_part/weighted/stable", 0x18cb2aa04df1f58e),
     ("two_part/weighted/warm/no_cov", 0xc925fead5cba18f0),
     ("two_part/weighted/warm/model_se", 0xa90112d7dbe6f2b5),
-    ("tweedie2/weighted/robust/clustered", 0x7514a90d91e105ed),
+    ("tweedie2/weighted/robust/clustered", 0x00c1506a4a885bb7),
     ("tweedie2/unweighted/plain", 0x66ca3ead887a50d8),
     ("tweedie2/weighted/warm", 0x169946344253d936),
-    ("tweedie2/weighted/ridge/warm/robust", 0x948c51be25293cb4),
-    ("tweedie1.5/weighted/robust/clustered", 0x6975dbc2f59ebfab),
+    ("tweedie2/weighted/ridge/warm/robust", 0xd152025892edd8f1),
+    ("tweedie1.5/weighted/robust/clustered", 0x6c27f84b95f4274a),
     ("tweedie1.5/unweighted/plain", 0x7366d249674b0c28),
-    ("lognormal/weighted/robust/clustered", 0xd1900b83bd952489),
+    ("lognormal/weighted/robust/clustered", 0xb9bacb987d7e837d),
     ("two_part/input/default", 0x50443c256527acf3),
     ("tweedie2/input/default", 0xfeca4cccd30d521c),
 ];

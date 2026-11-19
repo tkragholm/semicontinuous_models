@@ -167,7 +167,7 @@ pub(super) fn weighted_least_squares(
     response: &Mat<f64>,
     weighted_buffer: &mut Vec<f64>,
 ) -> Result<Mat<f64>, MtpError> {
-    let mut information = weighted_xtx(x, weights);
+    let mut information = weighted_xtx(x, weights)?;
     add_ridge_to_diagonal(&mut information, RIDGE_L2, false);
     let weighted_response = weighted_xtz_with_buffer(x, weights, response, weighted_buffer);
     solve_linear_system(&information, &weighted_response).map_err(|_| MtpError::SolveFailed)
@@ -200,7 +200,7 @@ pub(super) fn approximate_alpha_covariance(
         (probability[(row, 0)] * (1.0 - probability[(row, 0)])).max(MIN_WEIGHT)
     });
 
-    let mut information = weighted_xtx(&input.x_binary, &weights);
+    let mut information = weighted_xtx(&input.x_binary, &weights)?;
     add_ridge_to_diagonal(&mut information, RIDGE_L2 + 1.0 / prior_variance, false);
     matrix_inverse(&information)
 }

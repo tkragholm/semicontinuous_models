@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+Dependencies: epistat-stats 0.2.0, epistat-linalg 0.3.0, epistat-inference 0.3.0 and
+epistat-rng 0.1.2.
+
+- `utils::weighted_xtx`, `weighted_xtx_ref` and `weighted_xtz` return
+  `Result<Mat<f64>, epistat_linalg::DesignError>` and refuse a negative or non-finite
+  weight. They used to floor a negative weight at zero. The fitters build their weights
+  from a variance function floored at `min_weight` and positive prior weights, so they
+  never pass a negative one and their results are unchanged.
+- `TweedieError`, `TwoPartError` and `MtpError` have an `InvalidWeights` variant that
+  carries the `DesignError`.
+- The sandwich covariance is exactly symmetric. Its off-diagonal entries differ from
+  before in the last bits, and the coefficients and standard errors are bit-identical.
+
 Breaking: statistics that do not exist are no longer reported as numbers.
 
 - `autocorrelation` returns `Option<f64>`, `None` for a constant chain or a lag not
