@@ -1,6 +1,6 @@
 //! Prior specifications and log-density helpers for MTP.
 
-use statrs::function::gamma::ln_gamma;
+use epistat_stats::gamma::ln_gamma;
 
 /// Hyperparameters for the correlated MTP prior set.
 #[derive(bon::Builder, Debug, Clone, Copy)]

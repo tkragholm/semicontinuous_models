@@ -16,6 +16,7 @@ use faer::Mat;
 use crate::models::Model;
 use crate::models::matrix_ops::{select_rows, select_values};
 use epistat_rng::Stream;
+use epistat_stats::likelihood;
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -29,8 +30,6 @@ use super::tweedie::{
 };
 use super::two_part::{FitOptions, TwoPartError, fit_two_part_input};
 use crate::input::{InputError, ModelInput};
-use crate::utils::solve_linear_system;
-use epistat_linalg::{row_scaled_gram, xtv};
 
 /// Goodness-of-fit metrics for model comparison.
 #[derive(Debug, Clone, Copy)]
@@ -155,9 +154,13 @@ pub enum CrossValidationError {
     LogNormal(#[from] LogNormalError),
 }
 
-/// Compute the Park test slope from a gamma-log auxiliary regression.
+/// Park's (1966) test of the variance function: a gamma fit of the positive outcomes
+/// on `x` with a log link, then the least-squares regression of `ln (y - mu)^2` on
+/// `ln mu`. The slope estimates the power of the mean in the variance. The regression
+/// is `epistat_glm::classic_park_test`. It is biased where Manning and Mullahy's (2001)
+/// modified test, `epistat_glm::modified_park_test`, is not, and is kept for comparison.
 #[must_use]
-pub fn park_test(x: &Mat<f64>, y: &Mat<f64>) -> Option<ParkTestResult> {
+pub fn classic_park_test(x: &Mat<f64>, y: &Mat<f64>) -> Option<ParkTestResult> {
     if y.ncols() != 1 || x.nrows() != y.nrows() {
         return None;
     }
@@ -178,31 +181,20 @@ pub fn park_test(x: &Mat<f64>, y: &Mat<f64>) -> Option<ParkTestResult> {
     )
     .ok()?;
     let mu = gamma.predict(&x_pos).mean;
-    let residuals = Mat::from_fn(y_pos.nrows(), 1, |i, _| y_pos[(i, 0)] - mu[(i, 0)]);
-    let log_resid = Mat::from_fn(residuals.nrows(), 1, |i, _| {
-        (residuals[(i, 0)].powi(2)).ln()
-    });
-    let log_mu = Mat::from_fn(mu.nrows(), 1, |i, _| mu[(i, 0)].ln());
-
-    let design = Mat::from_fn(
-        log_mu.nrows(),
-        2,
-        |i, j| if j == 0 { 1.0 } else { log_mu[(i, 0)] },
-    );
-    let xtx = row_scaled_gram(design.as_ref(), |_| 1.0);
-    let xty = xtv(design.as_ref(), log_resid.col_as_slice(0));
-    let beta = solve_linear_system(&xtx, &xty).ok()?;
+    let fitted: Vec<f64> = (0..mu.nrows()).map(|i| mu[(i, 0)]).collect();
+    let outcome: Vec<f64> = (0..y_pos.nrows()).map(|i| y_pos[(i, 0)]).collect();
+    let test = epistat_glm::park::classic_park_test(&fitted, &outcome).ok()??;
 
     Some(ParkTestResult {
-        intercept: beta[(0, 0)],
-        slope: beta[(1, 0)],
+        intercept: test.intercept,
+        slope: test.power,
     })
 }
 
 /// Fit candidate Tweedie powers and a log-normal model, returning metrics.
 #[must_use]
 pub(crate) fn select_models(x: &Mat<f64>, y: &Mat<f64>, powers: &[f64]) -> SelectionResult {
-    let park = park_test(x, y).unwrap_or(ParkTestResult {
+    let park = classic_park_test(x, y).unwrap_or(ParkTestResult {
         intercept: 0.0,
         slope: 2.0,
     });
@@ -363,17 +355,18 @@ pub fn compute_model_fit_metrics(
 }
 
 /// Compute AIC/BIC for a given log-likelihood, parameter count, and sample size.
+/// The BIC is NaN for no observations.
 #[must_use]
 pub fn compute_information_criteria(loglik: f64, k: usize, n: usize) -> InformationCriteria {
-    let k_f = f64::from(u32::try_from(k).unwrap_or(u32::MAX));
-    let n_f = f64::from(u32::try_from(n).unwrap_or(u32::MAX));
-    let aic = (-2.0f64).mul_add(loglik, 2.0 * k_f);
-    let bic = if n > 1 {
-        (-2.0f64).mul_add(loglik, n_f.ln() * k_f)
-    } else {
-        f64::NAN
-    };
-    InformationCriteria { loglik, aic, bic }
+    InformationCriteria {
+        loglik,
+        aic: likelihood::aic(loglik, k),
+        bic: if n >= 1 {
+            likelihood::bic(loglik, k, n)
+        } else {
+            f64::NAN
+        },
+    }
 }
 
 /// Recommend a model based on CV RMSE (lower is better).
@@ -711,9 +704,10 @@ mod tests {
     }
 
     #[test]
-    fn bic_is_nan_when_sample_size_is_too_small() {
+    fn bic_is_defined_from_one_observation() {
         let ic = compute_information_criteria(-10.0, 3, 1);
-        assert!(ic.bic.is_nan());
+        assert!((ic.bic - 20.0).abs() < 1e-12);
+        assert!(compute_information_criteria(-10.0, 3, 0).bic.is_nan());
     }
 
     #[test]

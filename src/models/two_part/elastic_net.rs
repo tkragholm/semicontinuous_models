@@ -1,9 +1,24 @@
-//! Coordinate-descent weighted least squares for the elastic-net penalty.
+//! Weighted least squares with the elastic-net penalty, fitted by
+//! [`epistat_glm::ElasticNet`] with the Gaussian family.
 
+use epistat_glm::{ElasticNet, Family, ResponseScaling};
 use faer::{Mat, MatRef};
 
 use super::{Regularization, TwoPartError};
 
+/// The bound on the largest variance-weighted squared coefficient change.
+const TOLERANCE: f64 = 1e-14;
+
+/// Minimises `0.5 * sum w_i (z_i - x_i b)^2 + lambda * (alpha * |b|_1 + (1 - alpha) / 2 *
+/// |b|_2^2)` over the columns of `x` as given, with the first column unpenalised when
+/// `exclude_intercept` is set.
+///
+/// The penalty is on the sum scale of the weights. The fit is `ElasticNet`'s, whose
+/// penalty is per unit of weight, so it is run with `lambda / sum(w)` and
+/// [`ResponseScaling::None`], which leaves the response unscaled. glmnet's own Gaussian
+/// objective divides the ridge term by the weighted standard deviation of `z`.
+/// A fit that reaches the pass limit without meeting the tolerance is returned as it
+/// stands.
 pub(super) fn elastic_net_wls(
     x: MatRef<'_, f64>,
     weights: MatRef<'_, f64>,
@@ -21,67 +36,29 @@ pub(super) fn elastic_net_wls(
 
     let n = x.nrows();
     let p = x.ncols();
-    let mut beta = Mat::<f64>::zeros(p, 1);
-    let mut residual = Mat::<f64>::zeros(n, 1);
-    for i in 0..n {
-        residual[(i, 0)] = z[(i, 0)];
+    let w: Vec<f64> = (0..n).map(|i| weights[(i, 0)]).collect();
+    let target: Vec<f64> = (0..n).map(|i| z[(i, 0)]).collect();
+    let total_weight: f64 = w.iter().sum();
+    if !(total_weight.is_finite() && total_weight > 0.0) {
+        return Err(TwoPartError::SolveFailed);
     }
-
-    let mut col_norms = vec![0.0; p];
-    for j in 0..p {
-        let mut norm = 0.0;
-        for i in 0..n {
-            let xij = x[(i, j)];
-            norm = (weights[(i, 0)] * xij).mul_add(xij, norm);
-        }
-        col_norms[j] = norm.max(1e-12);
-    }
-
-    let mut iterations = 0;
-    loop {
-        iterations += 1;
-        let mut max_delta = 0.0;
-        for j in 0..p {
-            let mut rho = 0.0;
-            for i in 0..n {
-                rho = (weights[(i, 0)] * x[(i, j)]).mul_add(residual[(i, 0)], rho);
-            }
-            rho = col_norms[j].mul_add(beta[(j, 0)], rho);
-
-            let new_beta = if exclude_intercept && j == 0 {
-                rho / col_norms[j]
+    let penalty_factor: Vec<f64> = (0..p)
+        .map(|j| {
+            if exclude_intercept && j == 0 {
+                0.0
             } else {
-                soft_threshold(rho, lambda * alpha) / lambda.mul_add(1.0 - alpha, col_norms[j])
-            };
-
-            let delta = new_beta - beta[(j, 0)];
-            if delta != 0.0 {
-                for i in 0..n {
-                    residual[(i, 0)] = x[(i, j)].mul_add(-delta, residual[(i, 0)]);
-                }
+                1.0
             }
-            if delta.abs() > max_delta {
-                max_delta = delta.abs();
-            }
-            beta[(j, 0)] = new_beta;
-        }
+        })
+        .collect();
 
-        if max_delta < 1e-6 || iterations >= 200 {
-            break;
-        }
-    }
-
-    Ok(beta)
-}
-
-fn soft_threshold(value: f64, penalty: f64) -> f64 {
-    if value > penalty {
-        value - penalty
-    } else if value < -penalty {
-        value + penalty
-    } else {
-        0.0
-    }
+    let mut model = ElasticNet::new(Family::Gaussian, lambda / total_weight, alpha);
+    model.tolerance = TOLERANCE;
+    model.scaling = ResponseScaling::None;
+    let fit = model
+        .fit(x, &target, Some(&w), None, Some(&penalty_factor), None)
+        .map_err(|_| TwoPartError::SolveFailed)?;
+    Ok(Mat::from_fn(p, 1, |j, _| fit.coefficients[j]))
 }
 
 #[cfg(test)]
@@ -105,11 +82,9 @@ mod tests {
         cases: Vec<Case>,
     }
 
-    /// The coordinate descent against `glmnet(family = "gaussian", weights = w,
-    /// standardize = FALSE)` on the same design, with lambda and alpha mapped to
-    /// glmnet's scaling as described in `tests/r/elastic_net_reference.R`. The descent
-    /// stops when no coefficient moves by 1e-6, which accounts for the deviation of a
-    /// few times 1e-7 from glmnet's converged solution.
+    /// The fit against `glmnet(family = "gaussian", weights = w, standardize = FALSE)` on
+    /// the same design, with lambda and alpha mapped to glmnet's scaling as described in
+    /// `tests/r/elastic_net_reference.R`.
     #[test]
     fn matches_glmnet() {
         let text = std::fs::read_to_string(concat!(
@@ -151,8 +126,8 @@ mod tests {
             worst = worst.max(deviation);
             worst_kkt = worst_kkt.max(kkt_violation(&x, &z, &weights, &beta, case));
         }
-        assert!(worst < 2e-6, "worst deviation {worst}");
-        assert!(worst_kkt < 1e-4, "worst KKT violation {worst_kkt}");
+        assert!(worst < 1e-9, "worst deviation {worst}");
+        assert!(worst_kkt < 1e-5, "worst KKT violation {worst_kkt}");
     }
 
     /// Largest violation of the subgradient conditions of the penalised objective: for

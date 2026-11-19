@@ -37,8 +37,8 @@ use crate::models::{
 use crate::utils::linear_predictor;
 #[cfg(feature = "bench-internals")]
 use crate::utils::weighted_xtz;
+use epistat_stats::gamma::ln_gamma;
 use faer::{Mat, MatRef};
-use statrs::function::gamma::ln_gamma;
 use std::collections::HashSet;
 use std::time::Instant;
 use thiserror::Error;

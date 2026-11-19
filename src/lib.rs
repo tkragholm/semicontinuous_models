@@ -62,8 +62,8 @@ pub use models::lognormal::{
 pub use models::selection::{
     CrossValidationError, CrossValidationOptions, CrossValidationResult, InformationCriteria,
     LogNormalCandidate, ModelFitMetrics, ParkTestResult, SelectionResult, TweedieCandidate,
-    TweedieCvCandidate, compute_information_criteria, compute_model_fit_metrics,
-    cross_validate_models_input, fit_tweedie_candidates_input, park_test, recommend_from_cv,
+    TweedieCvCandidate, classic_park_test, compute_information_criteria, compute_model_fit_metrics,
+    cross_validate_models_input, fit_tweedie_candidates_input, recommend_from_cv,
     select_models_input,
 };
 

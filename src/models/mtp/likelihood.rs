@@ -1,6 +1,6 @@
 //! Likelihood and numerical-stability helpers for MTP.
 
-use statrs::function::erf::erf;
+use epistat_stats::normal;
 
 const EPS_PROBABILITY: f64 = 1.0e-12;
 
@@ -38,8 +38,7 @@ pub fn log_standard_normal_pdf(value: f64) -> f64 {
 /// Log-CDF of standard normal with finite clipping.
 #[must_use]
 pub fn log_standard_normal_cdf(value: f64) -> f64 {
-    let cdf = 0.5 * (1.0 + erf(value / std::f64::consts::SQRT_2));
-    clamp_probability(cdf).ln()
+    clamp_probability(normal::cdf(value)).ln()
 }
 
 /// Zero branch log-likelihood for `y == 0`.

@@ -8,9 +8,7 @@ pub fn select_rows(matrix: &Mat<f64>, indices: &[usize]) -> Mat<f64> {
 /// [`select_rows`] on a borrowed matrix.
 #[must_use]
 pub fn select_rows_ref(matrix: MatRef<'_, f64>, indices: &[usize]) -> Mat<f64> {
-    Mat::from_fn(indices.len(), matrix.ncols(), |i, j| {
-        matrix[(indices[i], j)]
-    })
+    epistat_linalg::design::select_rows(matrix, indices)
 }
 
 #[must_use]

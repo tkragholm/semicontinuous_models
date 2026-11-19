@@ -1,6 +1,6 @@
 [package]
 name = "semicontinuous_models"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 authors = ["Tobias Kragholm"]
 license = "MIT OR Apache-2.0"
@@ -30,20 +30,19 @@ thiserror = "2.0.18"
 # calls (Llt/PartialPivLu), `rayon` for the multithreaded gemm this crate leans
 # on (get_global_parallelism), `nightly` for AVX-512 codegen on the x86 server.
 faer = { version = "0.24", default-features = false, features = ["std", "rayon", "nightly", "linalg"] }
-rand = "0.10.0"
-rand_distr = "0.6.0"
-statrs = "0.18.0"
 num-traits = "0.2.19"
 comfy-table = "7.2.2"
 dyn-stack = "0.13.2"
 tracing = "0.1.41"
 rayon = "1.11.0"
-epistat-rng = { version = "0.1.2", features = ["rand"] }
+epistat-rng = { version = "0.1.3", features = ["rand"] }
 epistat-linalg = "0.3.0"
-epistat-inference = "0.3.0"
-epistat-stats = "0.2.0"
+epistat-inference = "0.3.1"
+epistat-stats = "0.2.3"
+epistat-glm = "0.1.1"
 
 [dev-dependencies]
+rand_distr = "0.6.0"
 epistat-testkit = "0.1.0"
 approx = "0.5.1"
 serde = { version = "1", features = ["derive"] }

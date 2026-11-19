@@ -4,9 +4,7 @@ use dyn_stack::{MemBuffer, MemStack};
 use epistat_rng::Stream;
 use faer::linalg::cholesky::llt;
 use faer::linalg::cholesky::llt::factor::LltRegularization;
-use faer::linalg::matmul::matmul;
-use faer::{Accum, Mat, MatRef, Par, Side, Spec};
-use rand::RngExt;
+use faer::{Mat, MatRef, Par, Side, Spec};
 
 use crate::input::LongitudinalModelInput;
 use crate::models::matrix_ops::select_rows;
@@ -445,40 +443,15 @@ pub(super) fn sample_wishart(
     scale: &Mat<f64>,
 ) -> Result<Mat<f64>, MtpError> {
     let dim = scale.ncols();
-    if dim == 0 || df <= usize_to_f64(dim.saturating_sub(1)) {
-        return Err(MtpError::SolveFailed);
-    }
     let chol = cholesky_lower(scale).ok_or(MtpError::SolveFailed)?;
-    let mut bartlett = Mat::<f64>::zeros(dim, dim);
-    for row in 0..dim {
-        let dof = df - usize_to_f64(row);
-        if dof <= 0.0 {
-            return Err(MtpError::SolveFailed);
-        }
-        bartlett[(row, row)] = sample_chi_square(rng, dof).sqrt();
-        for col in 0..row {
-            bartlett[(row, col)] = sample_standard_normal(rng);
-        }
-    }
-    let mut product = Mat::<f64>::zeros(dim, dim);
-    matmul(
-        product.as_mut(),
-        Accum::Replace,
-        chol.as_ref(),
-        bartlett.as_ref(),
-        1.0,
-        Par::Seq,
-    );
-    let mut wishart = Mat::<f64>::zeros(dim, dim);
-    matmul(
-        wishart.as_mut(),
-        Accum::Replace,
-        product.as_ref(),
-        product.transpose(),
-        1.0,
-        Par::Seq,
-    );
-    Ok(wishart)
+    let factor: Vec<f64> = (0..dim)
+        .flat_map(|row| (0..dim).map(move |col| (row, col)))
+        .map(|(row, col)| chol[(row, col)])
+        .collect();
+    let draw = rng
+        .wishart(df, &factor, dim)
+        .map_err(|_| MtpError::SolveFailed)?;
+    Ok(Mat::from_fn(dim, dim, |row, col| draw[row * dim + col]))
 }
 
 pub(super) fn cholesky_lower(matrix: &Mat<f64>) -> Option<Mat<f64>> {
@@ -495,47 +468,6 @@ pub(super) fn cholesky_lower(matrix: &Mat<f64>) -> Option<Mat<f64>> {
             0.0
         }
     }))
-}
-
-pub(super) fn sample_chi_square(rng: &mut Stream, dof: f64) -> f64 {
-    sample_gamma(rng, 0.5 * dof, 2.0)
-}
-
-pub(super) fn sample_gamma(rng: &mut Stream, shape: f64, scale: f64) -> f64 {
-    if !(shape > 0.0 && scale > 0.0) {
-        return f64::NAN;
-    }
-
-    if shape < 1.0 {
-        let u = (1.0_f64 - rng.uniform()).max(f64::MIN_POSITIVE);
-        return sample_gamma(rng, shape + 1.0, scale) * u.powf(1.0 / shape);
-    }
-
-    let shape_minus_third = shape - (1.0 / 3.0);
-    let coeff = (1.0 / (9.0 * shape_minus_third)).sqrt();
-    loop {
-        let standard_normal = sample_standard_normal(rng);
-        let one_plus_coeff_noise = coeff.mul_add(standard_normal, 1.0);
-        if one_plus_coeff_noise <= 0.0 {
-            continue;
-        }
-        let cubic_term = one_plus_coeff_noise * one_plus_coeff_noise * one_plus_coeff_noise;
-        let uniform = rng.uniform();
-        if uniform
-            < (0.0331 * standard_normal * standard_normal * standard_normal)
-                .mul_add(-standard_normal, 1.0)
-        {
-            return scale * shape_minus_third * cubic_term;
-        }
-        if uniform.ln()
-            < (0.5 * standard_normal).mul_add(
-                standard_normal,
-                shape_minus_third * (1.0 - cubic_term + cubic_term.ln()),
-            )
-        {
-            return scale * shape_minus_third * cubic_term;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -628,7 +560,7 @@ pub(super) fn subject_effect_log_prior(effect: &[f64], random_effects_precision:
 }
 
 pub(super) fn sample_standard_normal(rng: &mut Stream) -> f64 {
-    rng.sample(rand_distr::StandardNormal)
+    rng.normal()
 }
 
 pub(super) fn identity_matrix(dim: usize) -> Mat<f64> {

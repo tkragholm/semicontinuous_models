@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.9.0 - Unreleased
+
+Dependencies: epistat-rng 0.1.3, epistat-stats 0.2.3, epistat-inference 0.3.1 and
+epistat-glm 0.1.1. statrs is removed, and rand and rand_distr are no longer runtime
+dependencies (rand_distr remains a dev-dependency).
+
+- Breaking: `park_test` is renamed `classic_park_test`. It is Park's (1966) test: the
+  least-squares regression of `ln (y - mu)^2` on `ln mu` after a gamma fit with a log
+  link, computed by `epistat_glm::classic_park_test`. The slope and intercept are
+  those of the old function. For Manning and Mullahy's (2001) modified test use
+  `epistat_glm::modified_park_test`.
+- The two-part model's elastic net (`Regularization::ElasticNet`) is
+  `epistat_glm::ElasticNet` with the Gaussian family, run with `ResponseScaling::None`.
+  The documented objective is unchanged, `0.5 * sum w (z - x b)^2 + lambda * (alpha *
+  |b|_1 + (1 - alpha) / 2 * |b|_2^2)` with the first column unpenalised when
+  `exclude_intercept` is set. glmnet's own Gaussian fit divides the ridge term by the
+  weighted standard deviation of the response, which is not done here. The fit now
+  stops on glmnet's rule at a tolerance of 1e-14 and no longer stops silently after 200
+  passes. Coefficients move by up to about 2e-6, and the worst deviation from glmnet's
+  converged solution on the reference design is 4e-15.
+- `compute_information_criteria` uses `epistat_stats::likelihood`. The BIC for one
+  observation is a value, `-2 loglik`, and is still NaN for none. The AIC and BIC
+  differ from before in the last bits, since the fused multiply-add is gone.
+- The normal distribution function in the MTP likelihood is `epistat_stats::normal::cdf`
+  and `ln_gamma` is `epistat_stats::gamma::ln_gamma`.
+- The MTP sampler draws its normals, gamma, chi-square and Wishart variates from
+  `epistat_rng::Stream`. The draws differ from 0.8.0, so a given seed gives a different
+  chain. The posterior is the same distribution, and the recovery and R-hat tests pass.
+- Deterministic fits are unchanged, and no golden hash in `tests/fit_golden.rs` moves.
+- `matrix_ops::select_rows` and `select_rows_ref` call `epistat_linalg::design::select_rows`.
+
 ## 0.8.0 - 2026-11-19
 
 - `bootstrap_percentile_ci`, and so `bootstrap_summary`, read the interval bounds as R's
