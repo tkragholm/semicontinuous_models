@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0
+
+The dense solves, the cached factor of the gamma and Tweedie IRLS, the
+row-blocked `X'WX`, `X'Wz` and `X beta` products, the sandwich covariance, the
+type 7 quantile, the normal quantile and the MCMC diagnostics now come from the
+epistat crates (`epistat-linalg`, `epistat-inference`, `epistat-stats`).
+
+- Coefficients and predictions are bit-identical to 0.4.1 on the golden
+  fixtures. Robust standard errors can differ in the last bit, because the
+  cluster sums no longer use fused multiply-add.
+- Factorisations always run on one thread and the row blocks keep their fixed
+  order, so results do not depend on the number of threads.
+  `FitOptions::inner_parallel` and `TweedieOptions::inner_parallel` are kept
+  for compatibility and no longer change anything.
+- The sandwich covariance factorises the information matrix with the first
+  method that succeeds, then solves with it.
+
 ## 0.4.1
 
 Additions only. The results of the existing functions are unchanged: fits with the

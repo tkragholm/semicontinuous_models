@@ -1,6 +1,6 @@
 [package]
 name = "semicontinuous_models"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 authors = ["Tobias Kragholm"]
 license = "MIT OR Apache-2.0"
@@ -38,9 +38,9 @@ comfy-table = "7.2.2"
 dyn-stack = "0.13.2"
 tracing = "0.1.41"
 rayon = "1.11.0"
-epistat-linalg = { git = "https://github.com/tkragholm/epistat", rev = "9b49113fb7493846f033694c0034c74eb86c8938" }
-epistat-inference = { git = "https://github.com/tkragholm/epistat", rev = "9b49113fb7493846f033694c0034c74eb86c8938" }
-epistat-stats = { git = "https://github.com/tkragholm/epistat", rev = "9b49113fb7493846f033694c0034c74eb86c8938" }
+epistat-linalg = "0.1"
+epistat-inference = "0.1"
+epistat-stats = "0.1"
 
 [dev-dependencies]
 approx = "0.5.1"

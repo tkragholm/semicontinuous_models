@@ -13,7 +13,7 @@ The crate was originally developed for a healthcare outcome study, but the API i
 
 ```toml
 [dependencies]
-semicontinuous_models = "0.1"
+semicontinuous_models = "0.5"
 ```
 
 ## Quick start
